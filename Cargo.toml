@@ -1,0 +1,9 @@
+[package]
+name = "rseq"
+version = "0.1.0"
+edition = "2024"
+description = "Register Sequence DSL"
+license = "MIT"
+license-file = "LICENSE"
+
+[dependencies]

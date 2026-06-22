@@ -1,9 +1,19 @@
-[package]
-name = "rseq"
+
+[workspace]
+members = ["crates/rseq-vm", "crates/rseq", "crates/rseq-cli"]
+resolver = "2"
+
+[workspace.package]
+authors = ["leo"]
 version = "0.1.0"
 edition = "2024"
 description = "Register Sequence DSL"
 license = "MIT"
 license-file = "LICENSE"
+keywords = ["register", "sequence", "dsl", "i2c", "spi", "embedded"]
+categories = ["embedded", "hardware", "hardware-agnostic"]
+repository = "https://github.com/listentodella/rseq"
 
-[dependencies]
+[workspace.dependencies]
+rseq-vm = { path = "crates/rseq-vm" }
+rseq = { path = "crates/rseq" }

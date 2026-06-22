@@ -1,0 +1,19 @@
+
+[package]
+name = "rseq"
+description = "Register Sequence DSL — host-side compiler, chip dictionary, and MockBus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+rseq-vm = { workspace = true }
+toml = "1.1.2"
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,24 @@
+[package]
+name = "rseq-vm"
+description = "Register Sequence VM — no_std compatible bytecode interpreter core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# ── no_std 支持 ─────────────────────────────────────────────
+# 默认开启 std（PC侧开发/测试）
+# MCU移植时：default-features = false
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+# 零外部依赖，纯 core/alloc
+
+[dev-dependencies]
+# 测试时依赖上位机库提供的 MockBus
+rseq = { workspace = true }

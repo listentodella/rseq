@@ -1,4 +1,3 @@
-
 [package]
 name = "rseq"
 description = "Register Sequence DSL — host-side compiler, chip dictionary, and MockBus"
@@ -17,3 +16,6 @@ default = []
 rseq-vm = { workspace = true }
 toml = "1.1.2"
 serde = { version = "1", features = ["derive"] }
+logos = "0.16.1"
+chumsky = "1.0.0-alpha.8"
+ariadne = { version = "0.6.0", features = ["auto-color"] }

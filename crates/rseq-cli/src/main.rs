@@ -18,16 +18,23 @@ struct Cli {
 
     #[arg(short, long)]
     output: Option<String>,
+
+    #[arg(short = 'x', long)]
+    hex: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
     if cli.decompile {
-        let data = if let Some(file) = cli.file {
+        let data = if let Some(hex_str) = &cli.hex {
+            parse_hex_string(hex_str).expect("Failed to parse hex string")
+        } else if let Some(file) = cli.file {
             std::fs::read(file).expect("Failed to read bytecode file")
         } else {
-            eprintln!("Please provide a bytecode file with --file");
+            eprintln!(
+                "Please provide either a bytecode file with --file or a hex string with --hex"
+            );
             std::process::exit(1);
         };
 
@@ -68,7 +75,13 @@ fn main() {
         let bytecode = match compile(&program) {
             Ok(b) => {
                 println!("✓ Compiled successfully ({} bytes)", b.len());
-                println!("Bytecode: {:02x?}", b);
+                println!("Bytecode (vec): {:02x?}", b);
+                let hex_str: String = b
+                    .iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("Bytecode (hex): {}", hex_str);
                 if let Some(path) = &cli.output {
                     std::fs::write(path, &b).expect("Failed to write bytecode");
                     println!("Saved bytecode to {}", path);
@@ -81,8 +94,9 @@ fn main() {
             }
         };
 
-        println!("\nStatements:");
-        for stmt in &program.stmts {
+        println!("\nStatements (in order):");
+        for (idx, stmt) in program.stmts.iter().enumerate() {
+            println!("  Step {}:", idx + 1);
             match stmt {
                 rseq::Stmt::Let { name, expr } => match expr {
                     rseq::Expr::Read {
@@ -100,15 +114,14 @@ fn main() {
                             rseq::Value::Ident(s) => s.clone(),
                             _ => "unknown".to_string(),
                         };
-                        let delay_str = if let Some(d) = delay_us {
-                            format!(", delay: {} μs", d)
-                        } else {
-                            "".to_string()
-                        };
                         println!(
-                            "  let {} = read from {}: {} bytes{}",
-                            name, addr_str, len_str, delay_str
+                            "    Action: Read {} bytes from address {}",
+                            len_str, addr_str
                         );
+                        println!("    Bind to: {}", name);
+                        if let Some(d) = delay_us {
+                            println!("    Delay: {} μs after read", d);
+                        }
                     }
                 },
                 rseq::Stmt::Write {
@@ -139,12 +152,10 @@ fn main() {
                         }
                         rseq::Value::Ident(s) => s.clone(),
                     };
-                    let delay_str = if let Some(d) = delay_us {
-                        format!(", delay: {} μs", d)
-                    } else {
-                        "".to_string()
-                    };
-                    println!("  write {} to {} address{}", val_str, addr_str, delay_str);
+                    println!("    Action: Write {} to address {}", val_str, addr_str);
+                    if let Some(d) = delay_us {
+                        println!("    Delay: {} μs after write", d);
+                    }
                 }
             }
         }
@@ -157,13 +168,38 @@ fn main() {
             match vm.run() {
                 Ok(_) => {
                     println!("✓ Execution completed successfully");
-                    println!("Delay count: {} us", bus.get_delay_count());
 
-                    let mem = bus.get_memory();
-                    if !mem.is_empty() {
-                        println!("Written memory:");
-                        for (addr, val) in mem {
-                            println!("  0x{addr:08x} → 0x{val:02x}");
+                    let ops = bus.ops();
+                    if ops.is_empty() {
+                        println!("No bus operations recorded");
+                    } else {
+                        println!("Bus operations (in execution order):");
+                        for (step, op) in ops.iter().enumerate() {
+                            match op {
+                                mock::BusOp::Write { addr, data } => {
+                                    let bytes: String = data
+                                        .iter()
+                                        .map(|b| format!("0x{b:02x}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    println!("  Step {}: Write [{bytes}] → 0x{addr:08x}", step + 1);
+                                }
+                                mock::BusOp::Read { addr, data } => {
+                                    let bytes: String = data
+                                        .iter()
+                                        .map(|b| format!("0x{b:02x}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    println!(
+                                        "  Step {}: Read {} bytes from 0x{addr:08x} → [{bytes}]",
+                                        step + 1,
+                                        data.len()
+                                    );
+                                }
+                                mock::BusOp::Delay { us } => {
+                                    println!("  Step {}: Delay {us} μs", step + 1);
+                                }
+                            }
                         }
                     }
                 }
@@ -176,6 +212,16 @@ fn main() {
             println!("\nUse --execute to run in MockBus");
         }
     }
+}
+
+fn parse_hex_string(hex_str: &str) -> Result<Vec<u8>, String> {
+    hex_str
+        .split_whitespace()
+        .map(|s| {
+            u8::from_str_radix(s, 16)
+                .map_err(|e| format!("Failed to parse hex byte '{}': {}", s, e))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -214,5 +260,14 @@ mod tests {
         let decompiled = decompile(&bytecode).unwrap();
         assert!(decompiled.contains("write!(0x40, [0x01, 0x02, 0x03], 500);"));
         assert!(decompiled.contains("write!(0x100, 0xaa);"));
+    }
+
+    #[test]
+    fn test_parse_hex_string() {
+        let hex_str = "02 40 00 00 00 03 00 00 00 f4 01 00 00 01 02 03 ff";
+        let parsed = parse_hex_string(hex_str).unwrap();
+        assert_eq!(parsed.len(), 17);
+        assert_eq!(parsed[0], 0x02);
+        assert_eq!(parsed[16], 0xff);
     }
 }

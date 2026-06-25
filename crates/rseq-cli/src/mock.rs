@@ -1,30 +1,23 @@
-
 use rseq_vm::{Bus, BusError};
-use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusOp {
+    Read { addr: u32, data: Vec<u8> },
+    Write { addr: u32, data: Vec<u8> },
+    Delay { us: u32 },
+}
 
 pub struct MockBus {
-    memory: HashMap<u32, u8>,
-    delay_count: u32,
+    ops: Vec<BusOp>,
 }
 
 impl MockBus {
     pub fn new() -> Self {
-        Self {
-            memory: HashMap::new(),
-            delay_count: 0,
-        }
+        Self { ops: Vec::new() }
     }
 
-    pub fn get_memory(&self) -> &HashMap<u32, u8> {
-        &self.memory
-    }
-
-    pub fn get_delay_count(&self) -> u32 {
-        self.delay_count
-    }
-
-    pub fn set_memory(&mut self, addr: u32, value: u8) {
-        self.memory.insert(addr, value);
+    pub fn ops(&self) -> &[BusOp] {
+        &self.ops
     }
 }
 
@@ -36,21 +29,23 @@ impl Default for MockBus {
 
 impl Bus for MockBus {
     fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
-        for i in 0..data.len() {
-            data[i] = self.memory.get(&(addr + i as u32)).copied().unwrap_or(0);
-        }
+        self.ops.push(BusOp::Read {
+            addr,
+            data: data.to_vec(),
+        });
         Ok(())
     }
 
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
-        for i in 0..data.len() {
-            self.memory.insert(addr + i as u32, data[i]);
-        }
+        self.ops.push(BusOp::Write {
+            addr,
+            data: data.to_vec(),
+        });
         Ok(())
     }
 
     fn delay_us(&mut self, us: u32) -> Result<(), BusError> {
-        self.delay_count += us;
+        self.ops.push(BusOp::Delay { us });
         Ok(())
     }
 }

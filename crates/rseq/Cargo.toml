@@ -19,3 +19,4 @@ serde = { version = "1", features = ["derive"] }
 logos = "0.16.1"
 chumsky = "1.0.0-alpha.8"
 ariadne = { version = "0.6.0", features = ["auto-color"] }
+serde_yaml = "0.9.34"

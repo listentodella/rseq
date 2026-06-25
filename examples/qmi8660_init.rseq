@@ -1,0 +1,5 @@
+chip!("qmi8660.yaml");
+
+write!(UI.RESET, 0x98, 50000);
+let whoami = read!(UI.WHOAMI, 1, 100);
+write!(UI.ENCTL, 0x03);

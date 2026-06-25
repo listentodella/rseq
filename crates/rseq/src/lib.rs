@@ -1,19 +1,24 @@
 //! Register Sequence DSL Parser
 //! A DSL for defining register sequences in embedded systems
 
+mod chip;
+
 use chumsky::{
     input::{Stream, ValueInput},
     prelude::*,
 };
 use logos::Logos;
 use std::fmt;
+use std::path::Path;
 use std::vec::Vec;
+
+pub use chip::{load_chip, resolve_chip_path, Chip, ChipError, ChipRegistry, normalize_chip_path};
 
 #[derive(Logos, Clone, PartialEq, Debug)]
 enum Token<'a> {
     Error,
 
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*")]
+    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*")]
     Ident(&'a str),
 
     #[regex(r"0x[0-9a-fA-F]+", |lex| u32::from_str_radix(&lex.slice()[2..], 16).unwrap())]
@@ -28,6 +33,8 @@ enum Token<'a> {
     ReadMacro,
     #[token("write!")]
     WriteMacro,
+    #[token("chip!")]
+    ChipMacro,
     #[token("(")]
     LParen,
     #[token(")")]
@@ -40,6 +47,12 @@ enum Token<'a> {
     Comma,
     #[token(";")]
     Semicolon,
+
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
+        let s = lex.slice();
+        s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+    })]
+    String(String),
 
     #[regex(r"[ \t\f\n]+", logos::skip)]
     Whitespace,
@@ -54,12 +67,14 @@ impl fmt::Display for Token<'_> {
             Self::Assign => write!(f, "="),
             Self::ReadMacro => write!(f, "read!"),
             Self::WriteMacro => write!(f, "write!"),
+            Self::ChipMacro => write!(f, "chip!"),
             Self::LParen => write!(f, "("),
             Self::RParen => write!(f, ")"),
             Self::LBracket => write!(f, "["),
             Self::RBracket => write!(f, "]"),
             Self::Comma => write!(f, ","),
             Self::Semicolon => write!(f, ";"),
+            Self::String(s) => write!(f, "\"{s}\""),
             Self::Whitespace => write!(f, "<whitespace>"),
             Self::Error => write!(f, "<error>"),
         }
@@ -75,6 +90,9 @@ pub enum Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    Chip {
+        path: String,
+    },
     Let {
         name: String,
         expr: Expr,
@@ -155,6 +173,17 @@ fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Stmt, extra::Err<Rich<'to
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
+    let chip_stmt = just(Token::ChipMacro)
+        .ignore_then(
+            select! {
+                Token::String(s) => s.clone(),
+                Token::Ident(s) => s.to_string(),
+            }
+            .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|path| Stmt::Chip { path });
+
     let let_stmt = just(Token::Let)
         .ignore_then(select! { Token::Ident(s) => s.to_string() })
         .then(just(Token::Assign).ignore_then(read_expr()))
@@ -181,7 +210,7 @@ where
             }
         });
 
-    let_stmt.or(write_stmt)
+    chip_stmt.or(let_stmt).or(write_stmt)
 }
 
 fn parser<'tok, 'src: 'tok, I>()
@@ -216,27 +245,41 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 pub enum CompileError {
     UnsupportedValue,
     NumberExpected,
+    Chip(ChipError),
+    Register(String),
 }
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
+    compile_with_base(program, None)
+}
+
+pub fn compile_with_base(
+    program: &Program,
+    base_dir: Option<&Path>,
+) -> Result<Vec<u8>, CompileError> {
+    let mut registry = ChipRegistry::default();
+    for stmt in &program.stmts {
+        if let Stmt::Chip { path } = stmt {
+            let chip_path = resolve_chip_path(path, base_dir);
+            registry
+                .load_file(&chip_path)
+                .map_err(CompileError::Chip)?;
+        }
+    }
+
     let mut bytecode = Vec::new();
 
     for stmt in &program.stmts {
         match stmt {
+            Stmt::Chip { .. } => {}
             Stmt::Let { expr, .. } => match expr {
                 Expr::Read {
                     addr,
                     len,
                     delay_us,
                 } => {
-                    let addr = match addr {
-                        Value::Number(n) => *n,
-                        _ => return Err(CompileError::NumberExpected),
-                    };
-                    let len = match len {
-                        Value::Number(n) => *n,
-                        _ => return Err(CompileError::NumberExpected),
-                    };
+                    let addr = resolve_u32(addr, &registry)?;
+                    let len = resolve_u32(len, &registry)?;
                     let delay = delay_us.unwrap_or(0);
 
                     bytecode.push(rseq_vm::Opcode::Read as u8);
@@ -250,10 +293,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
                 val,
                 delay_us,
             } => {
-                let addr = match addr {
-                    Value::Number(n) => *n,
-                    _ => return Err(CompileError::NumberExpected),
-                };
+                let addr = resolve_u32(addr, &registry)?;
                 let delay = delay_us.unwrap_or(0);
 
                 let data = match val {
@@ -284,6 +324,17 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
 
     bytecode.push(rseq_vm::Opcode::Return as u8);
     Ok(bytecode)
+}
+
+fn resolve_u32(value: &Value, registry: &ChipRegistry) -> Result<u32, CompileError> {
+    match value {
+        Value::Number(n) => Ok(*n),
+        Value::Ident(name) => registry
+            .resolve_register(name)
+            .map(|(addr, _)| addr)
+            .map_err(|e| CompileError::Register(e.to_string())),
+        _ => Err(CompileError::NumberExpected),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,5 +482,32 @@ mod tests {
             }
             _ => panic!("Expected Write statement"),
         }
+    }
+
+    #[test]
+    fn test_parse_chip() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.WHOAMI, 0x06);
+        "#;
+        let program = parse(src).unwrap();
+        assert_eq!(program.stmts.len(), 2);
+        assert!(matches!(&program.stmts[0], Stmt::Chip { path } if path == "qmi8660.yaml"));
+    }
+
+    #[test]
+    fn test_compile_with_chip_register() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+        let src = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.RESET, 0x98, 50);
+        let id = read!(UI.WHOAMI, 1);
+        "#;
+        let program = parse(src).unwrap();
+        let bytecode = compile_with_base(&program, Some(base)).unwrap();
+        assert!(bytecode.len() > 1);
     }
 }

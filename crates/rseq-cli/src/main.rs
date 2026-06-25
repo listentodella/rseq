@@ -1,6 +1,7 @@
 use clap::Parser;
-use rseq::{compile, decompile, parse};
+use rseq::{compile_with_base, decompile, parse, resolve_chip_path, ChipRegistry};
 use rseq_vm::Vm;
+use std::path::Path;
 pub mod mock;
 use mock::MockBus;
 
@@ -49,14 +50,15 @@ fn main() {
             }
         }
     } else {
-        let src = if let Some(file) = cli.file {
+        let (src, base_dir) = if let Some(file) = &cli.file {
             let content = std::fs::read_to_string(file).expect("Failed to read rseq file");
             println!("Original rseq content:\n{}", content);
-            content
+            let base = Path::new(file).parent().map(Path::to_path_buf);
+            (content, base)
         } else {
             let default = "write!(0x10, 0xaa, 100);";
             println!("Using default rseq content:\n{}", default);
-            default.to_string()
+            (default.to_string(), None)
         };
 
         println!("\nParsing rseq...");
@@ -71,8 +73,32 @@ fn main() {
             }
         };
 
+        let mut chip_registry = ChipRegistry::default();
+        for stmt in &program.stmts {
+            if let rseq::Stmt::Chip { path } = stmt {
+                let chip_path = resolve_chip_path(path, base_dir.as_deref());
+                match chip_registry.load_file(&chip_path) {
+                    Ok(()) => {
+                        let chip = chip_registry.chips().last().expect("chip loaded");
+                        let reg_count: usize = chip.pages.iter().map(|p| p.registers.len()).sum();
+                        println!(
+                            "✓ Loaded chip '{}' from {} ({} pages, {} registers)",
+                            chip.sensor,
+                            chip_path.display(),
+                            chip.pages.len(),
+                            reg_count
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Chip load error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
         println!("\nCompiling to bytecode...");
-        let bytecode = match compile(&program) {
+        let bytecode = match compile_with_base(&program, base_dir.as_deref()) {
             Ok(b) => {
                 println!("✓ Compiled successfully ({} bytes)", b.len());
                 println!("Bytecode (vec): {:02x?}", b);
@@ -98,6 +124,9 @@ fn main() {
         for (idx, stmt) in program.stmts.iter().enumerate() {
             println!("  Step {}:", idx + 1);
             match stmt {
+                rseq::Stmt::Chip { path } => {
+                    println!("    Action: Load chip dictionary from {path}");
+                }
                 rseq::Stmt::Let { name, expr } => match expr {
                     rseq::Expr::Read {
                         addr,
@@ -227,6 +256,7 @@ fn parse_hex_string(hex_str: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rseq::compile;
 
     #[test]
     fn test_compile_and_run() {
@@ -241,11 +271,11 @@ mod tests {
         let mut vm = Vm::new(&mut bus, &bytecode);
         vm.run().unwrap();
 
-        assert_eq!(*bus.get_memory().get(&0x40).unwrap(), 0x01);
-        assert_eq!(*bus.get_memory().get(&0x41).unwrap(), 0x02);
-        assert_eq!(*bus.get_memory().get(&0x42).unwrap(), 0x03);
-        assert_eq!(*bus.get_memory().get(&0x100).unwrap(), 0xaa);
-        assert_eq!(bus.get_delay_count(), 500);
+        let ops = bus.ops();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(&ops[0], mock::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03]));
+        assert!(matches!(&ops[1], mock::BusOp::Delay { us: 500 }));
+        assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x100, data } if data == &[0xaa]));
     }
 
     #[test]

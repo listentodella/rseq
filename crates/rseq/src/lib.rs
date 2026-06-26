@@ -8,9 +8,10 @@ use chumsky::{
     prelude::*,
 };
 use logos::Logos;
+use serde::Deserialize;
 use std::fmt;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
 pub use chip::{
@@ -357,6 +358,106 @@ pub struct CompileDiagnostic {
     pub error: CompileError,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUnit {
+    pub name: String,
+    pub source: String,
+    pub base_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDiagnostic {
+    pub unit: usize,
+    pub span: Range<usize>,
+    pub message: String,
+    pub help: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProgramUnit<'a> {
+    pub program: &'a Program,
+    pub base_dir: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Manifest {
+    #[serde(default)]
+    pub chip: Option<String>,
+    #[serde(default)]
+    pub sequence: Vec<ManifestSequence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ManifestSequence {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestError {
+    Parse(String),
+    Empty,
+    DuplicateId(String),
+    UnknownId(String),
+}
+
+impl fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(msg) => write!(f, "manifest parse error: {msg}"),
+            Self::Empty => write!(f, "manifest does not define any [[sequence]] entries"),
+            Self::DuplicateId(id) => write!(f, "duplicate manifest sequence id '{id}'"),
+            Self::UnknownId(id) => write!(f, "unknown manifest sequence id '{id}'"),
+        }
+    }
+}
+
+impl Manifest {
+    pub fn parse(source: &str) -> Result<Self, ManifestError> {
+        let manifest: Self =
+            toml::from_str(source).map_err(|e| ManifestError::Parse(e.to_string()))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn selected_sequences<'a>(
+        &'a self,
+        ids: &[String],
+    ) -> Result<Vec<&'a ManifestSequence>, ManifestError> {
+        self.validate()?;
+
+        if ids.is_empty() {
+            return Ok(self.sequence.iter().collect());
+        }
+
+        ids.iter()
+            .map(|id| {
+                self.sequence
+                    .iter()
+                    .find(|sequence| sequence.id == *id)
+                    .ok_or_else(|| ManifestError::UnknownId(id.clone()))
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<(), ManifestError> {
+        if self.sequence.is_empty() {
+            return Err(ManifestError::Empty);
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for sequence in &self.sequence {
+            if !ids.insert(sequence.id.clone()) {
+                return Err(ManifestError::DuplicateId(sequence.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
     compile_with_base(program, None)
 }
@@ -373,6 +474,70 @@ pub fn compile_with_base_detailed(
     base_dir: Option<&Path>,
 ) -> Result<Vec<u8>, CompileDiagnostic> {
     let mut registry = ChipRegistry::default();
+    let mut bytecode = Vec::new();
+    compile_into(program, base_dir, &mut registry, &mut bytecode)?;
+    bytecode.push(rseq_vm::Opcode::Return as u8);
+    Ok(bytecode)
+}
+
+pub fn compile_units_detailed(units: &[SourceUnit]) -> Result<Vec<u8>, SourceDiagnostic> {
+    let mut programs = Vec::with_capacity(units.len());
+
+    for (unit_idx, unit) in units.iter().enumerate() {
+        let program = parse_detailed(&unit.source).map_err(|errors| {
+            let first = errors
+                .into_iter()
+                .next()
+                .expect("parse_detailed returned at least one diagnostic");
+            SourceDiagnostic {
+                unit: unit_idx,
+                span: first.span,
+                message: first.message,
+                help: Some("check the macro syntax and punctuation near this location".to_string()),
+            }
+        })?;
+        programs.push(program);
+    }
+
+    let program_units = programs
+        .iter()
+        .zip(units)
+        .map(|(program, unit)| ProgramUnit {
+            program,
+            base_dir: unit.base_dir.as_deref(),
+        })
+        .collect::<Vec<_>>();
+
+    compile_program_units_detailed(&program_units)
+}
+
+pub fn compile_program_units_detailed(
+    units: &[ProgramUnit<'_>],
+) -> Result<Vec<u8>, SourceDiagnostic> {
+    let mut registry = ChipRegistry::default();
+    let mut bytecode = Vec::new();
+
+    for (unit_idx, unit) in units.iter().enumerate() {
+        compile_into(unit.program, unit.base_dir, &mut registry, &mut bytecode).map_err(
+            |diag| SourceDiagnostic {
+                unit: unit_idx,
+                span: diag.span,
+                message: diag.message,
+                help: diag.help,
+            },
+        )?;
+    }
+
+    bytecode.push(rseq_vm::Opcode::Return as u8);
+    Ok(bytecode)
+}
+
+fn compile_into(
+    program: &Program,
+    base_dir: Option<&Path>,
+    registry: &mut ChipRegistry,
+    mut bytecode: &mut Vec<u8>,
+) -> Result<(), CompileDiagnostic> {
     for (idx, stmt) in program.stmts.iter().enumerate() {
         if let Stmt::Chip { path } = stmt {
             let chip_path = resolve_chip_path(path, base_dir);
@@ -382,8 +547,6 @@ pub fn compile_with_base_detailed(
                 .map_err(|error| compile_diagnostic(program, idx, error))?;
         }
     }
-
-    let mut bytecode = Vec::new();
 
     for (idx, stmt) in program.stmts.iter().enumerate() {
         let result = (|| -> Result<(), CompileError> {
@@ -468,8 +631,7 @@ pub fn compile_with_base_detailed(
         result.map_err(|error| compile_diagnostic(program, idx, error))?;
     }
 
-    bytecode.push(rseq_vm::Opcode::Return as u8);
-    Ok(bytecode)
+    Ok(())
 }
 
 fn compile_diagnostic(program: &Program, idx: usize, error: CompileError) -> CompileDiagnostic {
@@ -791,5 +953,123 @@ mod tests {
                 .as_deref()
                 .is_some_and(|help| help.contains("update! only on RW registers"))
         );
+    }
+
+    #[test]
+    fn test_compile_program_units_share_chip_registry_and_return_once() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+        let init = parse_detailed(
+            r#"
+            chip!("qmi8660.yaml");
+            write!(UI.RESET, 0x98);
+            "#,
+        )
+        .unwrap();
+        let enable = parse_detailed(
+            r#"
+            update!(UI.ENCTL.aen_ui, 1);
+            "#,
+        )
+        .unwrap();
+
+        let bytecode = compile_program_units_detailed(&[
+            ProgramUnit {
+                program: &init,
+                base_dir: Some(base),
+            },
+            ProgramUnit {
+                program: &enable,
+                base_dir: Some(base),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+        assert_eq!(
+            bytecode
+                .iter()
+                .filter(|byte| **byte == rseq_vm::Opcode::Return as u8)
+                .count(),
+            1
+        );
+        assert!(bytecode.contains(&(rseq_vm::Opcode::Update as u8)));
+    }
+
+    #[test]
+    fn test_compile_units_diagnostic_reports_source_index() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap().to_path_buf();
+        let units = vec![
+            SourceUnit {
+                name: "init.rseq".to_string(),
+                source: r#"chip!("qmi8660.yaml");"#.to_string(),
+                base_dir: Some(base.clone()),
+            },
+            SourceUnit {
+                name: "bad.rseq".to_string(),
+                source: r#"update!(UI.WHOAMI.value, 0x08);"#.to_string(),
+                base_dir: Some(base),
+            },
+        ];
+
+        let diag = compile_units_detailed(&units).unwrap_err();
+
+        assert_eq!(diag.unit, 1);
+        assert!(units[diag.unit].source[diag.span.clone()].contains("WHOAMI"));
+        assert!(
+            diag.help
+                .as_deref()
+                .is_some_and(|help| help.contains("update! only on RW registers"))
+        );
+    }
+
+    #[test]
+    fn test_manifest_selects_sequences_in_requested_order() {
+        let manifest = Manifest::parse(
+            r#"
+            chip = "qmi8660.yaml"
+
+            [[sequence]]
+            id = "init"
+            name = "Initialize QMI8660"
+            file = "qmi8660_init.rseq"
+
+            [[sequence]]
+            id = "enable_accel"
+            file = "qmi8660_enable_accel.rseq"
+            "#,
+        )
+        .unwrap();
+
+        let selected = manifest
+            .selected_sequences(&["enable_accel".to_string(), "init".to_string()])
+            .unwrap();
+
+        assert_eq!(manifest.chip.as_deref(), Some("qmi8660.yaml"));
+        assert_eq!(selected[0].id, "enable_accel");
+        assert_eq!(selected[1].id, "init");
+    }
+
+    #[test]
+    fn test_manifest_rejects_unknown_sequence() {
+        let manifest = Manifest::parse(
+            r#"
+            [[sequence]]
+            id = "init"
+            file = "qmi8660_init.rseq"
+            "#,
+        )
+        .unwrap();
+
+        let err = manifest
+            .selected_sequences(&["missing".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(err, ManifestError::UnknownId(id) if id == "missing"));
     }
 }

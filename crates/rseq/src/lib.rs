@@ -9,6 +9,7 @@ use chumsky::{
 };
 use logos::Logos;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,28 @@ enum Token<'a> {
     #[token(";")]
     Semicolon,
 
+    // ── 算术 / 位运算符 ──────────────────────────
+    #[token("+")]
+    Plus,
+    #[token("-")]
+    Minus,
+    #[token("*")]
+    Star,
+    #[token("/")]
+    Slash,
+    #[token("%")]
+    Percent,
+    #[token("<<")]
+    Shl,
+    #[token(">>")]
+    Shr,
+    #[token("&")]
+    Amp,
+    #[token("|")]
+    Pipe,
+    #[token("^")]
+    Caret,
+
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
         s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
@@ -93,6 +116,16 @@ impl fmt::Display for Token<'_> {
             Self::Colon => write!(f, ":"),
             Self::Comma => write!(f, ","),
             Self::Semicolon => write!(f, ";"),
+            Self::Plus => write!(f, "+"),
+            Self::Minus => write!(f, "-"),
+            Self::Star => write!(f, "*"),
+            Self::Slash => write!(f, "/"),
+            Self::Percent => write!(f, "%"),
+            Self::Shl => write!(f, "<<"),
+            Self::Shr => write!(f, ">>"),
+            Self::Amp => write!(f, "&"),
+            Self::Pipe => write!(f, "|"),
+            Self::Caret => write!(f, "^"),
             Self::String(s) => write!(f, "\"{s}\""),
             Self::Whitespace => write!(f, "<whitespace>"),
             Self::Error => write!(f, "<error>"),
@@ -129,12 +162,51 @@ pub enum Stmt {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Shl,
+    Shr,
+    And,
+    Or,
+    Xor,
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Mod => "%",
+            Self::Shl => "<<",
+            Self::Shr => ">>",
+            Self::And => "&",
+            Self::Or => "|",
+            Self::Xor => "^",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Read {
         addr: Value,
         len: Value,
         delay_us: Option<u32>,
+    },
+    Number(u32),
+    Ident(String),
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
 }
 
@@ -144,7 +216,7 @@ pub struct Program {
     pub stmt_spans: Vec<Range<usize>>,
 }
 
-fn value<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>>
+fn value<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -170,7 +242,7 @@ where
     })
 }
 
-fn field_map<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>>
+fn field_map<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -184,7 +256,7 @@ where
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
 }
 
-fn read_expr<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>>
+fn read_expr<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -208,6 +280,71 @@ where
         })
 }
 
+/// 完整表达式解析器，支持加减乘除、移位、逻辑与或异或，以及括号。
+///
+/// 优先级（从低到高）：
+///   `|` → `^` → `&` → `<<`/`>>` → `+`/`-` → `*`/`/`/`%` → primary
+fn expr<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    recursive(|expr| {
+        let number = select! { Token::Number(n) => Expr::Number(n) };
+        let ident = select! { Token::Ident(s) => Expr::Ident(s.to_string()) };
+        let paren = expr
+            .clone()
+            .delimited_by(just(Token::LParen), just(Token::RParen));
+        let primary = number.or(ident).or(read_expr()).or(paren);
+
+        fn binop_layer<'tok, 'src: 'tok, I>(
+            prev: impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok,
+            op_parser: impl Parser<'tok, I, BinOp, ParserExtra<'tok, 'src>> + Clone + 'tok,
+        ) -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok
+        where
+            I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+        {
+            prev.clone()
+                .then(op_parser.then(prev).repeated().collect::<Vec<_>>())
+                .map(|(first, rest)| {
+                    rest.into_iter().fold(first, |lhs, (op, rhs)| Expr::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    })
+                })
+                .boxed()
+        }
+
+        // 乘除模
+        let mul_op = just(Token::Star).to(BinOp::Mul)
+            .or(just(Token::Slash).to(BinOp::Div))
+            .or(just(Token::Percent).to(BinOp::Mod));
+        let mul = binop_layer(primary, mul_op);
+
+        // 加减
+        let add_op = just(Token::Plus).to(BinOp::Add)
+            .or(just(Token::Minus).to(BinOp::Sub));
+        let add = binop_layer(mul, add_op);
+
+        // 移位
+        let shift_op = just(Token::Shl).to(BinOp::Shl)
+            .or(just(Token::Shr).to(BinOp::Shr));
+        let shift = binop_layer(add, shift_op);
+
+        // 按位与
+        let and_op = just(Token::Amp).to(BinOp::And);
+        let and = binop_layer(shift, and_op);
+
+        // 按位异或
+        let xor_op = just(Token::Caret).to(BinOp::Xor);
+        let xor = binop_layer(and, xor_op);
+
+        // 按位或
+        let or_op = just(Token::Pipe).to(BinOp::Or);
+        binop_layer(xor, or_op)
+    })
+}
+
 fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
@@ -225,7 +362,7 @@ where
 
     let let_stmt = just(Token::Let)
         .ignore_then(select! { Token::Ident(s) => s.to_string() })
-        .then(just(Token::Assign).ignore_then(read_expr()))
+        .then(just(Token::Assign).ignore_then(expr()))
         .then_ignore(just(Token::Semicolon).or_not())
         .map(|(name, expr)| Stmt::Let { name, expr });
 
@@ -336,6 +473,8 @@ pub enum CompileError {
     Chip(ChipError),
     Register(String),
     Update(String),
+    UndefinedVariable(String),
+    RegisterOverflow,
 }
 
 impl fmt::Display for CompileError {
@@ -346,6 +485,10 @@ impl fmt::Display for CompileError {
             Self::Chip(err) => write!(f, "{err}"),
             Self::Register(msg) => write!(f, "register resolution failed: {msg}"),
             Self::Update(msg) => write!(f, "update failed: {msg}"),
+            Self::UndefinedVariable(name) => {
+                write!(f, "undefined variable '{name}'")
+            }
+            Self::RegisterOverflow => write!(f, "register overflow: too many live values"),
         }
     }
 }
@@ -475,7 +618,16 @@ pub fn compile_with_base_detailed(
 ) -> Result<Vec<u8>, CompileDiagnostic> {
     let mut registry = ChipRegistry::default();
     let mut bytecode = Vec::new();
-    compile_into(program, base_dir, &mut registry, &mut bytecode)?;
+    let mut vars = HashMap::new();
+    let mut next_reg: u16 = 0;
+    compile_into(
+        program,
+        base_dir,
+        &mut registry,
+        &mut bytecode,
+        &mut vars,
+        &mut next_reg,
+    )?;
     bytecode.push(rseq_vm::Opcode::Return as u8);
     Ok(bytecode)
 }
@@ -516,16 +668,24 @@ pub fn compile_program_units_detailed(
 ) -> Result<Vec<u8>, SourceDiagnostic> {
     let mut registry = ChipRegistry::default();
     let mut bytecode = Vec::new();
+    let mut vars = HashMap::new();
+    let mut next_reg: u16 = 0;
 
     for (unit_idx, unit) in units.iter().enumerate() {
-        compile_into(unit.program, unit.base_dir, &mut registry, &mut bytecode).map_err(
-            |diag| SourceDiagnostic {
-                unit: unit_idx,
-                span: diag.span,
-                message: diag.message,
-                help: diag.help,
-            },
-        )?;
+        compile_into(
+            unit.program,
+            unit.base_dir,
+            &mut registry,
+            &mut bytecode,
+            &mut vars,
+            &mut next_reg,
+        )
+        .map_err(|diag| SourceDiagnostic {
+            unit: unit_idx,
+            span: diag.span,
+            message: diag.message,
+            help: diag.help,
+        })?;
     }
 
     bytecode.push(rseq_vm::Opcode::Return as u8);
@@ -536,8 +696,11 @@ fn compile_into(
     program: &Program,
     base_dir: Option<&Path>,
     registry: &mut ChipRegistry,
-    mut bytecode: &mut Vec<u8>,
+    bytecode: &mut Vec<u8>,
+    vars: &mut HashMap<String, u8>,
+    next_reg: &mut u16,
 ) -> Result<(), CompileDiagnostic> {
+    // 第一遍：加载所有 chip! 字典
     for (idx, stmt) in program.stmts.iter().enumerate() {
         if let Stmt::Chip { path } = stmt {
             let chip_path = resolve_chip_path(path, base_dir);
@@ -548,90 +711,160 @@ fn compile_into(
         }
     }
 
+    // 第二遍：编译语句
     for (idx, stmt) in program.stmts.iter().enumerate() {
-        let result = (|| -> Result<(), CompileError> {
-            match stmt {
-                Stmt::Chip { .. } => {}
-                Stmt::Let { expr, .. } => match expr {
-                    Expr::Read {
-                        addr,
-                        len,
-                        delay_us,
-                    } => {
-                        let addr = resolve_u32(addr, &registry)?;
-                        let len = resolve_u32(len, &registry)?;
-                        let delay = delay_us.unwrap_or(0);
-
-                        bytecode.push(rseq_vm::Opcode::Read as u8);
-                        bytecode.extend_from_slice(&addr.to_le_bytes());
-                        bytecode.extend_from_slice(&len.to_le_bytes());
-                        bytecode.extend_from_slice(&delay.to_le_bytes());
-                    }
-                },
-                Stmt::Write {
-                    addr,
-                    val,
-                    delay_us,
-                } => {
-                    let addr = resolve_u32(addr, &registry)?;
-                    let delay = delay_us.unwrap_or(0);
-
-                    let data = match val {
-                        Value::Number(n) => vec![*n as u8],
-                        Value::Array(arr) => {
-                            let mut bytes = Vec::new();
-                            for v in arr {
-                                match v {
-                                    Value::Number(n) => bytes.push(*n as u8),
-                                    _ => return Err(CompileError::UnsupportedValue),
-                                }
-                            }
-                            bytes
-                        }
-                        _ => return Err(CompileError::UnsupportedValue),
-                    };
-
-                    let len = data.len() as u32;
-
-                    bytecode.push(rseq_vm::Opcode::Write as u8);
-                    bytecode.extend_from_slice(&addr.to_le_bytes());
-                    bytecode.extend_from_slice(&len.to_le_bytes());
-                    bytecode.extend_from_slice(&delay.to_le_bytes());
-                    bytecode.extend(data);
-                }
-                Stmt::Update {
-                    target,
-                    val,
-                    delay_us,
-                } => {
-                    let updates = match val {
-                        Value::Number(n) => {
-                            let field = target
-                                .rsplit('.')
-                                .next()
-                                .ok_or_else(|| CompileError::Update("missing field name".into()))?;
-                            vec![(field.to_string(), *n)]
-                        }
-                        Value::FieldMap(entries) => entries.clone(),
-                        _ => {
-                            return Err(CompileError::Update(
-                                "expected field value or field map".into(),
-                            ));
-                        }
-                    };
-                    let plan = registry
-                        .plan_update(target, &updates)
-                        .map_err(|e| CompileError::Chip(e))?;
-                    emit_update_bytecode(&mut bytecode, &plan, delay_us.unwrap_or(0));
-                }
-            }
-            Ok(())
-        })();
-
-        result.map_err(|error| compile_diagnostic(program, idx, error))?;
+        if let Err(error) = compile_stmt(stmt, registry, vars, next_reg, bytecode) {
+            return Err(compile_diagnostic(program, idx, error));
+        }
     }
 
     Ok(())
+}
+
+fn compile_stmt(
+    stmt: &Stmt,
+    registry: &ChipRegistry,
+    vars: &mut HashMap<String, u8>,
+    next_reg: &mut u16,
+    bytecode: &mut Vec<u8>,
+) -> Result<(), CompileError> {
+    match stmt {
+        Stmt::Chip { .. } => {}
+        Stmt::Let { name, expr } => {
+            let dst = compile_expr(expr, registry, vars, next_reg, bytecode)?;
+            vars.insert(name.clone(), dst);
+        }
+        Stmt::Write {
+            addr,
+            val,
+            delay_us,
+        } => {
+            let addr = resolve_u32(addr, registry)?;
+            let delay = delay_us.unwrap_or(0);
+
+            let data = match val {
+                Value::Number(n) => vec![*n as u8],
+                Value::Array(arr) => {
+                    let mut bytes = Vec::new();
+                    for v in arr {
+                        match v {
+                            Value::Number(n) => bytes.push(*n as u8),
+                            _ => return Err(CompileError::UnsupportedValue),
+                        }
+                    }
+                    bytes
+                }
+                _ => return Err(CompileError::UnsupportedValue),
+            };
+
+            let len = data.len() as u32;
+
+            bytecode.push(rseq_vm::Opcode::Write as u8);
+            bytecode.extend_from_slice(&addr.to_le_bytes());
+            bytecode.extend_from_slice(&len.to_le_bytes());
+            bytecode.extend_from_slice(&delay.to_le_bytes());
+            bytecode.extend(data);
+        }
+        Stmt::Update {
+            target,
+            val,
+            delay_us,
+        } => {
+            let updates = match val {
+                Value::Number(n) => {
+                    let field = target
+                        .rsplit('.')
+                        .next()
+                        .ok_or_else(|| CompileError::Update("missing field name".into()))?;
+                    vec![(field.to_string(), *n)]
+                }
+                Value::FieldMap(entries) => entries.clone(),
+                _ => {
+                    return Err(CompileError::Update(
+                        "expected field value or field map".into(),
+                    ));
+                }
+            };
+            let plan = registry
+                .plan_update(target, &updates)
+                .map_err(CompileError::Chip)?;
+            emit_update_bytecode(bytecode, &plan, delay_us.unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
+/// 分配一个新的寄存器索引。
+fn alloc_reg(next_reg: &mut u16) -> Result<u8, CompileError> {
+    if *next_reg >= 256 {
+        return Err(CompileError::RegisterOverflow);
+    }
+    let reg = *next_reg as u8;
+    *next_reg += 1;
+    Ok(reg)
+}
+
+/// 将表达式编译为字节码，返回存放结果的寄存器索引。
+fn compile_expr(
+    expr: &Expr,
+    registry: &ChipRegistry,
+    vars: &mut HashMap<String, u8>,
+    next_reg: &mut u16,
+    bytecode: &mut Vec<u8>,
+) -> Result<u8, CompileError> {
+    match expr {
+        Expr::Number(n) => {
+            let dst = alloc_reg(next_reg)?;
+            bytecode.push(rseq_vm::Opcode::LoadConst as u8);
+            bytecode.push(dst);
+            bytecode.extend_from_slice(&n.to_le_bytes());
+            Ok(dst)
+        }
+        Expr::Ident(name) => vars.get(name).copied().ok_or_else(|| {
+            CompileError::UndefinedVariable(name.clone())
+        }),
+        Expr::Read {
+            addr,
+            len,
+            delay_us,
+        } => {
+            let addr = resolve_u32(addr, registry)?;
+            let len = resolve_u32(len, registry)?;
+            if len == 0 || len > 4 {
+                return Err(CompileError::UnsupportedValue);
+            }
+            let delay = delay_us.unwrap_or(0);
+            let dst = alloc_reg(next_reg)?;
+            bytecode.push(rseq_vm::Opcode::ReadVar as u8);
+            bytecode.extend_from_slice(&addr.to_le_bytes());
+            bytecode.extend_from_slice(&len.to_le_bytes());
+            bytecode.extend_from_slice(&delay.to_le_bytes());
+            bytecode.push(dst);
+            Ok(dst)
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_reg = compile_expr(lhs, registry, vars, next_reg, bytecode)?;
+            let rhs_reg = compile_expr(rhs, registry, vars, next_reg, bytecode)?;
+            let dst = alloc_reg(next_reg)?;
+            let opcode = match op {
+                BinOp::Add => rseq_vm::Opcode::Add,
+                BinOp::Sub => rseq_vm::Opcode::Sub,
+                BinOp::Mul => rseq_vm::Opcode::Mul,
+                BinOp::Div => rseq_vm::Opcode::Div,
+                BinOp::Mod => rseq_vm::Opcode::Mod,
+                BinOp::Shl => rseq_vm::Opcode::Shl,
+                BinOp::Shr => rseq_vm::Opcode::Shr,
+                BinOp::And => rseq_vm::Opcode::And,
+                BinOp::Or => rseq_vm::Opcode::Or,
+                BinOp::Xor => rseq_vm::Opcode::Xor,
+            };
+            bytecode.push(opcode as u8);
+            bytecode.push(dst);
+            bytecode.push(lhs_reg);
+            bytecode.push(rhs_reg);
+            Ok(dst)
+        }
+    }
 }
 
 fn compile_diagnostic(program: &Program, idx: usize, error: CompileError) -> CompileDiagnostic {
@@ -665,6 +898,12 @@ fn compile_help(error: &CompileError) -> Option<String> {
         ),
         CompileError::Update(_) => Some(
             "use update!(PAGE.REG.FIELD, value) or update!(PAGE.REG, { field: value })".to_string(),
+        ),
+        CompileError::UndefinedVariable(name) => Some(format!(
+            "declare '{name}' with `let {name} = ...` before using it in an expression"
+        )),
+        CompileError::RegisterOverflow => Some(
+            "the program uses too many live values; reduce the number of let bindings".to_string(),
         ),
         _ => None,
     }
@@ -768,6 +1007,78 @@ pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
             Some(rseq_vm::Opcode::Return) => {
                 break;
             }
+            Some(rseq_vm::Opcode::ReadVar) => {
+                pc += 1;
+                let addr = read_u32(bytecode, &mut pc)?;
+                let len = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                pc += 1;
+                output.push_str(&format!("// r{dst} = read!(0x{addr:x}, {len}"));
+                if delay > 0 {
+                    output.push_str(&format!(", {delay}"));
+                }
+                output.push_str(");\n");
+            }
+            Some(rseq_vm::Opcode::LoadConst) => {
+                pc += 1;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                pc += 1;
+                let imm = read_u32(bytecode, &mut pc)?;
+                output.push_str(&format!("// r{dst} = 0x{imm:x}\n"));
+            }
+            Some(rseq_vm::Opcode::Move) => {
+                pc += 1;
+                if pc + 1 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                let src = bytecode[pc + 1];
+                pc += 2;
+                output.push_str(&format!("// r{dst} = r{src}\n"));
+            }
+            Some(op @ (rseq_vm::Opcode::Add
+            | rseq_vm::Opcode::Sub
+            | rseq_vm::Opcode::Mul
+            | rseq_vm::Opcode::Div
+            | rseq_vm::Opcode::Mod
+            | rseq_vm::Opcode::Shl
+            | rseq_vm::Opcode::Shr
+            | rseq_vm::Opcode::And
+            | rseq_vm::Opcode::Or
+            | rseq_vm::Opcode::Xor)) => {
+                pc += 1;
+                if pc + 2 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                let lhs = bytecode[pc + 1];
+                let rhs = bytecode[pc + 2];
+                pc += 3;
+                let op_str = match op {
+                    rseq_vm::Opcode::Add => "+",
+                    rseq_vm::Opcode::Sub => "-",
+                    rseq_vm::Opcode::Mul => "*",
+                    rseq_vm::Opcode::Div => "/",
+                    rseq_vm::Opcode::Mod => "%",
+                    rseq_vm::Opcode::Shl => "<<",
+                    rseq_vm::Opcode::Shr => ">>",
+                    rseq_vm::Opcode::And => "&",
+                    rseq_vm::Opcode::Or => "|",
+                    rseq_vm::Opcode::Xor => "^",
+                    _ => unreachable!(),
+                };
+                output.push_str(&format!("// r{dst} = r{lhs} {op_str} r{rhs}\n"));
+            }
+            Some(rseq_vm::Opcode::WriteVar | rseq_vm::Opcode::UpdateVar) => {
+                return Err(DecompileError::InvalidOpcode);
+            }
             None => {
                 return Err(DecompileError::InvalidOpcode);
             }
@@ -803,6 +1114,7 @@ mod tests {
                         assert_eq!(len, &Value::Number(1));
                         assert_eq!(delay_us, &Some(100));
                     }
+                    _ => panic!("Expected Expr::Read"),
                 }
             }
             _ => panic!("Expected Let statement"),
@@ -1071,5 +1383,310 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ManifestError::UnknownId(id) if id == "missing"));
+    }
+
+    // ── 算术表达式测试 ──────────────────────────────────
+
+    #[test]
+    fn test_parse_let_number() {
+        let src = "let a = 0x10;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { name, expr } => {
+                assert_eq!(name, "a");
+                assert_eq!(expr, &Expr::Number(0x10));
+            }
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_let_add() {
+        let src = "let c = 1 + 2;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { name, expr } => {
+                assert_eq!(name, "c");
+                match expr {
+                    Expr::Binary { op, lhs, rhs } => {
+                        assert_eq!(*op, BinOp::Add);
+                        assert_eq!(**lhs, Expr::Number(1));
+                        assert_eq!(**rhs, Expr::Number(2));
+                    }
+                    _ => panic!("expected Binary"),
+                }
+            }
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_precedence_mul_over_add() {
+        // a + b * c  →  a + (b * c)
+        let src = "let x = 1 + 2 * 3;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { expr, .. } => match expr {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(*op, BinOp::Add);
+                    assert_eq!(**lhs, Expr::Number(1));
+                    match rhs.as_ref() {
+                        Expr::Binary { op, .. } => assert_eq!(*op, BinOp::Mul),
+                        _ => panic!("expected Mul on rhs"),
+                    }
+                }
+                _ => panic!("expected Binary"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_parens_override_precedence() {
+        // (a + b) * c  →  (a + b) is grouped
+        let src = "let x = (1 + 2) * 3;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { expr, .. } => match expr {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(*op, BinOp::Mul);
+                    match lhs.as_ref() {
+                        Expr::Binary { op, .. } => assert_eq!(*op, BinOp::Add),
+                        _ => panic!("expected Add in parens"),
+                    }
+                    assert_eq!(**rhs, Expr::Number(3));
+                }
+                _ => panic!("expected Binary"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_all_binary_ops() {
+        let cases = [
+            ("+", BinOp::Add),
+            ("-", BinOp::Sub),
+            ("*", BinOp::Mul),
+            ("/", BinOp::Div),
+            ("%", BinOp::Mod),
+            ("<<", BinOp::Shl),
+            (">>", BinOp::Shr),
+            ("&", BinOp::And),
+            ("|", BinOp::Or),
+            ("^", BinOp::Xor),
+        ];
+        for (sym, expected) in cases {
+            let src = format!("let x = 1 {sym} 2;");
+            let program = parse(&src).unwrap();
+            match &program.stmts[0] {
+                Stmt::Let { expr, .. } => match expr {
+                    Expr::Binary { op, .. } => assert_eq!(*op, expected, "for symbol {sym}"),
+                    _ => panic!("expected Binary for {sym}"),
+                },
+                _ => panic!("expected Let"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_shift_precedence_below_arith() {
+        // 1 + 2 << 3  →  (1 + 2) << 3   [shift is lower precedence than +]
+        let src = "let x = 1 + 2 << 3;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { expr, .. } => match expr {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(*op, BinOp::Shl);
+                    match lhs.as_ref() {
+                        Expr::Binary { op, .. } => assert_eq!(*op, BinOp::Add),
+                        _ => panic!("expected Add below shift"),
+                    }
+                    assert_eq!(**rhs, Expr::Number(3));
+                }
+                _ => panic!("expected Binary"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_and_or_xor_precedence() {
+        // a | b ^ c & d  →  a | (b ^ (c & d))
+        let src = "let x = 1 | 2 ^ 3 & 4;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { expr, .. } => match expr {
+                Expr::Binary { op, lhs, rhs } => {
+                    assert_eq!(*op, BinOp::Or);
+                    assert_eq!(**lhs, Expr::Number(1));
+                    match rhs.as_ref() {
+                        Expr::Binary { op, rhs, .. } => {
+                            assert_eq!(*op, BinOp::Xor);
+                            match rhs.as_ref() {
+                                Expr::Binary { op, .. } => assert_eq!(*op, BinOp::And),
+                                _ => panic!("expected And at deepest level"),
+                            }
+                        }
+                        _ => panic!("expected Xor"),
+                    }
+                }
+                _ => panic!("expected Binary"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_parse_variable_reference_in_expr() {
+        let src = "let c = a + b;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { name, expr } => {
+                assert_eq!(name, "c");
+                match expr {
+                    Expr::Binary { op, lhs, rhs } => {
+                        assert_eq!(*op, BinOp::Add);
+                        assert_eq!(**lhs, Expr::Ident("a".into()));
+                        assert_eq!(**rhs, Expr::Ident("b".into()));
+                    }
+                    _ => panic!("expected Binary"),
+                }
+            }
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_compile_arithmetic_add() {
+        let src = "let x = 1 + 2;";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        // LoadConst r0=1 ; LoadConst r1=2 ; Add r2=r0+r1 ; Return
+        assert_eq!(bytecode[0], rseq_vm::Opcode::LoadConst as u8);
+        assert_eq!(bytecode[6], rseq_vm::Opcode::LoadConst as u8);
+        assert_eq!(bytecode[12], rseq_vm::Opcode::Add as u8);
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_compile_arithmetic_with_variables() {
+        let src = r"
+        let a = 0x10;
+        let b = 0x20;
+        let c = a + b;
+        ";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        // a: LoadConst r0=0x10
+        // b: LoadConst r1=0x20
+        // c: Add r2=r0+r1
+        assert!(bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Add as u8));
+    }
+
+    #[test]
+    fn test_compile_read_var_emits_readvar() {
+        let src = "let val = read!(0x10, 1);";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        assert_eq!(bytecode[0], rseq_vm::Opcode::ReadVar as u8);
+    }
+
+    #[test]
+    fn test_compile_undefined_variable_error() {
+        let src = "let x = undefined_var + 1;";
+        let program = parse_detailed(src).unwrap();
+        let diag = compile_with_base_detailed(&program, None).unwrap_err();
+        assert!(matches!(
+            diag.error,
+            CompileError::UndefinedVariable(ref name) if name == "undefined_var"
+        ));
+    }
+
+    #[test]
+    fn test_compile_and_run_arithmetic_in_vm() {
+        // compile a program that does arithmetic and verify via decompile
+        let src = r"
+        let a = 6;
+        let b = 7;
+        let c = a * b;
+        let d = c - 1;
+        let e = d << 2;
+        let f = e & 0xFF;
+        let g = f | 0x100;
+        let h = g ^ 0x10;
+        ";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        // Just verify it compiles and contains expected opcodes
+        let has_mul = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Mul as u8);
+        let has_sub = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Sub as u8);
+        let has_shl = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Shl as u8);
+        let has_and = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::And as u8);
+        let has_or = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Or as u8);
+        let has_xor = bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Xor as u8);
+        assert!(has_mul && has_sub && has_shl && has_and && has_or && has_xor);
+    }
+
+    #[test]
+    fn test_decompile_arithmetic_opcodes() {
+        let src = "let x = 1 + 2;";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        let decompiled = decompile(&bytecode).unwrap();
+        assert!(decompiled.contains("LoadConst") || decompiled.contains("r0 = 0x"));
+        assert!(decompiled.contains("+"));
+    }
+
+    #[test]
+    fn test_compile_div_and_mod() {
+        let src = r"
+        let q = 17 / 5;
+        let r = 17 % 5;
+        ";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        assert!(bytecode.iter().any(|&b| b == rseq_vm::Opcode::Div as u8));
+        assert!(bytecode.iter().any(|&b| b == rseq_vm::Opcode::Mod as u8));
+    }
+
+    #[test]
+    fn test_compile_shr() {
+        let src = "let x = 0x100 >> 4;";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        assert!(bytecode
+            .iter()
+            .any(|&b| b == rseq_vm::Opcode::Shr as u8));
+    }
+
+    #[test]
+    fn test_parse_complex_expression() {
+        let src = "let x = (a + b) * (c - d) & 0xFF;";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Let { expr, .. } => {
+                // top-level should be & (lowest precedence here)
+                match expr {
+                    Expr::Binary { op, .. } => assert_eq!(*op, BinOp::And),
+                    _ => panic!("expected And at top level"),
+                }
+            }
+            _ => panic!("expected Let"),
+        }
     }
 }

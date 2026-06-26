@@ -155,32 +155,12 @@ fn main() {
                     rseq::Stmt::Chip { path } => {
                         println!("    Action: Load chip dictionary from {path}");
                     }
-                    rseq::Stmt::Let { name, expr } => match expr {
-                        rseq::Expr::Read {
-                            addr,
-                            len,
-                            delay_us,
-                        } => {
-                            let addr_str = match addr {
-                                rseq::Value::Number(n) => format!("0x{:x}", n),
-                                rseq::Value::Ident(s) => s.clone(),
-                                _ => "unknown".to_string(),
-                            };
-                            let len_str = match len {
-                                rseq::Value::Number(n) => n.to_string(),
-                                rseq::Value::Ident(s) => s.clone(),
-                                _ => "unknown".to_string(),
-                            };
-                            println!(
-                                "    Action: Read {} bytes from address {}",
-                                len_str, addr_str
-                            );
-                            println!("    Bind to: {}", name);
-                            if let Some(d) = delay_us {
-                                println!("    Delay: {} μs after read", d);
-                            }
+                    rseq::Stmt::Let { name, expr } => {
+                        println!("    Action: Bind {} = {}", name, format_expr(expr));
+                        if let rseq::Expr::Read { delay_us: Some(d), .. } = expr {
+                            println!("    Delay: {} μs after read", d);
                         }
-                    },
+                    }
                     rseq::Stmt::Write {
                         addr,
                         val,
@@ -376,6 +356,38 @@ fn load_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, Str
 
 fn escape_rseq_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_expr(expr: &rseq::Expr) -> String {
+    match expr {
+        rseq::Expr::Read {
+            addr,
+            len,
+            delay_us,
+        } => {
+            let addr_str = match addr {
+                rseq::Value::Number(n) => format!("0x{:x}", n),
+                rseq::Value::Ident(s) => s.clone(),
+                _ => "unknown".to_string(),
+            };
+            let len_str = match len {
+                rseq::Value::Number(n) => n.to_string(),
+                rseq::Value::Ident(s) => s.clone(),
+                _ => "unknown".to_string(),
+            };
+            let mut s = format!("read!({addr_str}, {len_str}");
+            if let Some(d) = delay_us {
+                s.push_str(&format!(", {d}"));
+            }
+            s.push(')');
+            s
+        }
+        rseq::Expr::Number(n) => format!("0x{n:x}"),
+        rseq::Expr::Ident(name) => name.clone(),
+        rseq::Expr::Binary { op, lhs, rhs } => {
+            format!("({} {} {})", format_expr(lhs), op, format_expr(rhs))
+        }
+    }
 }
 
 fn emit_diagnostic(

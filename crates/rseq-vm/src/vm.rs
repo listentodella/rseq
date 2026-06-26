@@ -7,12 +7,18 @@ pub enum VmError {
     BusError(BusError),
     ProgramTooShort,
     InvalidLength,
+    DivideByZero,
 }
+
+/// 通用寄存器数量。寄存器以 u8 索引，故最多 256 个。
+pub const REG_COUNT: usize = 256;
 
 pub struct Vm<'a, B: Bus> {
     bus: &'a mut B,
     pc: usize,
     program: &'a [u8],
+    /// 通用寄存器文件，供算术/逻辑指令使用。
+    regs: [u32; REG_COUNT],
 }
 
 impl<'a, B: Bus> Vm<'a, B> {
@@ -21,6 +27,7 @@ impl<'a, B: Bus> Vm<'a, B> {
             bus,
             pc: 0,
             program,
+            regs: [0; REG_COUNT],
         }
     }
 
@@ -119,8 +126,87 @@ impl<'a, B: Bus> Vm<'a, B> {
                         self.bus.delay_us(delay).map_err(VmError::BusError)?;
                     }
                 }
+                Some(Opcode::ReadVar) => {
+                    let addr = self.read_u32()?;
+                    let len = self.read_u32()?;
+                    let delay = self.read_u32()?;
+                    let dst = self.read_u8()? as usize;
+
+                    if len == 0 || len > 4 {
+                        return Err(VmError::InvalidLength);
+                    }
+                    let mut buffer = [0u8; 4];
+                    let data = &mut buffer[..len as usize];
+                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+
+                    let mut val = 0u32;
+                    for (i, &b) in data.iter().enumerate() {
+                        val |= (b as u32) << (8 * i);
+                    }
+                    self.regs[dst] = val;
+
+                    if delay > 0 {
+                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                    }
+                }
+                Some(Opcode::LoadConst) => {
+                    let dst = self.read_u8()? as usize;
+                    let imm = self.read_u32()?;
+                    self.regs[dst] = imm;
+                }
+                Some(Opcode::Move) => {
+                    let dst = self.read_u8()? as usize;
+                    let src = self.read_u8()? as usize;
+                    self.regs[dst] = self.regs[src];
+                }
+                Some(
+                    op @ (Opcode::Add
+                    | Opcode::Sub
+                    | Opcode::Mul
+                    | Opcode::Div
+                    | Opcode::Mod
+                    | Opcode::Shl
+                    | Opcode::Shr
+                    | Opcode::And
+                    | Opcode::Or
+                    | Opcode::Xor),
+                ) => {
+                    let dst = self.read_u8()? as usize;
+                    let lhs = self.regs[self.read_u8()? as usize];
+                    let rhs = self.regs[self.read_u8()? as usize];
+                    let result = match op {
+                        Opcode::Add => lhs.wrapping_add(rhs),
+                        Opcode::Sub => lhs.wrapping_sub(rhs),
+                        Opcode::Mul => lhs.wrapping_mul(rhs),
+                        Opcode::Div => {
+                            if rhs == 0 {
+                                return Err(VmError::DivideByZero);
+                            }
+                            lhs / rhs
+                        }
+                        Opcode::Mod => {
+                            if rhs == 0 {
+                                return Err(VmError::DivideByZero);
+                            }
+                            lhs % rhs
+                        }
+                        // 移位量取 rhs 低位，避免 >= 32 时 panic。
+                        Opcode::Shl => lhs.wrapping_shl(rhs),
+                        Opcode::Shr => lhs.wrapping_shr(rhs),
+                        Opcode::And => lhs & rhs,
+                        Opcode::Or => lhs | rhs,
+                        Opcode::Xor => lhs ^ rhs,
+                        // 上面的 match 已覆盖全部进入此分支的 opcode。
+                        _ => unreachable!(),
+                    };
+                    self.regs[dst] = result;
+                }
                 Some(Opcode::Return) => {
                     return Ok(());
+                }
+                // WriteVar / UpdateVar 尚未在 VM 中实现。
+                Some(Opcode::WriteVar | Opcode::UpdateVar) => {
+                    return Err(VmError::InvalidOpcode);
                 }
                 None => {
                     return Err(VmError::InvalidOpcode);
@@ -158,6 +244,101 @@ fn merge_field(reg_val: u64, bit_lo: u8, bit_hi: u8, value: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{Bus, BusError};
+
+    /// 简易 mock bus，仅用于 VM 单元测试。
+    struct TestBus {
+        mem: [u8; 256],
+    }
+
+    impl TestBus {
+        fn new() -> Self {
+            Self { mem: [0; 256] }
+        }
+    }
+
+    impl Bus for TestBus {
+        fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+            for (i, slot) in data.iter_mut().enumerate() {
+                *slot = self.mem[(addr as usize + i) % 256];
+            }
+            Ok(())
+        }
+        fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+            for (i, &b) in data.iter().enumerate() {
+                self.mem[(addr as usize + i) % 256] = b;
+            }
+            Ok(())
+        }
+        fn delay_us(&mut self, _us: u32) -> Result<(), BusError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_var_stores_le_value_into_register() {
+        // 程序: ReadVar addr=0x10 len=2 delay=0 dst=0 ; Return
+        let program = [
+            Opcode::ReadVar as u8,
+            0x10, 0x00, 0x00, 0x00, // addr
+            0x02, 0x00, 0x00, 0x00, // len
+            0x00, 0x00, 0x00, 0x00, // delay
+            0x00,                   // dst reg
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        bus.mem[0x10] = 0x34;
+        bus.mem[0x11] = 0x12;
+
+        let mut vm = Vm::new(&mut bus, &program);
+        vm.run().unwrap();
+        assert_eq!(vm.regs[0], 0x1234);
+    }
+
+    #[test]
+    fn load_const_and_add_execute_correctly() {
+        // 程序: LoadConst r0=10 ; LoadConst r1=20 ; Add r2=r0+r1 ; Return
+        let program = [
+            Opcode::LoadConst as u8, 0x00, 0x0A, 0x00, 0x00, 0x00,
+            Opcode::LoadConst as u8, 0x01, 0x14, 0x00, 0x00, 0x00,
+            Opcode::Add as u8, 0x02, 0x00, 0x01,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &program);
+        vm.run().unwrap();
+        assert_eq!(vm.regs[2], 30);
+    }
+
+    #[test]
+    fn shift_and_logic_opcodes_execute() {
+        // LoadConst r0=0xF0 ; LoadConst r1=4 ; Shl r2=r0<<r1 ; And r3=r2&r0 ; Return
+        let program = [
+            Opcode::LoadConst as u8, 0x00, 0xF0, 0x00, 0x00, 0x00,
+            Opcode::LoadConst as u8, 0x01, 0x04, 0x00, 0x00, 0x00,
+            Opcode::Shl as u8, 0x02, 0x00, 0x01,
+            Opcode::And as u8, 0x03, 0x02, 0x00,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &program);
+        vm.run().unwrap();
+        assert_eq!(vm.regs[2], 0xF0 << 4);
+        assert_eq!(vm.regs[3], (0xF0 << 4) & 0xF0);
+    }
+
+    #[test]
+    fn divide_by_zero_returns_error() {
+        let program = [
+            Opcode::LoadConst as u8, 0x00, 0x0A, 0x00, 0x00, 0x00,
+            Opcode::LoadConst as u8, 0x01, 0x00, 0x00, 0x00, 0x00,
+            Opcode::Div as u8, 0x02, 0x00, 0x01,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &program);
+        assert_eq!(vm.run(), Err(VmError::DivideByZero));
+    }
 
     #[test]
     fn merge_field_preserves_other_bits() {

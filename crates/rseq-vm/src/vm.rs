@@ -1,4 +1,3 @@
-
 use crate::bus::{Bus, BusError};
 use crate::opcode::Opcode;
 

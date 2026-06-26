@@ -413,6 +413,7 @@ dependencies = [
 name = "rseq-cli"
 version = "0.1.0"
 dependencies = [
+ "ariadne",
  "clap",
  "rseq",
  "rseq-vm",

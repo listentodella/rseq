@@ -4,18 +4,21 @@
 mod chip;
 
 use chumsky::{
-    input::{Stream, ValueInput},
+    input::{MapExtra, Stream, ValueInput},
     prelude::*,
 };
 use logos::Logos;
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 use std::vec::Vec;
 
 pub use chip::{
-    emit_update_bytecode, load_chip, normalize_chip_path, resolve_chip_path, Chip, ChipError,
-    ChipRegistry, UpdatePlan,
+    Chip, ChipError, ChipRegistry, UpdatePlan, emit_update_bytecode, load_chip,
+    normalize_chip_path, resolve_chip_path,
 };
+
+type ParserExtra<'tok, 'src> = extra::Err<Rich<'tok, Token<'src>>>;
 
 #[derive(Logos, Clone, PartialEq, Debug)]
 enum Token<'a> {
@@ -137,9 +140,10 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub stmts: Vec<Stmt>,
+    pub stmt_spans: Vec<Range<usize>>,
 }
 
-fn value<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, extra::Err<Rich<'tok, Token<'src>>>>
+fn value<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -165,8 +169,7 @@ where
     })
 }
 
-fn field_map<'tok, 'src: 'tok, I>()
--> impl Parser<'tok, I, Value, extra::Err<Rich<'tok, Token<'src>>>>
+fn field_map<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -180,8 +183,7 @@ where
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
 }
 
-fn read_expr<'tok, 'src: 'tok, I>()
--> impl Parser<'tok, I, Expr, extra::Err<Rich<'tok, Token<'src>>>>
+fn read_expr<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -205,7 +207,7 @@ where
         })
 }
 
-fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Stmt, extra::Err<Rich<'tok, Token<'src>>>>
+fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -246,33 +248,46 @@ where
             }
         });
 
-    let update_stmt = just(Token::UpdateMacro)
-        .ignore_then(
-            select! { Token::Ident(s) => s.to_string() }
-                .then(
-                    just(Token::Comma).ignore_then(
+    let update_stmt =
+        just(Token::UpdateMacro)
+            .ignore_then(
+                select! { Token::Ident(s) => s.to_string() }
+                    .then(just(Token::Comma).ignore_then(
                         field_map().or(select! { Token::Number(n) => Value::Number(n) }),
-                    ),
-                )
-                .then(just(Token::Comma).ignore_then(select! { Token::Number(n) => n }).or_not())
-                .delimited_by(just(Token::LParen), just(Token::RParen)),
-        )
-        .then_ignore(just(Token::Semicolon).or_not())
-        .map(|((target, val), delay_us)| Stmt::Update {
-            target,
-            val,
-            delay_us,
-        });
+                    ))
+                    .then(
+                        just(Token::Comma)
+                            .ignore_then(select! { Token::Number(n) => n })
+                            .or_not(),
+                    )
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then_ignore(just(Token::Semicolon).or_not())
+            .map(|((target, val), delay_us)| Stmt::Update {
+                target,
+                val,
+                delay_us,
+            });
 
-    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt)
+    chip_stmt
+        .or(let_stmt)
+        .or(update_stmt)
+        .or(write_stmt)
+        .map_with(
+            |stmt, e: &mut MapExtra<'tok, '_, I, ParserExtra<'tok, 'src>>| {
+                (stmt, e.span().into_range())
+            },
+        )
 }
 
-fn parser<'tok, 'src: 'tok, I>()
--> impl Parser<'tok, I, Program, extra::Err<Rich<'tok, Token<'src>>>>
+fn parser<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Program, ParserExtra<'tok, 'src>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
-    stmt().repeated().collect().map(|stmts| Program { stmts })
+    stmt().repeated().collect::<Vec<_>>().map(|spanned_stmts| {
+        let (stmts, stmt_spans): (Vec<_>, Vec<_>) = spanned_stmts.into_iter().unzip();
+        Program { stmts, stmt_spans }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,7 +295,17 @@ pub enum ParseError {
     GenericError,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    pub span: Range<usize>,
+    pub message: String,
+}
+
 pub fn parse(source: &str) -> Result<Program, ParseError> {
+    parse_detailed(source).map_err(|_| ParseError::GenericError)
+}
+
+pub fn parse_detailed(source: &str) -> Result<Program, Vec<ParseDiagnostic>> {
     let token_iter = Token::lexer(source).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -292,7 +317,15 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
     parser()
         .parse(token_stream)
         .into_result()
-        .map_err(|_| ParseError::GenericError)
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|err| ParseDiagnostic {
+                    span: err.span().into_range(),
+                    message: err.to_string(),
+                })
+                .collect()
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +337,26 @@ pub enum CompileError {
     Update(String),
 }
 
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedValue => write!(f, "unsupported value in this context"),
+            Self::NumberExpected => write!(f, "expected a number or resolvable register"),
+            Self::Chip(err) => write!(f, "{err}"),
+            Self::Register(msg) => write!(f, "register resolution failed: {msg}"),
+            Self::Update(msg) => write!(f, "update failed: {msg}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileDiagnostic {
+    pub span: Range<usize>,
+    pub message: String,
+    pub help: Option<String>,
+    pub error: CompileError,
+}
+
 pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
     compile_with_base(program, None)
 }
@@ -312,94 +365,147 @@ pub fn compile_with_base(
     program: &Program,
     base_dir: Option<&Path>,
 ) -> Result<Vec<u8>, CompileError> {
+    compile_with_base_detailed(program, base_dir).map_err(|diag| diag.error)
+}
+
+pub fn compile_with_base_detailed(
+    program: &Program,
+    base_dir: Option<&Path>,
+) -> Result<Vec<u8>, CompileDiagnostic> {
     let mut registry = ChipRegistry::default();
-    for stmt in &program.stmts {
+    for (idx, stmt) in program.stmts.iter().enumerate() {
         if let Stmt::Chip { path } = stmt {
             let chip_path = resolve_chip_path(path, base_dir);
             registry
                 .load_file(&chip_path)
-                .map_err(CompileError::Chip)?;
+                .map_err(CompileError::Chip)
+                .map_err(|error| compile_diagnostic(program, idx, error))?;
         }
     }
 
     let mut bytecode = Vec::new();
 
-    for stmt in &program.stmts {
-        match stmt {
-            Stmt::Chip { .. } => {}
-            Stmt::Let { expr, .. } => match expr {
-                Expr::Read {
+    for (idx, stmt) in program.stmts.iter().enumerate() {
+        let result = (|| -> Result<(), CompileError> {
+            match stmt {
+                Stmt::Chip { .. } => {}
+                Stmt::Let { expr, .. } => match expr {
+                    Expr::Read {
+                        addr,
+                        len,
+                        delay_us,
+                    } => {
+                        let addr = resolve_u32(addr, &registry)?;
+                        let len = resolve_u32(len, &registry)?;
+                        let delay = delay_us.unwrap_or(0);
+
+                        bytecode.push(rseq_vm::Opcode::Read as u8);
+                        bytecode.extend_from_slice(&addr.to_le_bytes());
+                        bytecode.extend_from_slice(&len.to_le_bytes());
+                        bytecode.extend_from_slice(&delay.to_le_bytes());
+                    }
+                },
+                Stmt::Write {
                     addr,
-                    len,
+                    val,
                     delay_us,
                 } => {
                     let addr = resolve_u32(addr, &registry)?;
-                    let len = resolve_u32(len, &registry)?;
                     let delay = delay_us.unwrap_or(0);
 
-                    bytecode.push(rseq_vm::Opcode::Read as u8);
+                    let data = match val {
+                        Value::Number(n) => vec![*n as u8],
+                        Value::Array(arr) => {
+                            let mut bytes = Vec::new();
+                            for v in arr {
+                                match v {
+                                    Value::Number(n) => bytes.push(*n as u8),
+                                    _ => return Err(CompileError::UnsupportedValue),
+                                }
+                            }
+                            bytes
+                        }
+                        _ => return Err(CompileError::UnsupportedValue),
+                    };
+
+                    let len = data.len() as u32;
+
+                    bytecode.push(rseq_vm::Opcode::Write as u8);
                     bytecode.extend_from_slice(&addr.to_le_bytes());
                     bytecode.extend_from_slice(&len.to_le_bytes());
                     bytecode.extend_from_slice(&delay.to_le_bytes());
+                    bytecode.extend(data);
                 }
-            },
-            Stmt::Write {
-                addr,
-                val,
-                delay_us,
-            } => {
-                let addr = resolve_u32(addr, &registry)?;
-                let delay = delay_us.unwrap_or(0);
-
-                let data = match val {
-                    Value::Number(n) => vec![*n as u8],
-                    Value::Array(arr) => {
-                        let mut bytes = Vec::new();
-                        for v in arr {
-                            match v {
-                                Value::Number(n) => bytes.push(*n as u8),
-                                _ => return Err(CompileError::UnsupportedValue),
-                            }
+                Stmt::Update {
+                    target,
+                    val,
+                    delay_us,
+                } => {
+                    let updates = match val {
+                        Value::Number(n) => {
+                            let field = target
+                                .rsplit('.')
+                                .next()
+                                .ok_or_else(|| CompileError::Update("missing field name".into()))?;
+                            vec![(field.to_string(), *n)]
                         }
-                        bytes
-                    }
-                    _ => return Err(CompileError::UnsupportedValue),
-                };
-
-                let len = data.len() as u32;
-
-                bytecode.push(rseq_vm::Opcode::Write as u8);
-                bytecode.extend_from_slice(&addr.to_le_bytes());
-                bytecode.extend_from_slice(&len.to_le_bytes());
-                bytecode.extend_from_slice(&delay.to_le_bytes());
-                bytecode.extend(data);
+                        Value::FieldMap(entries) => entries.clone(),
+                        _ => {
+                            return Err(CompileError::Update(
+                                "expected field value or field map".into(),
+                            ));
+                        }
+                    };
+                    let plan = registry
+                        .plan_update(target, &updates)
+                        .map_err(|e| CompileError::Chip(e))?;
+                    emit_update_bytecode(&mut bytecode, &plan, delay_us.unwrap_or(0));
+                }
             }
-            Stmt::Update {
-                target,
-                val,
-                delay_us,
-            } => {
-                let updates = match val {
-                    Value::Number(n) => {
-                        let field = target
-                            .rsplit('.')
-                            .next()
-                            .ok_or_else(|| CompileError::Update("missing field name".into()))?;
-                        vec![(field.to_string(), *n)]
-                    }
-                    Value::FieldMap(entries) => entries.clone(),
-                    _ => return Err(CompileError::Update("expected field value or field map".into())),
-                };
-                let plan = registry
-                    .plan_update(target, &updates)
-                    .map_err(|e| CompileError::Chip(e))?;
-                emit_update_bytecode(&mut bytecode, &plan, delay_us.unwrap_or(0));
-            }
-        }
+            Ok(())
+        })();
+
+        result.map_err(|error| compile_diagnostic(program, idx, error))?;
     }
 
     bytecode.push(rseq_vm::Opcode::Return as u8);
     Ok(bytecode)
+}
+
+fn compile_diagnostic(program: &Program, idx: usize, error: CompileError) -> CompileDiagnostic {
+    let span = program.stmt_spans.get(idx).cloned().unwrap_or(0..0);
+    let help = compile_help(&error);
+    CompileDiagnostic {
+        span,
+        message: error.to_string(),
+        help,
+        error,
+    }
+}
+
+fn compile_help(error: &CompileError) -> Option<String> {
+    match error {
+        CompileError::Chip(ChipError::RegisterNotUpdatable { name, access }) => Some(format!(
+            "register '{name}' is declared as access={access}; use update! only on RW registers, or use read!/write! if that matches the device semantics"
+        )),
+        CompileError::Chip(ChipError::FieldNotFound(field)) => Some(format!(
+            "check the field name in the loaded chip YAML; '{field}' was not found"
+        )),
+        CompileError::Chip(ChipError::NotFound(name)) => Some(format!(
+            "check that '{name}' exists in a chip! YAML file loaded before this statement"
+        )),
+        CompileError::UnsupportedValue => {
+            Some("write! values must be a byte number or an array of byte numbers".to_string())
+        }
+        CompileError::NumberExpected => Some(
+            "use a numeric literal like 0x10, or a register name from a loaded chip dictionary"
+                .to_string(),
+        ),
+        CompileError::Update(_) => Some(
+            "use update!(PAGE.REG.FIELD, value) or update!(PAGE.REG, { field: value })".to_string(),
+        ),
+        _ => None,
+    }
 }
 
 fn resolve_u32(value: &Value, registry: &ChipRegistry) -> Result<u32, CompileError> {
@@ -637,10 +743,7 @@ mod tests {
                 assert_eq!(target, "UI.COMM_CTL");
                 assert_eq!(
                     val,
-                    &Value::FieldMap(vec![
-                        ("cs_pu_dis".into(), 1),
-                        ("sda_scl_pu_dis".into(), 0),
-                    ])
+                    &Value::FieldMap(vec![("cs_pu_dis".into(), 1), ("sda_scl_pu_dis".into(), 0),])
                 );
             }
             _ => panic!("expected Update"),
@@ -662,5 +765,31 @@ mod tests {
         let bytecode = compile_with_base(&program, Some(base)).unwrap();
         assert_eq!(bytecode[0], rseq_vm::Opcode::Write as u8);
         assert_eq!(bytecode[14], rseq_vm::Opcode::Update as u8);
+    }
+
+    #[test]
+    fn test_compile_diagnostic_points_to_failing_statement() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+        let src = r#"
+        chip!("qmi8660.yaml");
+        update!(UI.ENCTL.aen_ui, 1);
+        update!(UI.WHOAMI.value, 0x08);
+        "#;
+        let program = parse_detailed(src).unwrap();
+        let diag = compile_with_base_detailed(&program, Some(base)).unwrap_err();
+
+        assert!(matches!(
+            diag.error,
+            CompileError::Chip(ChipError::RegisterNotUpdatable { .. })
+        ));
+        assert!(src[diag.span.clone()].contains("update!(UI.WHOAMI.value"));
+        assert!(
+            diag.help
+                .as_deref()
+                .is_some_and(|help| help.contains("update! only on RW registers"))
+        );
     }
 }

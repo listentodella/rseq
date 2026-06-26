@@ -1,6 +1,9 @@
 use clap::Parser;
-use rseq::{ChipRegistry, compile_with_base, decompile, parse, resolve_chip_path};
+use rseq::{
+    ChipRegistry, compile_with_base_detailed, decompile, parse_detailed, resolve_chip_path,
+};
 use rseq_vm::Vm;
+use std::ops::Range;
 use std::path::Path;
 pub mod mock;
 use mock::MockBus;
@@ -62,13 +65,23 @@ fn main() {
         };
 
         println!("\nParsing rseq...");
-        let program = match parse(&src) {
+        let source_name = cli.file.as_deref().unwrap_or("<default>");
+        let program = match parse_detailed(&src) {
             Ok(p) => {
                 println!("✓ Parsed successfully");
                 p
             }
-            Err(e) => {
-                eprintln!("Parse error: {e:?}");
+            Err(errors) => {
+                for error in errors {
+                    emit_diagnostic(
+                        source_name,
+                        &src,
+                        error.span,
+                        "could not parse rseq source",
+                        &error.message,
+                        Some("check the macro syntax and punctuation near this location"),
+                    );
+                }
                 std::process::exit(1);
             }
         };
@@ -98,7 +111,7 @@ fn main() {
         }
 
         println!("\nCompiling to bytecode...");
-        let bytecode = match compile_with_base(&program, base_dir.as_deref()) {
+        let bytecode = match compile_with_base_detailed(&program, base_dir.as_deref()) {
             Ok(b) => {
                 println!("✓ Compiled successfully ({} bytes)", b.len());
                 println!("Bytecode (vec): {:02x?}", b);
@@ -114,8 +127,15 @@ fn main() {
                 }
                 b
             }
-            Err(e) => {
-                eprintln!("Compile error: {e:?}");
+            Err(diag) => {
+                emit_diagnostic(
+                    source_name,
+                    &src,
+                    diag.span,
+                    "could not compile rseq source",
+                    &diag.message,
+                    diag.help.as_deref(),
+                );
                 std::process::exit(1);
             }
         };
@@ -269,6 +289,56 @@ fn main() {
     }
 }
 
+fn emit_diagnostic(
+    source_name: &str,
+    source: &str,
+    byte_span: Range<usize>,
+    title: &str,
+    label: &str,
+    help: Option<&str>,
+) {
+    use ariadne::{Color, Label, Report, ReportKind, Source};
+
+    let span = byte_span_to_char_span(source, byte_span);
+    let source_id = source_name.to_string();
+    let report_span = (source_id.clone(), span.clone());
+    let mut builder = Report::build(ReportKind::Error, report_span.clone())
+        .with_message(title)
+        .with_label(
+            Label::new(report_span)
+                .with_message(label)
+                .with_color(Color::Red),
+        );
+
+    if let Some(help) = help {
+        builder = builder.with_help(help);
+    }
+
+    let report = builder.finish();
+    if let Err(err) = report.eprint((source_id, Source::from(source.to_string()))) {
+        eprintln!("{title}: {label}");
+        if let Some(help) = help {
+            eprintln!("help: {help}");
+        }
+        eprintln!("failed to render diagnostic: {err}");
+    }
+}
+
+fn byte_span_to_char_span(source: &str, span: Range<usize>) -> Range<usize> {
+    let start = source
+        .char_indices()
+        .take_while(|(idx, _)| *idx < span.start)
+        .count();
+    let mut end = source
+        .char_indices()
+        .take_while(|(idx, _)| *idx < span.end)
+        .count();
+    if end <= start {
+        end = start + 1;
+    }
+    start..end
+}
+
 fn parse_hex_string(hex_str: &str) -> Result<Vec<u8>, String> {
     hex_str
         .split_whitespace()
@@ -290,7 +360,7 @@ mod tests {
         write!(0x40, [0x01, 0x02, 0x03], 500);
         write!(0x100, 0xaa);
         ";
-        let program = parse(src).unwrap();
+        let program = rseq::parse(src).unwrap();
         let bytecode = compile(&program).unwrap();
 
         let mut bus = MockBus::new();
@@ -312,7 +382,7 @@ mod tests {
         write!(0x40, [0x01, 0x02, 0x03], 500);
         write!(0x100, 0xaa);
         ";
-        let program = parse(src).unwrap();
+        let program = rseq::parse(src).unwrap();
         let bytecode = compile(&program).unwrap();
 
         let decompiled = decompile(&bytecode).unwrap();
@@ -344,5 +414,16 @@ mod tests {
         let ops = bus.ops();
         assert!(matches!(&ops[1], mock::BusOp::Read { addr: 0x0B, .. }));
         assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x0B, data } if data == &[0x2B]));
+    }
+
+    #[test]
+    fn test_byte_span_to_char_span_handles_non_ascii_prefix() {
+        let src = "备注\nupdate!(UI.WHOAMI.value, 0x08);";
+        let byte_start = src.find("update!").unwrap();
+        let byte_end = src.len();
+        let span = byte_span_to_char_span(src, byte_start..byte_end);
+        let snippet: String = src.chars().skip(span.start).take(span.len()).collect();
+
+        assert_eq!(snippet, "update!(UI.WHOAMI.value, 0x08);");
     }
 }

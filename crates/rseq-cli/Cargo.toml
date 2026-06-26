@@ -18,3 +18,4 @@ default = []
 rseq-vm = { workspace = true }
 rseq = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
+ariadne = { version = "0.6.0", features = ["auto-color"] }

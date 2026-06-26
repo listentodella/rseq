@@ -12,7 +12,10 @@ use std::fmt;
 use std::path::Path;
 use std::vec::Vec;
 
-pub use chip::{load_chip, resolve_chip_path, Chip, ChipError, ChipRegistry, normalize_chip_path};
+pub use chip::{
+    emit_update_bytecode, load_chip, normalize_chip_path, resolve_chip_path, Chip, ChipError,
+    ChipRegistry, UpdatePlan,
+};
 
 #[derive(Logos, Clone, PartialEq, Debug)]
 enum Token<'a> {
@@ -33,6 +36,8 @@ enum Token<'a> {
     ReadMacro,
     #[token("write!")]
     WriteMacro,
+    #[token("update!")]
+    UpdateMacro,
     #[token("chip!")]
     ChipMacro,
     #[token("(")]
@@ -43,6 +48,12 @@ enum Token<'a> {
     LBracket,
     #[token("]")]
     RBracket,
+    #[token("{")]
+    LBrace,
+    #[token("}")]
+    RBrace,
+    #[token(":")]
+    Colon,
     #[token(",")]
     Comma,
     #[token(";")]
@@ -67,11 +78,15 @@ impl fmt::Display for Token<'_> {
             Self::Assign => write!(f, "="),
             Self::ReadMacro => write!(f, "read!"),
             Self::WriteMacro => write!(f, "write!"),
+            Self::UpdateMacro => write!(f, "update!"),
             Self::ChipMacro => write!(f, "chip!"),
             Self::LParen => write!(f, "("),
             Self::RParen => write!(f, ")"),
             Self::LBracket => write!(f, "["),
             Self::RBracket => write!(f, "]"),
+            Self::LBrace => write!(f, "{{"),
+            Self::RBrace => write!(f, "}}"),
+            Self::Colon => write!(f, ":"),
             Self::Comma => write!(f, ","),
             Self::Semicolon => write!(f, ";"),
             Self::String(s) => write!(f, "\"{s}\""),
@@ -86,6 +101,7 @@ pub enum Value {
     Ident(String),
     Number(u32),
     Array(Vec<Value>),
+    FieldMap(Vec<(String, u32)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +115,11 @@ pub enum Stmt {
     },
     Write {
         addr: Value,
+        val: Value,
+        delay_us: Option<u32>,
+    },
+    Update {
+        target: String,
         val: Value,
         delay_us: Option<u32>,
     },
@@ -142,6 +163,21 @@ where
 
         atom.or(array)
     })
+}
+
+fn field_map<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Value, extra::Err<Rich<'tok, Token<'src>>>>
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    select! { Token::Ident(s) => s.to_string() }
+        .then_ignore(just(Token::Colon))
+        .then(select! { Token::Number(n) => n })
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .map(Value::FieldMap)
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
 }
 
 fn read_expr<'tok, 'src: 'tok, I>()
@@ -210,7 +246,25 @@ where
             }
         });
 
-    chip_stmt.or(let_stmt).or(write_stmt)
+    let update_stmt = just(Token::UpdateMacro)
+        .ignore_then(
+            select! { Token::Ident(s) => s.to_string() }
+                .then(
+                    just(Token::Comma).ignore_then(
+                        field_map().or(select! { Token::Number(n) => Value::Number(n) }),
+                    ),
+                )
+                .then(just(Token::Comma).ignore_then(select! { Token::Number(n) => n }).or_not())
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|((target, val), delay_us)| Stmt::Update {
+            target,
+            val,
+            delay_us,
+        });
+
+    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt)
 }
 
 fn parser<'tok, 'src: 'tok, I>()
@@ -247,6 +301,7 @@ pub enum CompileError {
     NumberExpected,
     Chip(ChipError),
     Register(String),
+    Update(String),
 }
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, CompileError> {
@@ -318,6 +373,27 @@ pub fn compile_with_base(
                 bytecode.extend_from_slice(&len.to_le_bytes());
                 bytecode.extend_from_slice(&delay.to_le_bytes());
                 bytecode.extend(data);
+            }
+            Stmt::Update {
+                target,
+                val,
+                delay_us,
+            } => {
+                let updates = match val {
+                    Value::Number(n) => {
+                        let field = target
+                            .rsplit('.')
+                            .next()
+                            .ok_or_else(|| CompileError::Update("missing field name".into()))?;
+                        vec![(field.to_string(), *n)]
+                    }
+                    Value::FieldMap(entries) => entries.clone(),
+                    _ => return Err(CompileError::Update("expected field value or field map".into())),
+                };
+                let plan = registry
+                    .plan_update(target, &updates)
+                    .map_err(|e| CompileError::Chip(e))?;
+                emit_update_bytecode(&mut bytecode, &plan, delay_us.unwrap_or(0));
             }
         }
     }
@@ -391,6 +467,30 @@ pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
                         output.push_str(&format!("0x{:02x}", byte));
                     }
                     output.push(']');
+                }
+                if delay > 0 {
+                    output.push_str(&format!(", {}", delay));
+                }
+                output.push_str(");\n");
+            }
+            Some(rseq_vm::Opcode::Update) => {
+                pc += 1;
+                let addr = read_u32(bytecode, &mut pc)?;
+                let width = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                let field_count = read_u32(bytecode, &mut pc)?;
+                output.push_str(&format!(
+                    "update!(0x{addr:x}, /* {width} bytes, {field_count} fields */"
+                ));
+                for _ in 0..field_count {
+                    if pc + 6 > bytecode.len() {
+                        return Err(DecompileError::UnexpectedEnd);
+                    }
+                    let bit_lo = bytecode[pc];
+                    let bit_hi = bytecode[pc + 1];
+                    pc += 2;
+                    let value = read_u32(bytecode, &mut pc)?;
+                    output.push_str(&format!(" {{bits {bit_hi}:{bit_lo} = {value}}}"));
                 }
                 if delay > 0 {
                     output.push_str(&format!(", {}", delay));
@@ -509,5 +609,58 @@ mod tests {
         let program = parse(src).unwrap();
         let bytecode = compile_with_base(&program, Some(base)).unwrap();
         assert!(bytecode.len() > 1);
+    }
+
+    #[test]
+    fn test_parse_update_single_field() {
+        let src = r#"
+        update!(UI.COMM_CTL.sda_scl_pu_dis, 1);
+        "#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Update { target, val, .. } => {
+                assert_eq!(target, "UI.COMM_CTL.sda_scl_pu_dis");
+                assert_eq!(val, &Value::Number(1));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_field_map() {
+        let src = r#"
+        update!(UI.COMM_CTL, { cs_pu_dis: 1, sda_scl_pu_dis: 0 });
+        "#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Update { target, val, .. } => {
+                assert_eq!(target, "UI.COMM_CTL");
+                assert_eq!(
+                    val,
+                    &Value::FieldMap(vec![
+                        ("cs_pu_dis".into(), 1),
+                        ("sda_scl_pu_dis".into(), 0),
+                    ])
+                );
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_compile_update_rmw() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+        let src = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.COMM_CTL, 0x2A);
+        update!(UI.COMM_CTL.cs_pu_dis, 1);
+        "#;
+        let program = parse(src).unwrap();
+        let bytecode = compile_with_base(&program, Some(base)).unwrap();
+        assert_eq!(bytecode[0], rseq_vm::Opcode::Write as u8);
+        assert_eq!(bytecode[14], rseq_vm::Opcode::Update as u8);
     }
 }

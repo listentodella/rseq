@@ -4,6 +4,7 @@
 pub enum Opcode {
     Read = 0x01,
     Write = 0x02,
+    Update = 0x03,
     Return = 0xFF,
 }
 
@@ -12,6 +13,7 @@ impl Opcode {
         match n {
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
+            0x03 => Some(Self::Update),
             0xFF => Some(Self::Return),
             _ => None,
         }

@@ -1,4 +1,5 @@
 use rseq_vm::{Bus, BusError};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusOp {
@@ -8,16 +9,24 @@ pub enum BusOp {
 }
 
 pub struct MockBus {
+    memory: HashMap<u32, u8>,
     ops: Vec<BusOp>,
 }
 
 impl MockBus {
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            memory: HashMap::new(),
+            ops: Vec::new(),
+        }
     }
 
     pub fn ops(&self) -> &[BusOp] {
         &self.ops
+    }
+
+    pub fn memory(&self) -> &HashMap<u32, u8> {
+        &self.memory
     }
 }
 
@@ -29,6 +38,9 @@ impl Default for MockBus {
 
 impl Bus for MockBus {
     fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+        for i in 0..data.len() {
+            data[i] = self.memory.get(&(addr + i as u32)).copied().unwrap_or(0);
+        }
         self.ops.push(BusOp::Read {
             addr,
             data: data.to_vec(),
@@ -37,6 +49,9 @@ impl Bus for MockBus {
     }
 
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+        for (i, &byte) in data.iter().enumerate() {
+            self.memory.insert(addr + i as u32, byte);
+        }
         self.ops.push(BusOp::Write {
             addr,
             data: data.to_vec(),

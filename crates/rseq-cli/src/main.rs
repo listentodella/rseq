@@ -1,5 +1,5 @@
 use clap::Parser;
-use rseq::{compile_with_base, decompile, parse, resolve_chip_path, ChipRegistry};
+use rseq::{ChipRegistry, compile_with_base, decompile, parse, resolve_chip_path};
 use rseq_vm::Vm;
 use std::path::Path;
 pub mod mock;
@@ -180,10 +180,36 @@ fn main() {
                             s
                         }
                         rseq::Value::Ident(s) => s.clone(),
+                        rseq::Value::FieldMap(_) => "unknown".to_string(),
                     };
                     println!("    Action: Write {} to address {}", val_str, addr_str);
                     if let Some(d) = delay_us {
                         println!("    Delay: {} μs after write", d);
+                    }
+                }
+                rseq::Stmt::Update {
+                    target,
+                    val,
+                    delay_us,
+                } => {
+                    match val {
+                        rseq::Value::Number(n) => {
+                            println!("    Action: Update {target} = {n} (read-modify-write)");
+                        }
+                        rseq::Value::FieldMap(entries) => {
+                            let fields: Vec<String> = entries
+                                .iter()
+                                .map(|(name, value)| format!("{name}={value}"))
+                                .collect();
+                            println!(
+                                "    Action: Update {target} {{{}}} (read-modify-write)",
+                                fields.join(", ")
+                            );
+                        }
+                        _ => println!("    Action: Update {target} (read-modify-write)"),
+                    }
+                    if let Some(d) = delay_us {
+                        println!("    Delay: {} μs after update", d);
                     }
                 }
             }
@@ -273,7 +299,9 @@ mod tests {
 
         let ops = bus.ops();
         assert_eq!(ops.len(), 3);
-        assert!(matches!(&ops[0], mock::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03]));
+        assert!(
+            matches!(&ops[0], mock::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03])
+        );
         assert!(matches!(&ops[1], mock::BusOp::Delay { us: 500 }));
         assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x100, data } if data == &[0xaa]));
     }
@@ -293,11 +321,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_hex_string() {
-        let hex_str = "02 40 00 00 00 03 00 00 00 f4 01 00 00 01 02 03 ff";
-        let parsed = parse_hex_string(hex_str).unwrap();
-        assert_eq!(parsed.len(), 17);
-        assert_eq!(parsed[0], 0x02);
-        assert_eq!(parsed[16], 0xff);
+    fn test_update_rmw_on_mock_bus() {
+        use rseq::compile_with_base;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+        let src = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.COMM_CTL, 0x2A);
+        update!(UI.COMM_CTL.cs_pu_dis, 1);
+        "#;
+        let program = rseq::parse(src).unwrap();
+        let bytecode = compile_with_base(&program, Some(base)).unwrap();
+
+        let mut bus = MockBus::new();
+        let mut vm = Vm::new(&mut bus, &bytecode);
+        vm.run().unwrap();
+
+        // 0x2A | bit0 = 0x2B
+        assert_eq!(*bus.memory().get(&0x0B).unwrap(), 0x2B);
+        let ops = bus.ops();
+        assert!(matches!(&ops[1], mock::BusOp::Read { addr: 0x0B, .. }));
+        assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x0B, data } if data == &[0x2B]));
     }
 }

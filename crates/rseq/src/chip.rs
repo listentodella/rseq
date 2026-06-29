@@ -11,6 +11,7 @@ pub enum ChipError {
     NotFound(String),
     AmbiguousRegister { name: String, pages: Vec<String> },
     FieldNotFound(String),
+    EventNotFound(String),
     FieldValueOutOfRange { field: String, value: u32, max: u32 },
     RegisterNotUpdatable { name: String, access: String },
     InvalidUpdate(String),
@@ -30,6 +31,7 @@ impl std::fmt::Display for ChipError {
                 )
             }
             Self::FieldNotFound(msg) => write!(f, "field not found: {msg}"),
+            Self::EventNotFound(msg) => write!(f, "interrupt event not found: {msg}"),
             Self::FieldValueOutOfRange { field, value, max } => {
                 write!(
                     f,
@@ -94,6 +96,10 @@ struct RegisterYaml {
     #[serde(default)]
     desc: String,
     #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    read_clear: bool,
+    #[serde(default)]
     fields: Vec<FieldYaml>,
 }
 
@@ -103,6 +109,8 @@ struct FieldYaml {
     bits: String,
     #[serde(default)]
     desc: String,
+    #[serde(default)]
+    event: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +134,8 @@ pub struct Field {
     pub bit_hi: u8,
     pub bit_lo: u8,
     pub desc: String,
+    /// 当该位属于某个中断状态/使能位时，对应芯片字典里声明的事件名。
+    pub event: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +145,22 @@ pub struct Register {
     pub access: String,
     pub width: u32,
     pub desc: String,
+    /// 寄存器的语义角色（如 interrupt_status / interrupt_status_snapshot）。
+    pub roles: Vec<String>,
+    /// 读取后硬件自动清零（W1C-on-read 中断状态寄存器）。
+    pub read_clear: bool,
     pub fields: Vec<Field>,
+}
+
+/// 一个中断事件在状态寄存器中的位置，供 irq! 派发表解析。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventBit {
+    /// 该事件所在独立状态寄存器的地址。
+    pub status_addr: u32,
+    pub bit_lo: u8,
+    pub bit_hi: u8,
+    /// 该状态寄存器是否读取后清零。
+    pub read_clear: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +245,7 @@ impl ChipRegistry {
                                 bit_hi,
                                 bit_lo,
                                 desc: f.desc,
+                                event: f.event,
                             })
                         })
                         .collect::<Result<Vec<_>, ChipError>>()?;
@@ -230,6 +256,8 @@ impl ChipRegistry {
                         access: reg.access,
                         width: reg.width.unwrap_or(1),
                         desc: reg.desc,
+                        roles: reg.roles,
+                        read_clear: reg.read_clear,
                         fields,
                     })
                 })
@@ -440,6 +468,50 @@ impl ChipRegistry {
                 "expected PAGE.REG.FIELD with one value, or PAGE.REG with {{ field: value, ... }}, got '{target}'"
             ))),
         }
+    }
+
+    /// 遍历所有已加载芯片的寄存器。
+    fn registers(&self) -> impl Iterator<Item = &Register> {
+        self.chips
+            .iter()
+            .flat_map(|chip| chip.pages.iter())
+            .flat_map(|page| page.registers.iter())
+    }
+
+    /// 查找声明了 `interrupt_status_snapshot` 角色的寄存器，
+    /// 它是一次性读取整组中断状态的"快照视图"。
+    /// 返回 (起始地址, 字节宽度, 读后是否清零)。
+    pub fn interrupt_snapshot(&self) -> Option<(u32, u32, bool)> {
+        self.registers()
+            .find(|reg| {
+                reg.roles
+                    .iter()
+                    .any(|role| role == "interrupt_status_snapshot")
+            })
+            .map(|reg| (reg.addr, reg.width, reg.read_clear))
+    }
+
+    /// 把一个中断事件名解析为它在独立状态寄存器中的位位置。
+    /// 只在带有 `interrupt_status` 角色的寄存器里查找（排除快照视图，
+    /// 否则同一事件会与快照里同地址的位重复匹配）。
+    pub fn resolve_event(&self, event: &str) -> Result<EventBit, ChipError> {
+        for reg in self.registers() {
+            let is_status = reg.roles.iter().any(|role| role == "interrupt_status");
+            if !is_status {
+                continue;
+            }
+            for field in &reg.fields {
+                if field.event.as_deref() == Some(event) {
+                    return Ok(EventBit {
+                        status_addr: reg.addr,
+                        bit_lo: field.bit_lo,
+                        bit_hi: field.bit_hi,
+                        read_clear: reg.read_clear,
+                    });
+                }
+            }
+        }
+        Err(ChipError::EventNotFound(event.to_string()))
     }
 }
 

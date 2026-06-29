@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
 pub use chip::{
-    Chip, ChipError, ChipRegistry, UpdatePlan, emit_update_bytecode, load_chip,
+    Chip, ChipError, ChipRegistry, EventBit, UpdatePlan, emit_update_bytecode, load_chip,
     normalize_chip_path, resolve_chip_path,
 };
 
@@ -45,6 +45,8 @@ enum Token<'a> {
     UpdateMacro,
     #[token("chip!")]
     ChipMacro,
+    #[token("irq!")]
+    IrqMacro,
     #[token("(")]
     LParen,
     #[token(")")]
@@ -94,6 +96,9 @@ enum Token<'a> {
 
     #[regex(r"[ \t\f\n]+", logos::skip)]
     Whitespace,
+
+    #[regex(r"//[^\n]*", logos::skip, allow_greedy = true)]
+    Comment,
 }
 
 impl fmt::Display for Token<'_> {
@@ -107,6 +112,7 @@ impl fmt::Display for Token<'_> {
             Self::WriteMacro => write!(f, "write!"),
             Self::UpdateMacro => write!(f, "update!"),
             Self::ChipMacro => write!(f, "chip!"),
+            Self::IrqMacro => write!(f, "irq!"),
             Self::LParen => write!(f, "("),
             Self::RParen => write!(f, ")"),
             Self::LBracket => write!(f, "["),
@@ -128,6 +134,7 @@ impl fmt::Display for Token<'_> {
             Self::Caret => write!(f, "^"),
             Self::String(s) => write!(f, "\"{s}\""),
             Self::Whitespace => write!(f, "<whitespace>"),
+            Self::Comment => write!(f, "<comment>"),
             Self::Error => write!(f, "<error>"),
         }
     }
@@ -160,6 +167,19 @@ pub enum Stmt {
         val: Value,
         delay_us: Option<u32>,
     },
+    /// 中断处理块：当 `pin` 上发生中断时，按声明顺序逐个判断各 `arm`
+    /// 的事件位是否置位，命中则执行该 arm 的语句体。
+    Irq {
+        pin: String,
+        arms: Vec<IrqArm>,
+    },
+}
+
+/// `irq!` 块中的一条事件分支：`on(event) { ... }`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrqArm {
+    pub event: String,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +234,68 @@ pub enum Expr {
 pub struct Program {
     pub stmts: Vec<Stmt>,
     pub stmt_spans: Vec<Range<usize>>,
+}
+
+/// 完整编译产物：线性主程序字节码 + 若干中断派发表（方案 A）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProgram {
+    /// 上电初始化等顺序执行的字节码，以 Return 结尾。
+    pub main: Vec<u8>,
+    /// 每个 `irq!(pin)` 块编译出的一张派发表。
+    pub irqs: Vec<IrqVector>,
+}
+
+/// 一个中断引脚的派发表：发生中断时读取一次状态快照，
+/// 再按声明顺序对命中的事件运行对应的处理段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqVector {
+    /// 中断引脚名（仅作标注，如 "int1"）。
+    pub pin: String,
+    /// 状态快照寄存器地址（一次性读取整组中断状态）。
+    pub snapshot_addr: u32,
+    /// 快照读取字节数（≤ 8）。
+    pub snapshot_len: u32,
+    /// 状态寄存器读取后是否自动清零（决定只能读一次）。
+    pub read_clear: bool,
+    /// 各事件分支，按源码顺序即优先级排列。
+    pub arms: Vec<IrqArmBin>,
+}
+
+/// 派发表里的一条事件分支：命中 `mask` 时运行独立的 `handler` 段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqArmBin {
+    pub event: String,
+    /// 该事件在状态快照中的位掩码。
+    pub mask: u64,
+    /// 自包含的处理段字节码，以 Return 结尾，由独立 Vm 实例执行。
+    pub handler: Vec<u8>,
+}
+
+/// 方案 A 的宿主端派发器：中断发生时调用。
+///
+/// 读取一次状态快照（满足 `read_clear` 语义），然后按优先级顺序对每个
+/// 置位的事件运行其处理段。返回实际触发的事件名列表，便于观测/测试。
+pub fn run_irq_vector<B: rseq_vm::Bus>(
+    bus: &mut B,
+    vector: &IrqVector,
+) -> Result<Vec<String>, rseq_vm::VmError> {
+    let len = vector.snapshot_len as usize;
+    if len == 0 || len > 8 {
+        return Err(rseq_vm::VmError::InvalidLength);
+    }
+    let mut buf = [0u8; 8];
+    bus.read(vector.snapshot_addr, &mut buf[..len])
+        .map_err(rseq_vm::VmError::BusError)?;
+    let snapshot = u64::from_le_bytes(buf);
+
+    let mut fired = Vec::new();
+    for arm in &vector.arms {
+        if snapshot & arm.mask != 0 {
+            fired.push(arm.event.clone());
+            rseq_vm::Vm::new(bus, &arm.handler).run()?;
+        }
+    }
+    Ok(fired)
 }
 
 fn value<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Value, ParserExtra<'tok, 'src>> + Clone + 'tok
@@ -345,7 +427,8 @@ where
     })
 }
 
-fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), ParserExtra<'tok, 'src>>
+fn simple_stmt<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -407,15 +490,52 @@ where
                 delay_us,
             });
 
-    chip_stmt
-        .or(let_stmt)
-        .or(update_stmt)
-        .or(write_stmt)
-        .map_with(
-            |stmt, e: &mut MapExtra<'tok, '_, I, ParserExtra<'tok, 'src>>| {
-                (stmt, e.span().into_range())
-            },
+    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt)
+}
+
+/// 解析 `irq!(pin) { on(event) { ... } ... }` 中断处理块。
+/// 块内每个 `on(event)` 分支的语句体只允许普通语句（不可再嵌套 irq!）。
+fn irq_stmt<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    let arm = just(Token::Ident("on"))
+        .ignore_then(
+            select! { Token::Ident(s) => s.to_string() }
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
         )
+        .then(
+            simple_stmt()
+                .repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .map(|(event, body)| IrqArm { event, body });
+
+    just(Token::IrqMacro)
+        .ignore_then(
+            select! { Token::Ident(s) => s.to_string() }
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(
+            arm.repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(pin, arms)| Stmt::Irq { pin, arms })
+}
+
+fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), ParserExtra<'tok, 'src>>
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    simple_stmt().or(irq_stmt()).map_with(
+        |stmt, e: &mut MapExtra<'tok, '_, I, ParserExtra<'tok, 'src>>| {
+            (stmt, e.span().into_range())
+        },
+    )
 }
 
 fn parser<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Program, ParserExtra<'tok, 'src>>
@@ -475,6 +595,10 @@ pub enum CompileError {
     Update(String),
     UndefinedVariable(String),
     RegisterOverflow,
+    /// irq! 引用的事件在芯片字典里找不到对应的中断状态位。
+    UnknownEvent(String),
+    /// 芯片字典未声明任何中断状态寄存器，无法编译 irq!。
+    NoInterruptStatus,
 }
 
 impl fmt::Display for CompileError {
@@ -489,6 +613,12 @@ impl fmt::Display for CompileError {
                 write!(f, "undefined variable '{name}'")
             }
             Self::RegisterOverflow => write!(f, "register overflow: too many live values"),
+            Self::UnknownEvent(name) => {
+                write!(f, "unknown interrupt event '{name}'")
+            }
+            Self::NoInterruptStatus => {
+                write!(f, "chip dictionary declares no interrupt status register")
+            }
         }
     }
 }
@@ -616,10 +746,19 @@ pub fn compile_with_base_detailed(
     program: &Program,
     base_dir: Option<&Path>,
 ) -> Result<Vec<u8>, CompileDiagnostic> {
+    Ok(compile_program(program, base_dir)?.main)
+}
+
+/// 编译单个程序，返回主程序字节码与所有 `irq!` 派发表（方案 A）。
+pub fn compile_program(
+    program: &Program,
+    base_dir: Option<&Path>,
+) -> Result<CompiledProgram, CompileDiagnostic> {
     let mut registry = ChipRegistry::default();
     let mut bytecode = Vec::new();
     let mut vars = HashMap::new();
     let mut next_reg: u16 = 0;
+    let mut irqs = Vec::new();
     compile_into(
         program,
         base_dir,
@@ -627,9 +766,13 @@ pub fn compile_with_base_detailed(
         &mut bytecode,
         &mut vars,
         &mut next_reg,
+        &mut irqs,
     )?;
     bytecode.push(rseq_vm::Opcode::Return as u8);
-    Ok(bytecode)
+    Ok(CompiledProgram {
+        main: bytecode,
+        irqs,
+    })
 }
 
 pub fn compile_units_detailed(units: &[SourceUnit]) -> Result<Vec<u8>, SourceDiagnostic> {
@@ -666,10 +809,16 @@ pub fn compile_units_detailed(units: &[SourceUnit]) -> Result<Vec<u8>, SourceDia
 pub fn compile_program_units_detailed(
     units: &[ProgramUnit<'_>],
 ) -> Result<Vec<u8>, SourceDiagnostic> {
+    Ok(compile_program_units(units)?.main)
+}
+
+/// 编译多个程序单元（共享芯片字典与寄存器分配），返回主程序字节码与所有派发表。
+pub fn compile_program_units(units: &[ProgramUnit<'_>]) -> Result<CompiledProgram, SourceDiagnostic> {
     let mut registry = ChipRegistry::default();
     let mut bytecode = Vec::new();
     let mut vars = HashMap::new();
     let mut next_reg: u16 = 0;
+    let mut irqs = Vec::new();
 
     for (unit_idx, unit) in units.iter().enumerate() {
         compile_into(
@@ -679,6 +828,7 @@ pub fn compile_program_units_detailed(
             &mut bytecode,
             &mut vars,
             &mut next_reg,
+            &mut irqs,
         )
         .map_err(|diag| SourceDiagnostic {
             unit: unit_idx,
@@ -689,7 +839,10 @@ pub fn compile_program_units_detailed(
     }
 
     bytecode.push(rseq_vm::Opcode::Return as u8);
-    Ok(bytecode)
+    Ok(CompiledProgram {
+        main: bytecode,
+        irqs,
+    })
 }
 
 fn compile_into(
@@ -699,6 +852,7 @@ fn compile_into(
     bytecode: &mut Vec<u8>,
     vars: &mut HashMap<String, u8>,
     next_reg: &mut u16,
+    irqs: &mut Vec<IrqVector>,
 ) -> Result<(), CompileDiagnostic> {
     // 第一遍：加载所有 chip! 字典
     for (idx, stmt) in program.stmts.iter().enumerate() {
@@ -713,7 +867,7 @@ fn compile_into(
 
     // 第二遍：编译语句
     for (idx, stmt) in program.stmts.iter().enumerate() {
-        if let Err(error) = compile_stmt(stmt, registry, vars, next_reg, bytecode) {
+        if let Err(error) = compile_stmt(stmt, registry, vars, next_reg, bytecode, irqs) {
             return Err(compile_diagnostic(program, idx, error));
         }
     }
@@ -727,9 +881,14 @@ fn compile_stmt(
     vars: &mut HashMap<String, u8>,
     next_reg: &mut u16,
     bytecode: &mut Vec<u8>,
+    irqs: &mut Vec<IrqVector>,
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Chip { .. } => {}
+        Stmt::Irq { pin, arms } => {
+            let vector = compile_irq(pin, arms, registry)?;
+            irqs.push(vector);
+        }
         Stmt::Let { name, expr } => {
             let dst = compile_expr(expr, registry, vars, next_reg, bytecode)?;
             vars.insert(name.clone(), dst);
@@ -808,6 +967,93 @@ fn compile_stmt(
         }
     }
     Ok(())
+}
+
+/// 把一个 `irq!(pin) { on(event){...} ... }` 块编译成方案 A 的派发表。
+///
+/// 状态快照优先使用芯片字典里 `interrupt_status_snapshot` 角色的寄存器
+/// （一次读取覆盖整组状态位，满足 read_clear 只读一次的约束）；若芯片未
+/// 声明快照视图，则退化为"所有事件必须位于同一个状态寄存器"的单寄存器读取。
+fn compile_irq(
+    pin: &str,
+    arms: &[IrqArm],
+    registry: &ChipRegistry,
+) -> Result<IrqVector, CompileError> {
+    // 解析每个事件在独立状态寄存器中的位置。
+    let resolved: Vec<(&IrqArm, EventBit)> = arms
+        .iter()
+        .map(|arm| {
+            registry
+                .resolve_event(&arm.event)
+                .map(|eb| (arm, eb))
+                .map_err(|_| CompileError::UnknownEvent(arm.event.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // 确定快照基址、宽度与 read_clear。
+    let (snapshot_addr, snapshot_len, read_clear) = match registry.interrupt_snapshot() {
+        Some(s) => s,
+        None => {
+            // 没有快照视图：以第一个事件的状态寄存器为准，要求所有事件同址。
+            let first = resolved.first().ok_or(CompileError::NoInterruptStatus)?.1.clone();
+            if resolved.iter().any(|(_, eb)| eb.status_addr != first.status_addr) {
+                return Err(CompileError::NoInterruptStatus);
+            }
+            (first.status_addr, 1, first.read_clear)
+        }
+    };
+
+    let mut bins = Vec::with_capacity(resolved.len());
+    for (arm, eb) in &resolved {
+        // 事件所在状态寄存器相对快照基址的字节偏移。
+        if eb.status_addr < snapshot_addr {
+            return Err(CompileError::NoInterruptStatus);
+        }
+        let byte_off = eb.status_addr - snapshot_addr;
+        if byte_off >= snapshot_len {
+            // 事件不在快照覆盖范围内，无法在一次读取中判定。
+            return Err(CompileError::NoInterruptStatus);
+        }
+        let bit_off = byte_off * 8 + eb.bit_lo as u32;
+        let width = (eb.bit_hi - eb.bit_lo + 1) as u32;
+        let field_mask: u64 = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let mask = field_mask << bit_off;
+
+        // 把分支语句体编译成一个自包含的处理段（独立 Vm 实例执行）。
+        let mut handler = Vec::new();
+        let mut handler_vars = HashMap::new();
+        let mut handler_reg: u16 = 0;
+        let mut nested_irqs = Vec::new();
+        for s in &arm.body {
+            compile_stmt(
+                s,
+                registry,
+                &mut handler_vars,
+                &mut handler_reg,
+                &mut handler,
+                &mut nested_irqs,
+            )?;
+        }
+        handler.push(rseq_vm::Opcode::Return as u8);
+
+        bins.push(IrqArmBin {
+            event: arm.event.clone(),
+            mask,
+            handler,
+        });
+    }
+
+    Ok(IrqVector {
+        pin: pin.to_string(),
+        snapshot_addr,
+        snapshot_len,
+        read_clear,
+        arms: bins,
+    })
 }
 
 /// 分配一个新的寄存器索引。
@@ -920,6 +1166,12 @@ fn compile_help(error: &CompileError) -> Option<String> {
         )),
         CompileError::RegisterOverflow => Some(
             "the program uses too many live values; reduce the number of let bindings".to_string(),
+        ),
+        CompileError::UnknownEvent(name) => Some(format!(
+            "'{name}' is not a known interrupt event; use an `event:` name declared on an interrupt_status field in the chip YAML"
+        )),
+        CompileError::NoInterruptStatus => Some(
+            "declare an interrupt status register (role interrupt_status) and ideally an interrupt_status_snapshot view in the chip YAML so irq! events can be dispatched in a single read".to_string(),
         ),
         _ => None,
     }
@@ -1123,6 +1375,172 @@ pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用于 irq! 派发测试的简易内存总线。
+    struct MapBus {
+        mem: HashMap<u32, u8>,
+        writes: Vec<(u32, Vec<u8>)>,
+    }
+
+    impl MapBus {
+        fn new() -> Self {
+            Self {
+                mem: HashMap::new(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl rseq_vm::Bus for MapBus {
+        fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), rseq_vm::BusError> {
+            for (i, slot) in data.iter_mut().enumerate() {
+                *slot = self.mem.get(&(addr + i as u32)).copied().unwrap_or(0);
+            }
+            Ok(())
+        }
+        fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), rseq_vm::BusError> {
+            for (i, &b) in data.iter().enumerate() {
+                self.mem.insert(addr + i as u32, b);
+            }
+            self.writes.push((addr, data.to_vec()));
+            Ok(())
+        }
+        fn delay_us(&mut self, _us: u32) -> Result<(), rseq_vm::BusError> {
+            Ok(())
+        }
+    }
+
+    fn qmi_base() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    #[test]
+    fn test_parse_irq_block() {
+        let src = r#"
+        irq!(int1) {
+            on(fifo_watermark) { write!(0x10, 0x01); }
+            on(accel_drdy) { write!(0x11, 0x02); }
+        }
+        "#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Irq { pin, arms } => {
+                assert_eq!(pin, "int1");
+                assert_eq!(arms.len(), 2);
+                assert_eq!(arms[0].event, "fifo_watermark");
+                assert_eq!(arms[1].event, "accel_drdy");
+                assert_eq!(arms[0].body.len(), 1);
+            }
+            _ => panic!("expected Irq"),
+        }
+    }
+
+    #[test]
+    fn test_compile_irq_vector_masks_and_snapshot() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        irq!(int1) {
+            on(fifo_watermark) { write!(UI.ENCTL, 0x03); }
+            on(accel_drdy) { write!(UI.ENCTL, 0x01); }
+        }
+        "#;
+        let program = parse(src).unwrap();
+        let compiled = compile_program(&program, Some(&qmi_base())).unwrap();
+
+        // irq! 不进入主程序，主程序只有 Return。
+        assert_eq!(compiled.main, vec![rseq_vm::Opcode::Return as u8]);
+
+        assert_eq!(compiled.irqs.len(), 1);
+        let vector = &compiled.irqs[0];
+        assert_eq!(vector.pin, "int1");
+        // 快照视图 INT_HELPER：0x58，4 字节，读后清零。
+        assert_eq!(vector.snapshot_addr, 0x58);
+        assert_eq!(vector.snapshot_len, 4);
+        assert!(vector.read_clear);
+
+        assert_eq!(vector.arms.len(), 2);
+        // fifo_watermark 在 INT_STATUS0 bit6 → mask 0x40。
+        assert_eq!(vector.arms[0].event, "fifo_watermark");
+        assert_eq!(vector.arms[0].mask, 1 << 6);
+        // accel_drdy 在 INT_STATUS0 bit0 → mask 0x1。
+        assert_eq!(vector.arms[1].event, "accel_drdy");
+        assert_eq!(vector.arms[1].mask, 1 << 0);
+        // 处理段自包含，以 Return 结尾。
+        assert_eq!(
+            vector.arms[0].handler.last(),
+            Some(&(rseq_vm::Opcode::Return as u8))
+        );
+    }
+
+    #[test]
+    fn test_compile_irq_unknown_event_errors() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        irq!(int1) {
+            on(not_a_real_event) { write!(UI.ENCTL, 0x03); }
+        }
+        "#;
+        let program = parse_detailed(src).unwrap();
+        let diag = compile_program(&program, Some(&qmi_base())).unwrap_err();
+        assert!(matches!(
+            diag.error,
+            CompileError::UnknownEvent(ref name) if name == "not_a_real_event"
+        ));
+    }
+
+    #[test]
+    fn test_run_irq_vector_dispatches_only_set_bits() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        irq!(int1) {
+            on(fifo_watermark) { write!(UI.ENCTL, 0x03); }
+            on(accel_drdy) { write!(UI.ENCTL, 0x01); }
+        }
+        "#;
+        let program = parse(src).unwrap();
+        let compiled = compile_program(&program, Some(&qmi_base())).unwrap();
+        let vector = &compiled.irqs[0];
+
+        // 只有 fifo_watermark (bit6) 置位。
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x58, 0x40);
+        let fired = run_irq_vector(&mut bus, vector).unwrap();
+        assert_eq!(fired, vec!["fifo_watermark".to_string()]);
+        // 处理段把 0x03 写到 UI.ENCTL (0x3d)。
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x3d && d == &[0x03]));
+
+        // 只有 accel_drdy (bit0) 置位。
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x58, 0x01);
+        let fired = run_irq_vector(&mut bus, vector).unwrap();
+        assert_eq!(fired, vec!["accel_drdy".to_string()]);
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x3d && d == &[0x01]));
+
+        // 两个都置位 → 按声明顺序（优先级）触发。
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x58, 0x41);
+        let fired = run_irq_vector(&mut bus, vector).unwrap();
+        assert_eq!(
+            fired,
+            vec!["fifo_watermark".to_string(), "accel_drdy".to_string()]
+        );
+
+        // 无关位置位 → 不触发任何分支。
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x58, 0x80);
+        let fired = run_irq_vector(&mut bus, vector).unwrap();
+        assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_comment_is_ignored() {
+        let src = r"
+        // 这是注释
+        let x = 1 + 2; // 行尾注释
+        ";
+        let program = parse(src).unwrap();
+        assert_eq!(program.stmts.len(), 1);
+    }
 
     #[test]
     fn test_parse_let_read() {

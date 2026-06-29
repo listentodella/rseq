@@ -28,6 +28,13 @@ impl MockBus {
     pub fn memory(&self) -> &HashMap<u32, u8> {
         &self.memory
     }
+
+    /// 预置内存内容而不记录总线操作（用于模拟中断前的状态寄存器值）。
+    pub fn load(&mut self, addr: u32, data: &[u8]) {
+        for (i, &byte) in data.iter().enumerate() {
+            self.memory.insert(addr + i as u32, byte);
+        }
+    }
 }
 
 impl Default for MockBus {

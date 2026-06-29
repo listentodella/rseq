@@ -1,5 +1,7 @@
 use clap::Parser;
-use rseq::{Manifest, ProgramUnit, compile_program_units_detailed, decompile, parse_detailed};
+use rseq::{
+    CompiledProgram, Manifest, ProgramUnit, compile_program_units, decompile, parse_detailed,
+};
 use rseq_vm::Vm;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,11 @@ struct Cli {
 
     #[arg(short, long)]
     execute: bool,
+
+    /// 模拟一次中断：--fire <pin>=<status>，status 为状态快照值（十六进制 0x.. 或十进制）。
+    /// 可重复，例如 --fire int1=0x41 --fire int2=0x02。
+    #[arg(long)]
+    fire: Vec<String>,
 
     #[arg(short, long)]
     output: Option<String>,
@@ -112,8 +119,9 @@ fn main() {
                 base_dir: source.base_dir.as_deref(),
             })
             .collect::<Vec<_>>();
-        let bytecode = match compile_program_units_detailed(&program_units) {
-            Ok(b) => {
+        let CompiledProgram { main: bytecode, irqs } = match compile_program_units(&program_units) {
+            Ok(compiled) => {
+                let b = &compiled.main;
                 println!("✓ Compiled successfully ({} bytes)", b.len());
                 println!("Bytecode (vec): {:02x?}", b);
                 let hex_str: String = b
@@ -123,10 +131,10 @@ fn main() {
                     .join(" ");
                 println!("Bytecode (hex): {}", hex_str);
                 if let Some(path) = &cli.output {
-                    std::fs::write(path, &b).expect("Failed to write bytecode");
+                    std::fs::write(path, b).expect("Failed to write bytecode");
                     println!("Saved bytecode to {}", path);
                 }
-                b
+                compiled
             }
             Err(diag) => {
                 let source = &parsed_sources[diag.unit];
@@ -141,6 +149,33 @@ fn main() {
                 std::process::exit(1);
             }
         };
+
+        if !irqs.is_empty() {
+            println!("\nInterrupt dispatch tables (scheme A — host reads status once, then dispatches):");
+            for vector in &irqs {
+                println!(
+                    "  irq!({}) — read {} byte(s) @ 0x{:08x}{}:",
+                    vector.pin,
+                    vector.snapshot_len,
+                    vector.snapshot_addr,
+                    if vector.read_clear { " (read-clears)" } else { "" }
+                );
+                for arm in &vector.arms {
+                    println!(
+                        "    on({}) when status & 0x{:x}:",
+                        arm.event, arm.mask
+                    );
+                    match decompile(&arm.handler) {
+                        Ok(text) => {
+                            for line in text.lines() {
+                                println!("        {line}");
+                            }
+                        }
+                        Err(e) => println!("        <decompile error: {e:?}>"),
+                    }
+                }
+            }
+        }
 
         println!("\nStatements (in order):");
         let mut step = 1;
@@ -221,6 +256,15 @@ fn main() {
                         if let Some(d) = delay_us {
                             println!("    Delay: {} μs after update", d);
                         }
+                    }
+                    rseq::Stmt::Irq { pin, arms } => {
+                        let events: Vec<&str> =
+                            arms.iter().map(|arm| arm.event.as_str()).collect();
+                        println!(
+                            "    Action: Interrupt handler on {pin} dispatching {} event(s): {}",
+                            arms.len(),
+                            events.join(", ")
+                        );
                     }
                 }
             }

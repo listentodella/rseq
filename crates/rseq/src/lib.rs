@@ -742,6 +742,22 @@ fn compile_stmt(
             let addr = resolve_u32(addr, registry)?;
             let delay = delay_us.unwrap_or(0);
 
+            // 写入一个由 let 绑定的变量：变量的值在运行期保存在寄存器里，
+            // 因此发射 WriteVar，由 VM 在执行时把寄存器的低字节写入总线。
+            if let Value::Ident(name) = val {
+                let src = *vars
+                    .get(name)
+                    .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
+                // 与标量 `write!(addr, n)` 保持一致：默认写 1 字节（低 8 位）。
+                let len: u32 = 1;
+                bytecode.push(rseq_vm::Opcode::WriteVar as u8);
+                bytecode.extend_from_slice(&addr.to_le_bytes());
+                bytecode.extend_from_slice(&len.to_le_bytes());
+                bytecode.extend_from_slice(&delay.to_le_bytes());
+                bytecode.push(src);
+                return Ok(());
+            }
+
             let data = match val {
                 Value::Number(n) => vec![*n as u8],
                 Value::Array(arr) => {
@@ -1076,7 +1092,23 @@ pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
                 };
                 output.push_str(&format!("// r{dst} = r{lhs} {op_str} r{rhs}\n"));
             }
-            Some(rseq_vm::Opcode::WriteVar | rseq_vm::Opcode::UpdateVar) => {
+            Some(rseq_vm::Opcode::WriteVar) => {
+                pc += 1;
+                let addr = read_u32(bytecode, &mut pc)?;
+                let len = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let src = bytecode[pc];
+                pc += 1;
+                output.push_str(&format!("write!(0x{addr:x}, r{src} /* {len} bytes */"));
+                if delay > 0 {
+                    output.push_str(&format!(", {delay}"));
+                }
+                output.push_str(");\n");
+            }
+            Some(rseq_vm::Opcode::UpdateVar) => {
                 return Err(DecompileError::InvalidOpcode);
             }
             None => {

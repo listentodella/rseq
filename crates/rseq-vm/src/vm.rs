@@ -201,11 +201,33 @@ impl<'a, B: Bus> Vm<'a, B> {
                     };
                     self.regs[dst] = result;
                 }
+                Some(Opcode::WriteVar) => {
+                    let addr = self.read_u32()?;
+                    let len = self.read_u32()?;
+                    let delay = self.read_u32()?;
+                    let src = self.read_u8()? as usize;
+
+                    if len == 0 || len > 4 {
+                        return Err(VmError::InvalidLength);
+                    }
+                    let val = self.regs[src];
+                    let mut buffer = [0u8; 4];
+                    let data = &mut buffer[..len as usize];
+                    for (i, b) in data.iter_mut().enumerate() {
+                        *b = (val >> (8 * i)) as u8;
+                    }
+
+                    self.bus.write(addr, data).map_err(VmError::BusError)?;
+
+                    if delay > 0 {
+                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                    }
+                }
                 Some(Opcode::Return) => {
                     return Ok(());
                 }
-                // WriteVar / UpdateVar 尚未在 VM 中实现。
-                Some(Opcode::WriteVar | Opcode::UpdateVar) => {
+                // UpdateVar 尚未在 VM 中实现。
+                Some(Opcode::UpdateVar) => {
                     return Err(VmError::InvalidOpcode);
                 }
                 None => {

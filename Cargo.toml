@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/rseq-vm", "crates/rseq", "crates/rseq-cli"]
+members = ["crates/rseq-vm", "crates/rseq-link", "crates/rseq", "crates/rseq-cli", "crates/rseq-mcu-sim"]
 resolver = "2"
 
 [workspace.package]
@@ -16,4 +16,5 @@ repository = "https://github.com/listentodella/rseq"
 
 [workspace.dependencies]
 rseq-vm = { path = "crates/rseq-vm" }
+rseq-link = { path = "crates/rseq-link" }
 rseq = { path = "crates/rseq" }

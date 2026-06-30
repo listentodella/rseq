@@ -12,10 +12,14 @@ name = "rseq"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["serial"]
+# 串口下发到真实 MCU(--serial)。默认启用;纯主机回环(--execute)不依赖它。
+serial = ["rseq-link/serial"]
 
 [dependencies]
 rseq-vm = { workspace = true }
 rseq = { workspace = true }
+# HostLink + SerialTransport,用于 --serial 模式下发字节码并收集 Trace。
+rseq-link = { workspace = true, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
 ariadne = { version = "0.6.0", features = ["auto-color"] }

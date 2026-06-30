@@ -3,6 +3,9 @@
 
 mod chip;
 
+pub mod link;
+pub mod trace;
+
 use chumsky::{
     input::{MapExtra, Stream, ValueInput},
     prelude::*,

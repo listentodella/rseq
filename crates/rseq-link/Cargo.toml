@@ -1,0 +1,29 @@
+[package]
+name = "rseq-link"
+description = "Register Sequence transport layer — no_std frame protocol, CRC32, and tracing bus bridge"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# ── no_std 支持 ─────────────────────────────────────────────
+# default = 纯 no_std 核心(帧/CRC/TracingBus/Transport trait),MCU 移植用
+# std     = 启用 MockTransport(主机侧测试/回环仿真)
+# serial  = 启用 SerialTransport(串口,依赖 serialport)
+[features]
+default = []
+std = ["rseq-vm/std"]
+serial = ["std", "dep:serialport"]
+
+[dependencies]
+# 直接路径依赖并关闭默认 feature,保证 MCU 移植时可纯 no_std;std feature 再按需开启 rseq-vm/std。
+rseq-vm = { path = "../rseq-vm", default-features = false }
+serialport = { version = "4", optional = true }
+
+[dev-dependencies]
+# 测试复用主机侧 MockBus 与编译产物
+rseq = { workspace = true }

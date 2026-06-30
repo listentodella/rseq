@@ -1,12 +1,6 @@
 use rseq_vm::{Bus, BusError};
+use rseq::trace::BusOp;
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BusOp {
-    Read { addr: u32, data: Vec<u8> },
-    Write { addr: u32, data: Vec<u8> },
-    Delay { us: u32 },
-}
 
 pub struct MockBus {
     memory: HashMap<u32, u8>,

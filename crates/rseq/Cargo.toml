@@ -14,6 +14,9 @@ default = []
 
 [dependencies]
 rseq-vm = { workspace = true }
+# 主机侧链路驱动(HostLink)复用 rseq-link 的帧编解码与 Transport 抽象;
+# 启用 std 以便单测直接用 MockTransport 做回环。
+rseq-link = { workspace = true, features = ["std"] }
 toml = "1.1.2"
 serde = { version = "1", features = ["derive"] }
 logos = "0.16.1"

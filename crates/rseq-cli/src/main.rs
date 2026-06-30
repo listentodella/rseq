@@ -43,6 +43,14 @@ struct Cli {
 
     #[arg(short = 'x', long)]
     hex: Option<String>,
+
+    /// 通过串口把字节码下发到真实 MCU 并收集回传轨迹:--serial /dev/ttyUSB0
+    #[arg(long)]
+    serial: Option<String>,
+
+    /// 串口波特率(默认 115200)。
+    #[arg(long, default_value_t = 115_200)]
+    baud: u32,
 }
 
 fn main() {
@@ -279,39 +287,7 @@ fn main() {
                 Ok(_) => {
                     println!("✓ Execution completed successfully");
 
-                    let ops = bus.ops();
-                    if ops.is_empty() {
-                        println!("No bus operations recorded");
-                    } else {
-                        println!("Bus operations (in execution order):");
-                        for (step, op) in ops.iter().enumerate() {
-                            match op {
-                                mock::BusOp::Write { addr, data } => {
-                                    let bytes: String = data
-                                        .iter()
-                                        .map(|b| format!("0x{b:02x}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    println!("  Step {}: Write [{bytes}] → 0x{addr:08x}", step + 1);
-                                }
-                                mock::BusOp::Read { addr, data } => {
-                                    let bytes: String = data
-                                        .iter()
-                                        .map(|b| format!("0x{b:02x}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    println!(
-                                        "  Step {}: Read {} bytes from 0x{addr:08x} → [{bytes}]",
-                                        step + 1,
-                                        data.len()
-                                    );
-                                }
-                                mock::BusOp::Delay { us } => {
-                                    println!("  Step {}: Delay {us} μs", step + 1);
-                                }
-                            }
-                        }
-                    }
+                    print_bus_ops(bus.ops());
                 }
                 Err(e) => {
                     eprintln!("Execution error: {e:?}");
@@ -320,6 +296,86 @@ fn main() {
             }
         } else {
             println!("\nUse --execute to run in MockBus");
+        }
+
+        if let Some(path) = &cli.serial {
+            #[cfg(feature = "serial")]
+            run_over_serial(path, cli.baud, &bytecode);
+            #[cfg(not(feature = "serial"))]
+            {
+                eprintln!(
+                    "--serial {path} 需要以 `serial` feature 编译 \
+                     (cargo run -p rseq-cli --features serial -- ... --serial ...)"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+/// 经串口把字节码下发到真实 MCU,用 HostLink 收集回传的 Trace 并打印。
+#[cfg(feature = "serial")]
+fn run_over_serial(path: &str, baud: u32, bytecode: &[u8]) {
+    use rseq::link::HostLink;
+
+    println!("\nDispatching to MCU over serial ({path} @ {baud} baud)...");
+    let transport = match rseq_link::SerialTransport::open(path, baud) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open serial {path} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut host = HostLink::new(transport);
+    if let Err(e) = host.load(bytecode) {
+        eprintln!("LOAD failed: {e}");
+        std::process::exit(1);
+    }
+    println!("✓ Loaded {} byte(s)", bytecode.len());
+    match host.exec() {
+        Ok(res) => {
+            println!("Exec status: {:?}", res.status);
+            print_bus_ops(&res.traces);
+        }
+        Err(e) => {
+            eprintln!("EXEC failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 按执行顺序打印总线操作(MockBus 回放与串口回传 Trace 共用)。
+fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
+    if ops.is_empty() {
+        println!("No bus operations recorded");
+        return;
+    }
+    println!("Bus operations (in execution order):");
+    for (step, op) in ops.iter().enumerate() {
+        match op {
+            rseq::trace::BusOp::Write { addr, data } => {
+                let bytes: String = data
+                    .iter()
+                    .map(|b| format!("0x{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  Step {}: Write [{bytes}] → 0x{addr:08x}", step + 1);
+            }
+            rseq::trace::BusOp::Read { addr, data } => {
+                let bytes: String = data
+                    .iter()
+                    .map(|b| format!("0x{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "  Step {}: Read {} bytes from 0x{addr:08x} → [{bytes}]",
+                    step + 1,
+                    data.len()
+                );
+            }
+            rseq::trace::BusOp::Delay { us } => {
+                println!("  Step {}: Delay {us} μs", step + 1);
+            }
         }
     }
 }
@@ -515,10 +571,10 @@ mod tests {
         let ops = bus.ops();
         assert_eq!(ops.len(), 3);
         assert!(
-            matches!(&ops[0], mock::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03])
+            matches!(&ops[0], rseq::trace::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03])
         );
-        assert!(matches!(&ops[1], mock::BusOp::Delay { us: 500 }));
-        assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x100, data } if data == &[0xaa]));
+        assert!(matches!(&ops[1], rseq::trace::BusOp::Delay { us: 500 }));
+        assert!(matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x100, data } if data == &[0xaa]));
     }
 
     #[test]
@@ -557,8 +613,8 @@ mod tests {
         // 0x2A | bit0 = 0x2B
         assert_eq!(*bus.memory().get(&0x0B).unwrap(), 0x2B);
         let ops = bus.ops();
-        assert!(matches!(&ops[1], mock::BusOp::Read { addr: 0x0B, .. }));
-        assert!(matches!(&ops[2], mock::BusOp::Write { addr: 0x0B, data } if data == &[0x2B]));
+        assert!(matches!(&ops[1], rseq::trace::BusOp::Read { addr: 0x0B, .. }));
+        assert!(matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x0B, data } if data == &[0x2B]));
     }
 
     #[test]

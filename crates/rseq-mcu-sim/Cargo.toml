@@ -1,0 +1,30 @@
+[package]
+name = "rseq-mcu-sim"
+description = "Simulated MCU target that executes rseq bytecode over a rseq-link transport"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# 串口实现为可选 feature;默认仅进程内回环仿真。
+[features]
+default = []
+serial = ["rseq-link/serial"]
+
+[dependencies]
+rseq-vm = { workspace = true }
+# 主机侧链路与 MockTransport(回环仿真)。
+rseq-link = { workspace = true, features = ["std"] }
+# --self-test 复用主机编译器与 HostLink 做端到端校验。
+rseq = { workspace = true }
+
+[[bin]]
+name = "rseq-mcu-sim"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

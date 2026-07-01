@@ -51,6 +51,8 @@ enum Token<'a> {
     ChipMacro,
     #[token("irq!")]
     IrqMacro,
+    #[token("repeat!")]
+    RepeatMacro,
     #[token("(")]
     LParen,
     #[token(")")]
@@ -117,6 +119,7 @@ impl fmt::Display for Token<'_> {
             Self::UpdateMacro => write!(f, "update!"),
             Self::ChipMacro => write!(f, "chip!"),
             Self::IrqMacro => write!(f, "irq!"),
+            Self::RepeatMacro => write!(f, "repeat!"),
             Self::LParen => write!(f, "("),
             Self::RParen => write!(f, ")"),
             Self::LBracket => write!(f, "["),
@@ -176,6 +179,20 @@ pub enum Stmt {
     Irq {
         pin: String,
         arms: Vec<IrqArm>,
+    },
+    /// `repeat!(N) { ... }` 定长循环：把 body 重复执行 N 次。
+    /// 编译为 `Loop` 操作码（body 只存一份，VM 计数回跳），字节码不随 N 膨胀。
+    Repeat {
+        count: u32,
+        body: Vec<Stmt>,
+    },
+    /// `read!(addr, len[, delay])` 独立读语句：发射 `Read` 操作码（≤4096字节）。
+    /// 读出数据在 VM 本地丢弃，但 `TracingBus` 会把每次读作为 Trace 回传主机——
+    /// 适合多字节采集/轮询。与 `let x = read!(...)`（`ReadVar`，≤4字节，存寄存器）互补。
+    Read {
+        addr: Value,
+        len: Value,
+        delay_us: Option<u32>,
     },
 }
 
@@ -494,7 +511,71 @@ where
                 delay_us,
             });
 
-    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt)
+    let read_stmt = just(Token::ReadMacro)
+        .ignore_then(
+            value()
+                .then(just(Token::Comma).ignore_then(value()))
+                .then(just(Token::Comma).ignore_then(value()).or_not())
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|((addr, len), delay_us)| {
+            let delay_us = delay_us.and_then(|v| match v {
+                Value::Number(n) => Some(n),
+                _ => None,
+            });
+            Stmt::Read {
+                addr,
+                len,
+                delay_us,
+            }
+        });
+
+    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt).or(read_stmt)
+}
+
+/// 构造 `repeat!(<N>) { <body>* }` 解析器，体使用传入的 `body` 解析器。
+/// 抽出来是为了让 `block_stmt` 能用 `recursive` 把"自身"作为体传入，
+/// 从而支持嵌套 repeat! 而不在构造期形成无限递归。
+fn repeat_with<'tok, 'src: 'tok, I, B>(
+    body: B,
+) -> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+    B: Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok,
+{
+    just(Token::RepeatMacro)
+        .ignore_then(
+            select! { Token::Number(n) => n }
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(
+            body.repeated()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(count, body)| Stmt::Repeat { count, body })
+}
+
+/// `repeat!` 体里允许的语句集：普通语句 + 嵌套 repeat!（不含 irq!，与 irq! arm
+/// 体只允许普通语句的约束对称）。用 `recursive` 提供自引用句柄 `r`，把它作为
+/// repeat 体传入——构造期不再调用自身，解析期按嵌套层数递归（有界）。
+fn block_stmt<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    recursive(|r| simple_stmt().or(repeat_with(r)))
+}
+
+/// 顶层 `repeat!(N) { <stmt>* }`：定长循环。count 仅接受数字字量；体可嵌套 repeat!。
+fn repeat_stmt<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    repeat_with(block_stmt())
 }
 
 /// 解析 `irq!(pin) { on(event) { ... } ... }` 中断处理块。
@@ -535,7 +616,7 @@ fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), Par
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
-    simple_stmt().or(irq_stmt()).map_with(
+    simple_stmt().or(irq_stmt()).or(repeat_stmt()).map_with(
         |stmt, e: &mut MapExtra<'tok, '_, I, ParserExtra<'tok, 'src>>| {
             (stmt, e.span().into_range())
         },
@@ -996,6 +1077,40 @@ fn compile_stmt(
                 .map_err(CompileError::Chip)?;
             emit_update_bytecode(bytecode, &plan, delay_us.unwrap_or(0));
         }
+        Stmt::Repeat { count, body } => {
+            // count==0 或空体：no-op，直接不发射 Loop（VM 也会把 count==0 当 no-op，
+            // 但跳过发射更省字节，且避免 body_len==0 的空 Loop 帧）。
+            if *count == 0 || body.is_empty() {
+                return Ok(());
+            }
+            // body 各语句编译进临时缓冲，共享外层 vars/next_reg/registry/irqs：
+            // `let` 在每轮都重算到同一寄存器（寄存器在编译期只分配一次），无作用域，
+            // 与既有 `let` 语义一致。body 只编译一份，VM 靠 Loop 计数回跳复用。
+            let mut body_buf: Vec<u8> = Vec::new();
+            for s in body {
+                compile_stmt(s, registry, vars, next_reg, &mut body_buf, irqs)?;
+            }
+            if body_buf.is_empty() {
+                return Ok(());
+            }
+            bytecode.push(rseq_vm::Opcode::Loop as u8);
+            bytecode.extend_from_slice(&count.to_le_bytes());
+            bytecode.extend_from_slice(&(body_buf.len() as u32).to_le_bytes());
+            bytecode.extend(&body_buf);
+        }
+        Stmt::Read { addr, len, delay_us } => {
+            let addr = resolve_u32(addr, registry)?;
+            // Read 的 len 是字节计数，必须是编译期常量（VM 把它当作 u32 立即数）。
+            let len = match len {
+                Value::Number(n) => *n,
+                _ => return Err(CompileError::NumberExpected),
+            };
+            let delay = delay_us.unwrap_or(0);
+            bytecode.push(rseq_vm::Opcode::Read as u8);
+            bytecode.extend_from_slice(&addr.to_le_bytes());
+            bytecode.extend_from_slice(&len.to_le_bytes());
+            bytecode.extend_from_slice(&delay.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -1226,6 +1341,12 @@ pub enum DecompileError {
 }
 
 pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
+    decompile_block(bytecode)
+}
+
+/// 反编译一个指令块（顶层或 `repeat!` 体）。递归处理 `Loop`：对 body 子切片
+/// 再调用本函数，按 2 空格缩进拼回 `repeat!(N) { ... }`。
+fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
     let mut pc = 0;
     let mut output = String::new();
 
@@ -1302,6 +1423,23 @@ pub fn decompile(bytecode: &[u8]) -> Result<String, DecompileError> {
                     output.push_str(&format!(", {}", delay));
                 }
                 output.push_str(");\n");
+            }
+            Some(rseq_vm::Opcode::Loop) => {
+                pc += 1;
+                let count = read_u32(bytecode, &mut pc)?;
+                let body_len = read_u32(bytecode, &mut pc)? as usize;
+                if pc + body_len > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let inner = decompile_block(&bytecode[pc..pc + body_len])?;
+                pc += body_len;
+                output.push_str(&format!("repeat!({count}) {{\n"));
+                for line in inner.lines() {
+                    output.push_str("  ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+                output.push_str("}\n");
             }
             Some(rseq_vm::Opcode::Return) => {
                 break;
@@ -2213,5 +2351,149 @@ mod tests {
             }
             _ => panic!("expected Let"),
         }
+    }
+
+    // ── repeat! / Loop ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_repeat() {
+        let src = "repeat!(3) { write!(0x10, 0xaa); }";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Repeat { count, body } => {
+                assert_eq!(*count, 3);
+                assert_eq!(body.len(), 1);
+            }
+            _ => panic!("expected Repeat"),
+        }
+    }
+
+    #[test]
+    fn test_compile_repeat_emits_loop() {
+        let src = "repeat!(3) { write!(0x10, 0xaa); }";
+        let program = parse(src).unwrap();
+        let bytecode = compile(&program).unwrap();
+        // 首字节为 Loop，count=3，body 含一次 Write(0xAA)，整段以 Return 收尾。
+        assert_eq!(bytecode[0], rseq_vm::Opcode::Loop as u8);
+        let count = u32::from_le_bytes(bytecode[1..5].try_into().unwrap());
+        assert_eq!(count, 3);
+        let body_len = u32::from_le_bytes(bytecode[5..9].try_into().unwrap()) as usize;
+        let body = &bytecode[9..9 + body_len];
+        assert_eq!(body[0], rseq_vm::Opcode::Write as u8);
+        assert!(body.iter().any(|&b| b == 0xAA));
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_repeat_bus_equivalence() {
+        // repeat!(3){...} 与手写 3 次 write! 的总线效果应当一致。
+        let repeat_src = "repeat!(3) { write!(0x10, 0xaa); }";
+        let manual_src = "write!(0x10, 0xaa); write!(0x10, 0xaa); write!(0x10, 0xaa);";
+        let repeat_bc = compile(&parse(repeat_src).unwrap()).unwrap();
+        let manual_bc = compile(&parse(manual_src).unwrap()).unwrap();
+
+        let mut bus_r = MapBus::new();
+        rseq_vm::Vm::new(&mut bus_r, &repeat_bc).run().unwrap();
+        let mut bus_m = MapBus::new();
+        rseq_vm::Vm::new(&mut bus_m, &manual_bc).run().unwrap();
+
+        assert_eq!(bus_r.writes.len(), 3);
+        assert_eq!(bus_r.writes, bus_m.writes);
+    }
+
+    #[test]
+    fn test_decompile_repeat() {
+        let src = "repeat!(3) { write!(0x10, 0xaa); }";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        let decompiled = decompile(&bytecode).unwrap();
+        assert!(decompiled.contains("repeat!(3) {"));
+        assert!(decompiled.contains("write!(0x10, 0xaa);"));
+        assert!(decompiled.contains("}\n"));
+    }
+
+    #[test]
+    fn test_repeat_nested() {
+        let src = "repeat!(2) { repeat!(3) { write!(0x10, 0xaa); } }";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Repeat { count, body } => {
+                assert_eq!(*count, 2);
+                assert!(matches!(body[0], Stmt::Repeat { count: 3, .. }));
+            }
+            _ => panic!("expected outer Repeat"),
+        }
+
+        let bytecode = compile(&program).unwrap();
+        // 运行后应产生 2*3=6 次写。
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bytecode).run().unwrap();
+        assert_eq!(bus.writes.len(), 6);
+        // 反编译能还原两层 repeat!。
+        let decompiled = decompile(&bytecode).unwrap();
+        assert_eq!(decompiled.matches("repeat!(").count(), 2);
+    }
+
+    #[test]
+    fn test_repeat_count_zero_emits_nothing() {
+        let src = "repeat!(0) { write!(0x10, 0xaa); }";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        // count==0 不发射 Loop，只剩结尾的 Return。
+        assert_eq!(bytecode, vec![rseq_vm::Opcode::Return as u8]);
+    }
+
+    // ── read! 独立读语句 ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_read_stmt() {
+        let src = "read!(0x10, 6, 100);";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Read {
+                addr,
+                len,
+                delay_us,
+            } => {
+                assert_eq!(addr, &Value::Number(0x10));
+                assert_eq!(len, &Value::Number(6));
+                assert_eq!(*delay_us, Some(100));
+            }
+            _ => panic!("expected Read"),
+        }
+    }
+
+    #[test]
+    fn test_compile_read_stmt_emits_read() {
+        let src = "read!(0x10, 6, 100);";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        // Read | addr=0x10 | len=6 | delay=100 | Return
+        assert_eq!(bytecode[0], rseq_vm::Opcode::Read as u8);
+        assert_eq!(u32::from_le_bytes(bytecode[1..5].try_into().unwrap()), 0x10);
+        assert_eq!(u32::from_le_bytes(bytecode[5..9].try_into().unwrap()), 6);
+        assert_eq!(
+            u32::from_le_bytes(bytecode[9..13].try_into().unwrap()),
+            100
+        );
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_decompile_read_stmt() {
+        let src = "read!(0x10, 6, 100);";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        let decompiled = decompile(&bytecode).unwrap();
+        assert!(decompiled.contains("read!(0x10, 6, 100);"));
+    }
+
+    #[test]
+    fn test_repeat_with_read_runs() {
+        // 轮询场景：repeat! 包住独立 read!。Read 在 VM 本地丢弃数据，
+        // 但 TracingBus 会回传——这里只验证 VM 跑通且反编译还原结构。
+        let src = "repeat!(3) { read!(0x10, 6, 0); }";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        assert!(rseq_vm::Vm::new(&mut bus, &bytecode).run().is_ok());
+        let decompiled = decompile(&bytecode).unwrap();
+        assert!(decompiled.contains("repeat!(3) {"));
+        assert!(decompiled.contains("read!(0x10, 6);"));
     }
 }

@@ -19,6 +19,9 @@ pub enum Opcode {
     WriteVar = 0x04,
     UpdateVar = 0x05,
     ReadVar = 0x06,
+    /// `repeat!(N) { ... }` 定长循环：`count:u32 | body_len:u32 | body`，
+    /// VM 计数回跳执行 body 共 count 次。不引入条件/跳转，仅做有界重复。
+    Loop = 0x07,
     Return = 0xFF,
 }
 
@@ -43,6 +46,7 @@ impl Opcode {
             0x04 => Some(Self::WriteVar),
             0x05 => Some(Self::UpdateVar),
             0x06 => Some(Self::ReadVar),
+            0x07 => Some(Self::Loop),
             0xFF => Some(Self::Return),
             _ => None,
         }

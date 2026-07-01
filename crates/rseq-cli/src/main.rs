@@ -274,6 +274,30 @@ fn main() {
                             events.join(", ")
                         );
                     }
+                    rseq::Stmt::Repeat { count, body } => {
+                        println!(
+                            "    Action: Repeat body ({} statement(s)) {} time(s)",
+                            body.len(),
+                            count
+                        );
+                    }
+                    rseq::Stmt::Read {
+                        addr, len, delay_us,
+                    } => {
+                        let addr_str = match addr {
+                            rseq::Value::Number(n) => format!("0x{:x}", n),
+                            rseq::Value::Ident(s) => s.clone(),
+                            _ => "unknown".to_string(),
+                        };
+                        let len_str = match len {
+                            rseq::Value::Number(n) => format!("{}", n),
+                            _ => "unknown".to_string(),
+                        };
+                        println!("    Action: Read {len_str} byte(s) from {addr_str}");
+                        if let Some(d) = delay_us {
+                            println!("    Delay: {} μs after read", d);
+                        }
+                    }
                 }
             }
         }

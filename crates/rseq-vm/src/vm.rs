@@ -10,6 +10,14 @@ pub enum VmError {
     DivideByZero,
 }
 
+/// 单步执行结果：`Continue` 继续下一条指令；`Returned` 命中 Return，应终止。
+/// 供 `step()` 在 `Loop` 内递归时把"body 中出现 Return"向上传播。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Continue,
+    Returned,
+}
+
 /// 通用寄存器数量。寄存器以 u8 索引，故最多 256 个。
 pub const REG_COUNT: usize = 256;
 
@@ -62,15 +70,16 @@ impl<'a, B: Bus> Vm<'a, B> {
         Ok(len as usize)
     }
 
-    pub fn run(&mut self) -> Result<(), VmError> {
-        loop {
-            if self.pc >= self.program.len() {
-                return Err(VmError::ProgramTooShort);
-            }
-            let opcode_byte = self.program[self.pc];
-            self.pc += 1;
+    /// 执行下一条指令，返回是否命中 Return。
+    /// 抽成独立方法是为了让 `Loop` 能在 body 边界内递归调用单步执行。
+    fn step(&mut self) -> Result<Step, VmError> {
+        if self.pc >= self.program.len() {
+            return Err(VmError::ProgramTooShort);
+        }
+        let opcode_byte = self.program[self.pc];
+        self.pc += 1;
 
-            match Opcode::from_u8(opcode_byte) {
+        match Opcode::from_u8(opcode_byte) {
                 Some(Opcode::Read) => {
                     let addr = self.read_u32()?;
                     let len = self.read_len()?;
@@ -223,8 +232,33 @@ impl<'a, B: Bus> Vm<'a, B> {
                         self.bus.delay_us(delay).map_err(VmError::BusError)?;
                     }
                 }
+                // `repeat!(N) { ... }`：读 count 与 body_len，把 body 重复执行 count 次。
+                // body 只编译一次（在 Loop 帧内），靠计数回跳复用，字节码不随 N 膨胀。
+                // 嵌套 repeat! 经递归 step() 自然处理——递归深度等于嵌套层数（非迭代数）。
+                Some(Opcode::Loop) => {
+                    let count = self.read_u32()?;
+                    let body_len = self.read_u32()? as usize;
+                    // body_len 必须落在程序范围内，防止 body_end 越界/回绕。
+                    let body_end = match self.pc.checked_add(body_len) {
+                        Some(end) if end <= self.program.len() => end,
+                        _ => return Err(VmError::InvalidLength),
+                    };
+                    let loop_start = self.pc;
+                    for _ in 0..count {
+                        self.pc = loop_start;
+                        while self.pc < body_end {
+                            match self.step()? {
+                                Step::Continue => {}
+                                // body 内出现 Return（DSL 不会产生，防御性）：向上传播终止。
+                                Step::Returned => return Ok(Step::Returned),
+                            }
+                        }
+                    }
+                    // 跳过 body（count==0 时也直接落到 body_end，相当于 no-op）。
+                    self.pc = body_end;
+                }
                 Some(Opcode::Return) => {
-                    return Ok(());
+                    return Ok(Step::Returned);
                 }
                 // UpdateVar 尚未在 VM 中实现。
                 Some(Opcode::UpdateVar) => {
@@ -233,6 +267,17 @@ impl<'a, B: Bus> Vm<'a, B> {
                 None => {
                     return Err(VmError::InvalidOpcode);
                 }
+            }
+
+        Ok(Step::Continue)
+    }
+
+    /// 逐条执行指令直到 Return 或出错。
+    pub fn run(&mut self) -> Result<(), VmError> {
+        loop {
+            match self.step()? {
+                Step::Continue => {}
+                Step::Returned => return Ok(()),
             }
         }
     }
@@ -379,5 +424,99 @@ mod tests {
         // bits 4:3 = 3
         let new = merge_field(old, 3, 4, 3);
         assert_eq!(new, 0x18);
+    }
+
+    // ── Loop / repeat! ──────────────────────────────────────────────
+
+    /// 记录 read/write 调用次数的总线，用于断言 Loop 的迭代次数。
+    #[derive(Default)]
+    struct CountBus {
+        reads: u32,
+        writes: u32,
+    }
+
+    impl Bus for CountBus {
+        fn read(&mut self, _addr: u32, _data: &mut [u8]) -> Result<(), BusError> {
+            self.reads += 1;
+            Ok(())
+        }
+        fn write(&mut self, _addr: u32, _data: &[u8]) -> Result<(), BusError> {
+            self.writes += 1;
+            Ok(())
+        }
+        fn delay_us(&mut self, _us: u32) -> Result<(), BusError> {
+            Ok(())
+        }
+    }
+
+    /// 构造 `read!(addr, 1, 0)` 的 13 字节编码。
+    fn read_one(addr: u32) -> Vec<u8> {
+        let mut v = vec![Opcode::Read as u8];
+        v.extend_from_slice(&addr.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    /// 构造 `Loop | count | body_len | body`。
+    fn loop_frame(count: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![Opcode::Loop as u8];
+        v.extend_from_slice(&count.to_le_bytes());
+        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn loop_repeats_body_count_times() {
+        // repeat!(3) { read!(0x10, 1, 0) }
+        let body = read_one(0x10);
+        let mut prog = loop_frame(3, &body);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.reads, 3);
+        assert_eq!(bus.writes, 0);
+    }
+
+    #[test]
+    fn loop_nested_multiplies_iterations() {
+        // repeat!(2) { repeat!(3) { read!(0x10, 1, 0) } }
+        let inner = loop_frame(3, &read_one(0x10));
+        let mut prog = loop_frame(2, &inner);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.reads, 2 * 3);
+    }
+
+    #[test]
+    fn loop_count_zero_is_noop() {
+        // repeat!(0) { read!(0x10, 1, 0) } → body 被跳过
+        let body = read_one(0x10);
+        let mut prog = loop_frame(0, &body);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.reads, 0);
+    }
+
+    #[test]
+    fn loop_with_write_repeats_side_effect() {
+        // repeat!(3) { write!(0x10, 0xAA, 0) }
+        let mut body = vec![Opcode::Write as u8];
+        body.extend_from_slice(&0x10u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // len
+        body.extend_from_slice(&0u32.to_le_bytes()); // delay
+        body.push(0xAA); // data
+        let mut prog = loop_frame(3, &body);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.writes, 3);
     }
 }

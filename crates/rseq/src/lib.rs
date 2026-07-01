@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
 pub use chip::{
-    Chip, ChipError, ChipRegistry, EventBit, UpdatePlan, emit_update_bytecode, load_chip,
+    Chip, ChipError, ChipRegistry, EventBit, UpdatePlan, emit_update_bytecode, fields_to_bytes,
+    load_chip,
     normalize_chip_path, resolve_chip_path,
 };
 
@@ -455,7 +456,7 @@ where
     let write_stmt = just(Token::WriteMacro)
         .ignore_then(
             value()
-                .then(just(Token::Comma).ignore_then(value()))
+                .then(just(Token::Comma).ignore_then(field_map().or(value())))
                 .then(just(Token::Comma).ignore_then(value()).or_not())
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
         )
@@ -901,8 +902,35 @@ fn compile_stmt(
             val,
             delay_us,
         } => {
-            let addr = resolve_u32(addr, registry)?;
             let delay = delay_us.unwrap_or(0);
+
+            // write!(PAGE.REG, { field: value, ... }): build the register bytes
+            // from the field values at compile time (no read — a deterministic
+            // whole-byte set), then emit a plain Write. Bits outside the listed
+            // fields are 0.
+            if let Value::FieldMap(entries) = val {
+                let target = match addr {
+                    Value::Ident(s) => s.as_str(),
+                    _ => {
+                        return Err(CompileError::Update(
+                            "write!(REG, { field: value }) requires a named register (PAGE.REG)"
+                                .into(),
+                        ))
+                    }
+                };
+                let plan = registry
+                    .plan_update(target, entries)
+                    .map_err(CompileError::Chip)?;
+                let data = fields_to_bytes(plan.width, &plan.fields);
+                bytecode.push(rseq_vm::Opcode::Write as u8);
+                bytecode.extend_from_slice(&plan.addr.to_le_bytes());
+                bytecode.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                bytecode.extend_from_slice(&delay.to_le_bytes());
+                bytecode.extend(data);
+                return Ok(());
+            }
+
+            let addr = resolve_u32(addr, registry)?;
 
             // 写入一个由 let 绑定的变量：变量的值在运行期保存在寄存器里，
             // 因此发射 WriteVar，由 VM 在执行时把寄存器的低字节写入总线。
@@ -1692,6 +1720,50 @@ mod tests {
         let bytecode = compile_with_base(&program, Some(base)).unwrap();
         assert_eq!(bytecode[0], rseq_vm::Opcode::Write as u8);
         assert_eq!(bytecode[14], rseq_vm::Opcode::Update as u8);
+    }
+
+    #[test]
+    fn test_compile_write_field_map_equals_raw_byte() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let base = path.parent().unwrap();
+
+        // write! with a field map must build the byte from the field value at
+        // compile time and emit a plain Write (no read), so it is byte-identical
+        // to writing the same raw byte.
+        let src_fields = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.ACTL1, { afs_ui: 2 }, 50);
+        "#;
+        let src_raw = r#"
+        chip!("qmi8660.yaml");
+        write!(UI.ACTL1, 0x02, 50);
+        "#;
+
+        let bc_fields = compile_with_base(&parse(src_fields).unwrap(), Some(base)).unwrap();
+        let bc_raw = compile_with_base(&parse(src_raw).unwrap(), Some(base)).unwrap();
+
+        assert_eq!(bc_fields.first(), Some(&(rseq_vm::Opcode::Write as u8)));
+        assert_eq!(bc_fields, bc_raw);
+    }
+
+    #[test]
+    fn test_parse_write_field_map() {
+        let src = r#"
+        write!(UI.ACTL1, { afs_ui: 2, ast: 0 });
+        "#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Write { addr, val, .. } => {
+                assert_eq!(addr, &Value::Ident("UI.ACTL1".to_string()));
+                assert_eq!(
+                    val,
+                    &Value::FieldMap(vec![("afs_ui".into(), 2), ("ast".into(), 0)])
+                );
+            }
+            _ => panic!("expected Write"),
+        }
     }
 
     #[test]

@@ -633,6 +633,26 @@ pub fn emit_update_bytecode(bytecode: &mut Vec<u8>, plan: &UpdatePlan, delay_us:
     }
 }
 
+/// Construct a register's raw bytes from field updates — the compile-time
+/// equivalent of `update!`'s read-modify-write, but with NO read: bits not
+/// covered by any listed field are 0, so this is a deterministic whole-byte
+/// set built purely from the field values. Used by `write!(REG, { field: v })`.
+pub fn fields_to_bytes(width: u32, fields: &[FieldUpdate]) -> Vec<u8> {
+    let mut buf = vec![0u8; width as usize];
+    for fu in fields {
+        let nbits = (fu.bit_hi - fu.bit_lo + 1) as usize;
+        for bit in 0..nbits {
+            let abs = fu.bit_lo as usize + bit;
+            let byte_idx = abs / 8;
+            let bit_idx = abs % 8;
+            if byte_idx < buf.len() && (fu.value >> bit) & 1 == 1 {
+                buf[byte_idx] |= 1u8 << bit_idx;
+            }
+        }
+    }
+    buf
+}
+
 fn parse_u32_text(text: &str) -> Result<u32, String> {
     let trimmed = text.trim();
     if let Some(hex) = trimmed

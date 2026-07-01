@@ -108,7 +108,15 @@ mod serial {
 
     impl Transport for SerialTransport {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, LinkError> {
-            self.port.read(buf).map_err(|_| LinkError::Io)
+            // A read timeout means "no data available right now", not an error —
+            // return 0 so the HostLink backoff loop can retry during long MCU
+            // delays (e.g. a 200 ms sensor-settling gap between Trace frames).
+            match self.port.read(buf) {
+                Ok(n) => Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(_) => Err(LinkError::Io),
+            }
         }
 
         fn write(&mut self, data: &[u8]) -> Result<(), LinkError> {

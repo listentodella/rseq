@@ -28,6 +28,12 @@ pub enum Opcode {
     // ── 跳转（off 为 i32，相对读完 off 后的 pc；前向为正）──
     JumpIfZero = 0x25,
     Jump = 0x26,
+    /// `print!("msg")`：读 len(u32) + utf8 字节，调 `Bus::log`。不涉总线时序，
+    /// 由 `TracingBus` 回传 Log trace、`ImuSpiBus` 走 printk。
+    Log = 0x27,
+    /// `print!("fmt", v1, v2, ...)`：读 n_vars + 各寄存器索引 + fmt 字符串，
+    /// 调 `Bus::log_vars`（默认实现就地格式化 `{}`/`{x}` 后委托 `log`）。
+    LogVar = 0x28,
     Read = 0x01,
     Write = 0x02,
     Update = 0x03,
@@ -66,6 +72,8 @@ impl Opcode {
             0x24 => Some(Self::LogNot),
             0x25 => Some(Self::JumpIfZero),
             0x26 => Some(Self::Jump),
+            0x27 => Some(Self::Log),
+            0x28 => Some(Self::LogVar),
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
             0x03 => Some(Self::Update),

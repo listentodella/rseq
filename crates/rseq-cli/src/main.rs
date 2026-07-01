@@ -308,6 +308,13 @@ fn main() {
                             println!("      Else: {} stmt(s)", else_.len());
                         }
                     }
+                    rseq::Stmt::Print { msg, vars } => {
+                        if vars.is_empty() {
+                            println!("    Action: Print {msg:?}");
+                        } else {
+                            println!("    Action: Print {msg:?} vars({})", vars.join(", "));
+                        }
+                    }
                 }
             }
         }
@@ -409,6 +416,9 @@ fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
             }
             rseq::trace::BusOp::Delay { us } => {
                 println!("  Step {}: Delay {us} μs", step + 1);
+            }
+            rseq::trace::BusOp::Log { msg } => {
+                println!("  Step {}: print {msg:?}", step + 1);
             }
         }
     }

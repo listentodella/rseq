@@ -53,6 +53,8 @@ enum Token<'a> {
     IrqMacro,
     #[token("repeat!")]
     RepeatMacro,
+    #[token("print!")]
+    PrintMacro,
     #[token("if")]
     If,
     #[token("else")]
@@ -119,8 +121,31 @@ enum Token<'a> {
     Bang,
 
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
+        // 在引号之间做转义展开：\n \t \r \" \\；未知 \x 保留字面反斜杠。
+        // 支持 print!("msg\n") / print!("a\nb") 这类换行。
         let s = lex.slice();
-        s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+        let body = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     })]
     String(String),
 
@@ -144,6 +169,7 @@ impl fmt::Display for Token<'_> {
             Self::ChipMacro => write!(f, "chip!"),
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
+            Self::PrintMacro => write!(f, "print!"),
             Self::If => write!(f, "if"),
             Self::Else => write!(f, "else"),
             Self::LParen => write!(f, "("),
@@ -236,6 +262,11 @@ pub enum Stmt {
         then: Vec<Stmt>,
         else_: Vec<Stmt>,
     },
+    /// `print!("msg")` 或 `print!("fmt", v1, v2)`：vars 空 → `Log`（纯字符串）；
+    /// vars 非空 → `LogVar`（变量插值，`{}` 有符号十进制 / `{x}` 十六进制）。
+    /// 经 `Bus::log`/`Bus::log_vars` 在 MockBus/stdout、真机 USART3(printk)、
+    /// 主机 trace 流三处可见。
+    Print { msg: String, vars: Vec<String> },
 }
 
 /// `irq!` 块中的一条事件分支：`on(event) { ... }`。
@@ -644,7 +675,26 @@ where
             }
         });
 
-    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt).or(read_stmt)
+    let print_stmt = just(Token::PrintMacro)
+        .ignore_then(
+            select! { Token::String(s) => s }
+                .then(
+                    just(Token::Comma)
+                        .ignore_then(
+                            select! { Token::Ident(s) => s.to_string() }
+                                .separated_by(just(Token::Comma))
+                                .allow_trailing()
+                                .collect::<Vec<_>>(),
+                        )
+                        .or_not()
+                        .map(|v| v.unwrap_or_default()),
+                )
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(msg, vars)| Stmt::Print { msg, vars });
+
+    chip_stmt.or(let_stmt).or(update_stmt).or(write_stmt).or(read_stmt).or(print_stmt)
 }
 
 /// 构造 `repeat!(<N>) { <body>* }` 解析器，体使用传入的 `body` 解析器。
@@ -1308,6 +1358,32 @@ fn compile_stmt(
                 bytecode.extend(&else_buf);
             }
         }
+        Stmt::Print { msg, vars: pvars } => {
+            let bytes = msg.as_bytes();
+            if pvars.is_empty() {
+                // print!("msg") → 纯 Log。
+                bytecode.push(rseq_vm::Opcode::Log as u8);
+                bytecode.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                bytecode.extend(bytes);
+            } else {
+                // print!("fmt", v1, v2, ...) → LogVar | n_vars | regs... | fmt_len | fmt
+                if pvars.len() > 8 {
+                    return Err(CompileError::Update(
+                        "print! supports at most 8 variables".into(),
+                    ));
+                }
+                bytecode.push(rseq_vm::Opcode::LogVar as u8);
+                bytecode.push(pvars.len() as u8);
+                for name in pvars {
+                    let reg = *vars
+                        .get(name)
+                        .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
+                    bytecode.push(reg);
+                }
+                bytecode.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                bytecode.extend(bytes);
+            }
+        }
     }
     Ok(())
 }
@@ -1795,6 +1871,39 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                 let off = read_u32(bytecode, &mut pc)? as i32;
                 output.push_str(&format!("// goto +{off}\n"));
             }
+            Some(rseq_vm::Opcode::Log) => {
+                pc += 1;
+                let len = read_u32(bytecode, &mut pc)? as usize;
+                if pc + len > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let msg = core::str::from_utf8(&bytecode[pc..pc + len])
+                    .map_err(|_| DecompileError::InvalidOpcode)?;
+                pc += len;
+                output.push_str(&format!("print!({msg:?});\n"));
+            }
+            Some(rseq_vm::Opcode::LogVar) => {
+                pc += 1;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                if pc + n > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let regs: Vec<u8> = bytecode[pc..pc + n].to_vec();
+                pc += n;
+                let fmt_len = read_u32(bytecode, &mut pc)? as usize;
+                if pc + fmt_len > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let fmt = core::str::from_utf8(&bytecode[pc..pc + fmt_len])
+                    .map_err(|_| DecompileError::InvalidOpcode)?;
+                pc += fmt_len;
+                let args: Vec<String> = regs.iter().map(|r| format!("r{r}")).collect();
+                output.push_str(&format!("print!({fmt:?}{});\n", if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) }));
+            }
             Some(rseq_vm::Opcode::WriteVar) => {
                 pc += 1;
                 let addr = read_u32(bytecode, &mut pc)?;
@@ -1831,6 +1940,7 @@ mod tests {
     struct MapBus {
         mem: HashMap<u32, u8>,
         writes: Vec<(u32, Vec<u8>)>,
+        logs: Vec<String>,
     }
 
     impl MapBus {
@@ -1838,6 +1948,7 @@ mod tests {
             Self {
                 mem: HashMap::new(),
                 writes: Vec::new(),
+                logs: Vec::new(),
             }
         }
     }
@@ -1857,6 +1968,10 @@ mod tests {
             Ok(())
         }
         fn delay_us(&mut self, _us: u32) -> Result<(), rseq_vm::BusError> {
+            Ok(())
+        }
+        fn log(&mut self, msg: &str) -> Result<(), rseq_vm::BusError> {
+            self.logs.push(msg.to_string());
             Ok(())
         }
     }
@@ -2924,5 +3039,121 @@ mod tests {
         assert!(decompiled.contains(">")); // CmpGt（3 > 5）
         assert!(decompiled.contains("write!(0x10, 0x01);"));
         assert!(decompiled.contains("write!(0x11, 0x02);"));
+    }
+
+    // ── print! / Log ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_print() {
+        let src = r#"print!("hello");"#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Print { msg, vars } => {
+                assert_eq!(msg, "hello");
+                assert!(vars.is_empty());
+            }
+            _ => panic!("expected Print"),
+        }
+    }
+
+    #[test]
+    fn test_parse_print_with_vars() {
+        let src = r#"print!("a={} b={x}", a, b);"#;
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::Print { msg, vars } => {
+                assert_eq!(msg, "a={} b={x}");
+                assert_eq!(vars, &vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => panic!("expected Print"),
+        }
+    }
+
+    #[test]
+    fn test_compile_print_emits_log() {
+        let src = r#"print!("hello");"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        // Log | len=5 | "hello" | Return
+        assert_eq!(bc[0], rseq_vm::Opcode::Log as u8);
+        let len = u32::from_le_bytes(bc[1..5].try_into().unwrap());
+        assert_eq!(len, 5);
+        assert_eq!(&bc[5..10], b"hello");
+        assert_eq!(bc.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_compile_print_with_vars_emits_logvar() {
+        // let a = 7; print!("a={}", a);
+        let src = r#"let a = 7; print!("a={}", a);"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        // 找到 LogVar 操作码。
+        let idx = bc
+            .iter()
+            .position(|&b| b == rseq_vm::Opcode::LogVar as u8)
+            .expect("LogVar emitted");
+        // LogVar | n_vars=1 | reg | fmt_len=4 | "a={}"
+        assert_eq!(bc[idx + 1], 1); // n_vars
+                                       // bc[idx+2] = reg index of `a` (应非零，因 let a 先分配)
+        let fmt_len = u32::from_le_bytes(bc[idx + 3..idx + 7].try_into().unwrap());
+        assert_eq!(fmt_len, 4);
+        assert_eq!(&bc[idx + 7..idx + 11], b"a={}");
+    }
+
+    #[test]
+    fn test_decompile_print_round_trip() {
+        // 含转义引号，验证 {:?} 还原成合法字符串字面量。
+        let src = r#"print!("hello \"x\"");"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let decompiled = decompile(&bc).unwrap();
+        assert!(decompiled.contains(r#"print!("hello \"x\"");"#));
+    }
+
+    #[test]
+    fn test_print_runs_and_records_log() {
+        let src = r#"print!("starting");"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.logs, vec!["starting".to_string()]);
+        assert!(bus.writes.is_empty());
+    }
+
+    #[test]
+    fn test_print_with_vars_runs_and_formats() {
+        // let a = 42; let b = 0xaa; print!("a={} b={x}", a, b);
+        let src = r#"let a = 42; let b = 0xaa; print!("a={} b={x}", a, b);"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.logs, vec!["a=42 b=0xaa".to_string()]);
+    }
+
+    #[test]
+    fn test_print_signed_and_hex() {
+        // 负数：0xFFFFFFFF = -1。print!("d={} h={x}", n, n) —— 同一值两种视图。
+        let src = r#"let n = 0xffffffff; print!("d={} h={x}", n, n);"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.logs, vec!["d=-1 h=0xffffffff".to_string()]);
+    }
+
+    #[test]
+    fn test_print_newline_escape() {
+        // \n 展开成真实换行：尾换行 + 多行。
+        let src = r#"print!("line1\nline2\n");"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.logs, vec!["line1\nline2\n".to_string()]);
+    }
+
+    #[test]
+    fn test_decompile_preserves_newline_escape() {
+        // 反编译应把真实换行还原成 \n 转义（{:?} 自动处理）。
+        let src = r#"print!("a\nb");"#;
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let decompiled = decompile(&bc).unwrap();
+        assert!(decompiled.contains(r#"print!("a\nb");"#));
     }
 }

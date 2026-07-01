@@ -33,6 +33,9 @@ impl From<TraceRef<'_>> for BusOp {
             TraceRef::Read { addr, data } => BusOp::Read { addr, data: data.to_vec() },
             TraceRef::Write { addr, data } => BusOp::Write { addr, data: data.to_vec() },
             TraceRef::Delay { us } => BusOp::Delay { us },
+            TraceRef::Log { msg } => BusOp::Log {
+                msg: String::from_utf8_lossy(msg).into_owned(),
+            },
         }
     }
 }
@@ -181,7 +184,7 @@ impl<T: Transport> HostLink<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rseq_link::wire::{encode_trace_delay, encode_trace_rw, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE};
+    use rseq_link::wire::{encode_trace_delay, encode_trace_log, encode_trace_rw, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE};
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
     /// 用于确定性地测试 HostLink 的帧解析与状态机,无需真实 MCU。
@@ -270,5 +273,21 @@ mod tests {
         let data = [0x11, 0x22];
         let b: BusOp = TraceRef::Write { addr: 0x1234, data: &data }.into();
         assert_eq!(b, BusOp::Write { addr: 0x1234, data: vec![0x11, 0x22] });
+    }
+
+    #[test]
+    fn exec_collects_log_trace() {
+        // MCU 响应流：ACK(Exec) + Log trace("hello") + Result(Ok)
+        let mut rx = Vec::new();
+        rx.extend(frame(FrameType::Ack, &[]));
+        let mut lb = vec![0u8; 32];
+        let ln = encode_trace_log(&mut lb, "hello");
+        rx.extend(&lb[..ln]);
+        rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
+
+        let mut link = HostLink::new(ScriptTransport { rx, pos: 0, writes: Vec::new() });
+        let res = link.exec().unwrap();
+        assert_eq!(res.status, ExecStatus::Ok);
+        assert_eq!(res.traces, vec![BusOp::Log { msg: "hello".to_string() }]);
     }
 }

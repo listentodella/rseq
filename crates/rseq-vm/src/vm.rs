@@ -282,6 +282,51 @@ impl<'a, B: Bus> Vm<'a, B> {
                         return Err(VmError::InvalidLength);
                     }
                 }
+                // print!("msg")：读 len(u32) + utf8 字节，调 bus.log。不涉总线时序。
+                Some(Opcode::Log) => {
+                    let len = self.read_u32()? as usize;
+                    let end = self
+                        .pc
+                        .checked_add(len)
+                        .ok_or(VmError::InvalidLength)?;
+                    if end > self.program.len() {
+                        return Err(VmError::ProgramTooShort);
+                    }
+                    let bytes = &self.program[self.pc..end];
+                    self.pc = end;
+                    let msg = core::str::from_utf8(bytes)
+                        .map_err(|_| VmError::InvalidOpcode)?;
+                    self.bus.log(msg).map_err(VmError::BusError)?;
+                }
+                // print!("fmt", v1, ...)：读 n_vars + 寄存器索引 + fmt，调 bus.log_vars。
+                // n_vars 上限 8（栈数组），编译器强制。
+                Some(Opcode::LogVar) => {
+                    let n = self.read_u8()? as usize;
+                    if n > 8 {
+                        return Err(VmError::InvalidLength);
+                    }
+                    let mut reg_idx = [0u8; 8];
+                    for slot in reg_idx.iter_mut().take(n) {
+                        *slot = self.read_u8()?;
+                    }
+                    let fmt_len = self.read_u32()? as usize;
+                    let end = self
+                        .pc
+                        .checked_add(fmt_len)
+                        .ok_or(VmError::InvalidLength)?;
+                    if end > self.program.len() {
+                        return Err(VmError::ProgramTooShort);
+                    }
+                    let fmt_bytes = &self.program[self.pc..end];
+                    self.pc = end;
+                    let fmt = core::str::from_utf8(fmt_bytes)
+                        .map_err(|_| VmError::InvalidOpcode)?;
+                    let mut vals = [0u32; 8];
+                    for (i, slot) in reg_idx.iter().enumerate().take(n) {
+                        vals[i] = self.regs[*slot as usize];
+                    }
+                    self.bus.log_vars(fmt, &vals[..n]).map_err(VmError::BusError)?;
+                }
                 Some(Opcode::WriteVar) => {
                     let addr = self.read_u32()?;
                     let len = self.read_u32()?;
@@ -500,11 +545,12 @@ mod tests {
 
     // ── Loop / repeat! ──────────────────────────────────────────────
 
-    /// 记录 read/write 调用次数的总线，用于断言 Loop 的迭代次数。
+    /// 记录 read/write 调用次数与 log 消息的总线，用于断言 Loop/Log 行为。
     #[derive(Default)]
     struct CountBus {
         reads: u32,
         writes: u32,
+        logs: Vec<String>,
     }
 
     impl Bus for CountBus {
@@ -517,6 +563,10 @@ mod tests {
             Ok(())
         }
         fn delay_us(&mut self, _us: u32) -> Result<(), BusError> {
+            Ok(())
+        }
+        fn log(&mut self, msg: &str) -> Result<(), BusError> {
+            self.logs.push(msg.to_owned());
             Ok(())
         }
     }
@@ -698,5 +748,40 @@ mod tests {
         Vm::new(&mut bus, &build(0)).run().unwrap();
         assert_eq!(bus.mem[0x10], 0x00);
         assert_eq!(bus.mem[0x11], 0x02);
+    }
+
+    // ── print! / Log ───────────────────────────────────────────────
+
+    #[test]
+    fn log_opcode_calls_bus_log() {
+        // print!("hi") → Log | len=2 | "hi"
+        let mut prog = vec![Opcode::Log as u8];
+        prog.extend_from_slice(&2u32.to_le_bytes());
+        prog.extend(b"hi");
+        prog.push(Opcode::Return as u8);
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.logs, vec!["hi".to_owned()]);
+    }
+
+    #[test]
+    fn logvar_opcode_formats_vars() {
+        // print!("v={} h={x}", r0, r1)  with r0=42, r1=0xaa
+        let mut prog = vec![Opcode::LoadConst as u8, 0, 42, 0, 0, 0];
+        prog.push(Opcode::LoadConst as u8);
+        prog.push(1);
+        prog.extend_from_slice(&0xaau32.to_le_bytes());
+        let fmt = b"v={} h={x}";
+        prog.push(Opcode::LogVar as u8);
+        prog.push(2); // n_vars
+        prog.push(0); // reg0
+        prog.push(1); // reg1
+        prog.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        prog.extend(fmt);
+        prog.push(Opcode::Return as u8);
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        // 默认 log_vars 就地格式化后委托 log → CountBus.log 记录。
+        assert_eq!(bus.logs, vec!["v=42 h=0xaa".to_owned()]);
     }
 }

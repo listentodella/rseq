@@ -12,6 +12,8 @@ pub const TRACE_OP_READ: u8 = 0x01;
 pub const TRACE_OP_WRITE: u8 = 0x02;
 /// Trace op:延时。
 pub const TRACE_OP_DELAY: u8 = 0x03;
+/// Trace op:日志（`print!`）。
+pub const TRACE_OP_LOG: u8 = 0x04;
 
 /// Trace 载荷最大长度(op+addr+dlen+data≤4096)。
 pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 2 + 4096;
@@ -22,6 +24,8 @@ pub enum TraceRef<'a> {
     Read { addr: u32, data: &'a [u8] },
     Write { addr: u32, data: &'a [u8] },
     Delay { us: u32 },
+    /// `print!` 日志，载荷为 utf8 字节（解码端按 lossy 转 String）。
+    Log { msg: &'a [u8] },
 }
 
 /// 在 `out` 中构造一条完整的 Read/Write Trace 帧(含帧头与 CRC),返回总字节数。
@@ -71,6 +75,31 @@ pub fn encode_trace_delay(out: &mut [u8], us: u32) -> usize {
     total
 }
 
+/// 在 `out` 中构造一条 Log Trace 帧(`print!`),返回总字节数。
+/// 载荷 = `op + mlen(u16) + msg`。`out` 需 ≥ `OVERHEAD + 3 + msg.len()`。
+pub fn encode_trace_log(out: &mut [u8], msg: &str) -> usize {
+    let payload_len = 1 + 2 + msg.len();
+    let total = OVERHEAD + payload_len;
+    assert!(
+        out.len() >= total,
+        "trace log buffer too small: need {total}, have {}",
+        out.len()
+    );
+    out[0] = 0x55;
+    out[1] = 0xAA;
+    out[2] = FrameType::Trace as u8;
+    out[3] = (payload_len & 0xFF) as u8;
+    out[4] = (payload_len >> 8) as u8;
+    out[5] = TRACE_OP_LOG;
+    let mlen = msg.len() as u16;
+    out[6] = (mlen & 0xFF) as u8;
+    out[7] = (mlen >> 8) as u8;
+    out[8..8 + msg.len()].copy_from_slice(msg.as_bytes());
+    let crc = crate::crc32::crc32(&out[2..5 + payload_len]);
+    out[5 + payload_len..5 + payload_len + 4].copy_from_slice(&crc.to_le_bytes());
+    total
+}
+
 /// 从 Trace 载荷解码为 [`TraceRef`]。布局不合法返回 `None`。
 pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
     if payload.is_empty() {
@@ -100,6 +129,17 @@ pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
             }
             let us = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
             Some(TraceRef::Delay { us })
+        }
+        TRACE_OP_LOG => {
+            if payload.len() < 1 + 2 {
+                return None;
+            }
+            let mlen = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+            if payload.len() < 1 + 2 + mlen {
+                return None;
+            }
+            let msg = &payload[1 + 2..1 + 2 + mlen];
+            Some(TraceRef::Log { msg })
         }
         _ => None,
     }
@@ -217,6 +257,7 @@ mod tests {
     use super::*;
     use std::prelude::v1::*;
 
+
     #[test]
     fn trace_rw_round_trip() {
         let data = [0x11, 0x22, 0x33];
@@ -245,6 +286,20 @@ mod tests {
         });
         let (_, p) = payload.unwrap();
         assert_eq!(decode_trace(&p), Some(TraceRef::Delay { us: 50000 }));
+    }
+
+    #[test]
+    fn trace_log_round_trip() {
+        let mut buf = vec![0u8; 64];
+        let n = encode_trace_log(&mut buf, "hi log");
+        let mut dec = crate::frame::FrameDecoder::<{ crate::frame::HOST_FRAME_BUF }>::new();
+        let mut payload = None;
+        dec.feed(&buf[..n], |ty, p| {
+            payload = Some((ty, p.to_vec()));
+        });
+        let (ty, p) = payload.expect("frame decoded");
+        assert_eq!(ty, FrameType::Trace);
+        assert_eq!(decode_trace(&p), Some(TraceRef::Log { msg: &b"hi log"[..] }));
     }
 
     #[test]

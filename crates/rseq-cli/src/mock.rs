@@ -64,4 +64,9 @@ impl Bus for MockBus {
         self.ops.push(BusOp::Delay { us });
         Ok(())
     }
+
+    fn log(&mut self, msg: &str) -> Result<(), BusError> {
+        self.ops.push(BusOp::Log { msg: msg.to_string() });
+        Ok(())
+    }
 }

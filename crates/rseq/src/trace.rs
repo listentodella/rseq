@@ -17,4 +17,6 @@ pub enum BusOp {
     Read { addr: u32, data: Vec<u8> },
     Write { addr: u32, data: Vec<u8> },
     Delay { us: u32 },
+    /// `print!("msg")` 日志。
+    Log { msg: String },
 }

@@ -7,7 +7,7 @@ use rseq_vm::{Bus, BusError};
 
 use crate::error::LinkError;
 use crate::frame::MAX_TRACE_FRAME;
-use crate::wire::{encode_trace_delay, encode_trace_rw};
+use crate::wire::{encode_trace_delay, encode_trace_log, encode_trace_rw};
 
 /// 只能发送字节流的链路出口。`TracingBus` 只发不收。
 pub trait LinkTx {
@@ -107,6 +107,15 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
         self.send(n);
         Ok(())
     }
+
+    /// `print!`：先让真总线打印（真机=printk），再回传一条 Log trace 给主机。
+    /// 观测失败不影响总线动作本身（尽力发送）。
+    fn log(&mut self, msg: &str) -> Result<(), BusError> {
+        self.inner.log(msg)?;
+        let n = encode_trace_log(&mut self.buf, msg);
+        self.send(n);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +157,7 @@ mod tests {
         Read { addr: u32, data: Vec<u8> },
         Write { addr: u32, data: Vec<u8> },
         Delay { us: u32 },
+        Log { msg: Vec<u8> },
     }
 
     fn decoded_traces(bytes: &[u8]) -> Vec<OwnedTrace> {
@@ -164,6 +174,9 @@ mod tests {
                         OwnedTrace::Write { addr, data: data.to_vec() }
                     }
                     crate::wire::TraceRef::Delay { us } => OwnedTrace::Delay { us },
+                    crate::wire::TraceRef::Log { msg } => {
+                        OwnedTrace::Log { msg: msg.to_vec() }
+                    }
                 });
             }
         });

@@ -298,6 +298,16 @@ fn main() {
                             println!("    Delay: {} μs after read", d);
                         }
                     }
+                    rseq::Stmt::If {
+                        cond,
+                        then,
+                        else_,
+                    } => {
+                        println!("    Action: If ({}) → {} stmt(s)", format_expr(cond), then.len());
+                        if !else_.is_empty() {
+                            println!("      Else: {} stmt(s)", else_.len());
+                        }
+                    }
                 }
             }
         }
@@ -510,6 +520,9 @@ fn format_expr(expr: &rseq::Expr) -> String {
         rseq::Expr::Ident(name) => name.clone(),
         rseq::Expr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", format_expr(lhs), op, format_expr(rhs))
+        }
+        rseq::Expr::Unary { op, expr } => {
+            format!("{}{}", op, format_expr(expr))
         }
     }
 }

@@ -62,6 +62,11 @@ impl<'a, B: Bus> Vm<'a, B> {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    /// 读一个 i32 立即数（跳转偏移用）。复用 read_u32 的边界检查。
+    fn read_i32(&mut self) -> Result<i32, VmError> {
+        Ok(self.read_u32()? as i32)
+    }
+
     fn read_len(&mut self) -> Result<usize, VmError> {
         let len = self.read_u32()?;
         if len == 0 || len > 4096 {
@@ -209,6 +214,73 @@ impl<'a, B: Bus> Vm<'a, B> {
                         _ => unreachable!(),
                     };
                     self.regs[dst] = result;
+                }
+                // 比较：dst = lhs OP rhs ? 1 : 0。Lt/Le/Gt/Ge 按有符号 i32。
+                Some(
+                    op @ (Opcode::CmpEq
+                    | Opcode::CmpNe
+                    | Opcode::CmpLt
+                    | Opcode::CmpLe
+                    | Opcode::CmpGt
+                    | Opcode::CmpGe),
+                ) => {
+                    let dst = self.read_u8()? as usize;
+                    let lhs = self.regs[self.read_u8()? as usize];
+                    let rhs = self.regs[self.read_u8()? as usize];
+                    let (li, ri) = (lhs as i32, rhs as i32);
+                    let result: u32 = match op {
+                        Opcode::CmpEq => (lhs == rhs) as u32,
+                        Opcode::CmpNe => (lhs != rhs) as u32,
+                        Opcode::CmpLt => (li < ri) as u32,
+                        Opcode::CmpLe => (li <= ri) as u32,
+                        Opcode::CmpGt => (li > ri) as u32,
+                        Opcode::CmpGe => (li >= ri) as u32,
+                        _ => unreachable!(),
+                    };
+                    self.regs[dst] = result;
+                }
+                // 逻辑与/或（急求值非短路）：dst = (lhs!=0) OP (rhs!=0) ? 1 : 0。
+                Some(op @ (Opcode::LogAnd | Opcode::LogOr)) => {
+                    let dst = self.read_u8()? as usize;
+                    let lhs = self.regs[self.read_u8()? as usize];
+                    let rhs = self.regs[self.read_u8()? as usize];
+                    let result = match op {
+                        Opcode::LogAnd => ((lhs != 0) && (rhs != 0)) as u32,
+                        Opcode::LogOr => ((lhs != 0) || (rhs != 0)) as u32,
+                        _ => unreachable!(),
+                    };
+                    self.regs[dst] = result;
+                }
+                // 逻辑非：dst = (src==0) ? 1 : 0。
+                Some(Opcode::LogNot) => {
+                    let dst = self.read_u8()? as usize;
+                    let src = self.regs[self.read_u8()? as usize];
+                    self.regs[dst] = (src == 0) as u32;
+                }
+                // 条件跳转：cond==0 则 pc += off（off 相对读完 off 后的 pc）。
+                Some(Opcode::JumpIfZero) => {
+                    let cond = self.regs[self.read_u8()? as usize];
+                    let off = self.read_i32()?;
+                    if cond == 0 {
+                        self.pc = self
+                            .pc
+                            .checked_add_signed(off as isize)
+                            .ok_or(VmError::InvalidLength)?;
+                        if self.pc > self.program.len() {
+                            return Err(VmError::InvalidLength);
+                        }
+                    }
+                }
+                // 无条件跳转：pc += off。
+                Some(Opcode::Jump) => {
+                    let off = self.read_i32()?;
+                    self.pc = self
+                        .pc
+                        .checked_add_signed(off as isize)
+                        .ok_or(VmError::InvalidLength)?;
+                    if self.pc > self.program.len() {
+                        return Err(VmError::InvalidLength);
+                    }
                 }
                 Some(Opcode::WriteVar) => {
                     let addr = self.read_u32()?;
@@ -518,5 +590,113 @@ mod tests {
         let mut bus = CountBus::default();
         Vm::new(&mut bus, &prog).run().unwrap();
         assert_eq!(bus.writes, 3);
+    }
+
+    // ── 比较 / 逻辑 / 跳转 ─────────────────────────────────────────
+
+    /// 构造 `write!(addr, byte, 0)` 的 14 字节编码。
+    fn write_one(addr: u32, byte: u8) -> Vec<u8> {
+        let mut v = vec![Opcode::Write as u8];
+        v.extend_from_slice(&addr.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes()); // len
+        v.extend_from_slice(&0u32.to_le_bytes()); // delay
+        v.push(byte);
+        v
+    }
+
+    #[test]
+    fn cmp_lt_is_signed() {
+        // r0 = -1 (0xFFFFFFFF), r1 = 1, r2 = (r0 < r1) → 1（有符号 -1 < 1）
+        let prog = vec![
+            Opcode::LoadConst as u8, 0, 0xFF, 0xFF, 0xFF, 0xFF,
+            Opcode::LoadConst as u8, 1, 0x01, 0x00, 0x00, 0x00,
+            Opcode::CmpLt as u8, 2, 0, 1,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &prog);
+        vm.run().unwrap();
+        assert_eq!(vm.regs[2], 1);
+    }
+
+    #[test]
+    fn jump_if_zero_skips_when_zero() {
+        let w = write_one(0x10, 0xAA);
+        let off = w.len() as i32;
+
+        // r0=0 → 跳过 Write → 0 次 write
+        let mut prog = vec![Opcode::LoadConst as u8, 0, 0, 0, 0, 0];
+        prog.push(Opcode::JumpIfZero as u8);
+        prog.push(0);
+        prog.extend_from_slice(&off.to_le_bytes());
+        prog.extend(&w);
+        prog.push(Opcode::Return as u8);
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.writes, 0);
+
+        // r0=1 → 不跳 → 1 次 write
+        let mut prog = vec![Opcode::LoadConst as u8, 0, 1, 0, 0, 0];
+        prog.push(Opcode::JumpIfZero as u8);
+        prog.push(0);
+        prog.extend_from_slice(&off.to_le_bytes());
+        prog.extend(&w);
+        prog.push(Opcode::Return as u8);
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.writes, 1);
+    }
+
+    #[test]
+    fn logical_and_and_not() {
+        // r0=2, r1=0; r2=r0&&r1→0; r3=!r0→0; r4=!r1→1
+        let prog = vec![
+            Opcode::LoadConst as u8, 0, 2, 0, 0, 0,
+            Opcode::LoadConst as u8, 1, 0, 0, 0, 0,
+            Opcode::LogAnd as u8, 2, 0, 1,
+            Opcode::LogNot as u8, 3, 0,
+            Opcode::LogNot as u8, 4, 1,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &prog);
+        vm.run().unwrap();
+        assert_eq!(vm.regs[2], 0); // 2 && 0
+        assert_eq!(vm.regs[3], 0); // !2
+        assert_eq!(vm.regs[4], 1); // !0
+    }
+
+    #[test]
+    fn if_else_jumps_to_correct_branch() {
+        // if (cond) { write 0x10=0x01 } else { write 0x11=0x02 }
+        let then_w = write_one(0x10, 0x01);
+        let else_w = write_one(0x11, 0x02);
+        let jump_instr_len: i32 = 1 + 4; // Jump = 操作码 + i32
+
+        let build = |cond: u32| -> Vec<u8> {
+            let mut p = vec![Opcode::LoadConst as u8, 0];
+            p.extend_from_slice(&cond.to_le_bytes());
+            p.push(Opcode::JumpIfZero as u8);
+            p.push(0);
+            p.extend_from_slice(&(then_w.len() as i32 + jump_instr_len).to_le_bytes());
+            p.extend(&then_w);
+            p.push(Opcode::Jump as u8);
+            p.extend_from_slice(&(else_w.len() as i32).to_le_bytes());
+            p.extend(&else_w);
+            p.push(Opcode::Return as u8);
+            p
+        };
+
+        // cond=1 → then
+        let mut bus = TestBus::new();
+        Vm::new(&mut bus, &build(1)).run().unwrap();
+        assert_eq!(bus.mem[0x10], 0x01);
+        assert_eq!(bus.mem[0x11], 0x00);
+
+        // cond=0 → else
+        let mut bus = TestBus::new();
+        Vm::new(&mut bus, &build(0)).run().unwrap();
+        assert_eq!(bus.mem[0x10], 0x00);
+        assert_eq!(bus.mem[0x11], 0x02);
     }
 }

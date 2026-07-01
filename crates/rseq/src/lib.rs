@@ -53,6 +53,10 @@ enum Token<'a> {
     IrqMacro,
     #[token("repeat!")]
     RepeatMacro,
+    #[token("if")]
+    If,
+    #[token("else")]
+    Else,
     #[token("(")]
     LParen,
     #[token(")")]
@@ -94,6 +98,26 @@ enum Token<'a> {
     #[token("^")]
     Caret,
 
+    // ── 比较 / 逻辑运算符（多字符优先于单字符，logos 最长匹配）──
+    #[token("==")]
+    Eq,
+    #[token("!=")]
+    Ne,
+    #[token("<=")]
+    Le,
+    #[token(">=")]
+    Ge,
+    #[token("<")]
+    Lt,
+    #[token(">")]
+    Gt,
+    #[token("&&")]
+    AndAnd,
+    #[token("||")]
+    OrOr,
+    #[token("!")]
+    Bang,
+
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
         s[1..s.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
@@ -120,6 +144,8 @@ impl fmt::Display for Token<'_> {
             Self::ChipMacro => write!(f, "chip!"),
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
+            Self::If => write!(f, "if"),
+            Self::Else => write!(f, "else"),
             Self::LParen => write!(f, "("),
             Self::RParen => write!(f, ")"),
             Self::LBracket => write!(f, "["),
@@ -139,6 +165,15 @@ impl fmt::Display for Token<'_> {
             Self::Amp => write!(f, "&"),
             Self::Pipe => write!(f, "|"),
             Self::Caret => write!(f, "^"),
+            Self::Eq => write!(f, "=="),
+            Self::Ne => write!(f, "!="),
+            Self::Le => write!(f, "<="),
+            Self::Ge => write!(f, ">="),
+            Self::Lt => write!(f, "<"),
+            Self::Gt => write!(f, ">"),
+            Self::AndAnd => write!(f, "&&"),
+            Self::OrOr => write!(f, "||"),
+            Self::Bang => write!(f, "!"),
             Self::String(s) => write!(f, "\"{s}\""),
             Self::Whitespace => write!(f, "<whitespace>"),
             Self::Comment => write!(f, "<comment>"),
@@ -194,6 +229,13 @@ pub enum Stmt {
         len: Value,
         delay_us: Option<u32>,
     },
+    /// `if (cond) { ... } else { ... }`：cond 为任意表达式（非零为真）。
+    /// 编译为 `JumpIfZero`/`Jump`；体可嵌套 if/repeat。`else_` 空=无 else。
+    If {
+        cond: Box<Expr>,
+        then: Vec<Stmt>,
+        else_: Vec<Stmt>,
+    },
 }
 
 /// `irq!` 块中的一条事件分支：`on(event) { ... }`。
@@ -215,6 +257,16 @@ pub enum BinOp {
     And,
     Or,
     Xor,
+    // 比较（结果 0/1；Lt/Le/Gt/Ge 按有符号 i32）
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    // 逻辑（急求值非短路）
+    AndAnd,
+    OrOr,
 }
 
 impl fmt::Display for BinOp {
@@ -230,6 +282,14 @@ impl fmt::Display for BinOp {
             Self::And => "&",
             Self::Or => "|",
             Self::Xor => "^",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::AndAnd => "&&",
+            Self::OrOr => "||",
         };
         f.write_str(s)
     }
@@ -249,6 +309,26 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// 一元前缀运算（当前仅逻辑非 `!`）。
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `!expr`：逻辑非，结果 0/1。
+    Not,
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Not => "!",
+        };
+        f.write_str(s)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,7 +466,8 @@ where
 /// 完整表达式解析器，支持加减乘除、移位、逻辑与或异或，以及括号。
 ///
 /// 优先级（从低到高）：
-///   `|` → `^` → `&` → `<<`/`>>` → `+`/`-` → `*`/`/`/`%` → primary
+///   `||` → `&&` → `|` → `^` → `&` → `==`/`!=` → `<`/`<=`/`>`/`>=`
+///   → `<<`/`>>` → `+`/`-` → `*`/`/`/`%` → 一元 `!` → primary
 fn expr<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
@@ -397,7 +478,19 @@ where
         let paren = expr
             .clone()
             .delimited_by(just(Token::LParen), just(Token::RParen));
-        let primary = number.or(ident).or(read_expr()).or(paren);
+        let atom = number.or(ident).or(read_expr()).or(paren);
+
+        // 一元前缀 `!`（可叠加 `!!x`）；零个 `!` 时退化为 atom。
+        let primary = just(Token::Bang)
+            .repeated()
+            .collect::<Vec<_>>()
+            .then(atom)
+            .map(|(bangs, atom)| {
+                bangs.iter().fold(atom, |acc, _| Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(acc),
+                })
+            });
 
         fn binop_layer<'tok, 'src: 'tok, I>(
             prev: impl Parser<'tok, I, Expr, ParserExtra<'tok, 'src>> + Clone + 'tok,
@@ -434,9 +527,21 @@ where
             .or(just(Token::Shr).to(BinOp::Shr));
         let shift = binop_layer(add, shift_op);
 
+        // 关系：< <= > >=（按有符号 i32 比较）
+        let rel_op = just(Token::Lt).to(BinOp::Lt)
+            .or(just(Token::Le).to(BinOp::Le))
+            .or(just(Token::Gt).to(BinOp::Gt))
+            .or(just(Token::Ge).to(BinOp::Ge));
+        let rel = binop_layer(shift, rel_op);
+
+        // 相等：== !=
+        let eq_op = just(Token::Eq).to(BinOp::Eq)
+            .or(just(Token::Ne).to(BinOp::Ne));
+        let eq = binop_layer(rel, eq_op);
+
         // 按位与
         let and_op = just(Token::Amp).to(BinOp::And);
-        let and = binop_layer(shift, and_op);
+        let and = binop_layer(eq, and_op);
 
         // 按位异或
         let xor_op = just(Token::Caret).to(BinOp::Xor);
@@ -444,7 +549,15 @@ where
 
         // 按位或
         let or_op = just(Token::Pipe).to(BinOp::Or);
-        binop_layer(xor, or_op)
+        let or = binop_layer(xor, or_op);
+
+        // 逻辑与 &&（急求值非短路；低于按位或）
+        let andand_op = just(Token::AndAnd).to(BinOp::AndAnd);
+        let logand = binop_layer(or, andand_op);
+
+        // 逻辑或 ||（最低优先级）
+        let oror_op = just(Token::OrOr).to(BinOp::OrOr);
+        binop_layer(logand, oror_op)
     })
 }
 
@@ -558,24 +671,66 @@ where
         .map(|(count, body)| Stmt::Repeat { count, body })
 }
 
-/// `repeat!` 体里允许的语句集：普通语句 + 嵌套 repeat!（不含 irq!，与 irq! arm
+/// 构造 `if ( cond ) { body* } [ else { body* } | else <stmt> ]` 解析器，
+/// 体/else 使用传入的 `body` 解析器。else 子句支持 `else { ... }` 与
+/// `else if (...)`（单个 if 语句经 body 解析后包成 vec）。与 repeat_with 同构，
+/// 让 block_stmt 能用 `recursive` 把"自身"作为体传入而不在构造期递归。
+fn if_with<'tok, 'src: 'tok, I, B>(
+    body: B,
+) -> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+    B: Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok,
+{
+    let braced = body
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace));
+    let single = body.map(|s| vec![s]);
+    just(Token::If)
+        .ignore_then(expr().delimited_by(just(Token::LParen), just(Token::RParen)))
+        .then(braced.clone())
+        .then(
+            just(Token::Else)
+                .ignore_then(braced.or(single))
+                .or_not(),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|((cond, then), else_)| Stmt::If {
+            cond: Box::new(cond),
+            then,
+            else_: else_.unwrap_or_default(),
+        })
+}
+
+/// 块内允许的语句集：普通语句 + 嵌套 repeat! + 嵌套 if（不含 irq!，与 irq! arm
 /// 体只允许普通语句的约束对称）。用 `recursive` 提供自引用句柄 `r`，把它作为
-/// repeat 体传入——构造期不再调用自身，解析期按嵌套层数递归（有界）。
+/// repeat/if 体传入——构造期不调用自身，解析期按嵌套层数递归（有界）。
 fn block_stmt<'tok, 'src: 'tok, I>()
 -> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
-    recursive(|r| simple_stmt().or(repeat_with(r)))
+    recursive(|r| simple_stmt().or(repeat_with(r.clone())).or(if_with(r)))
 }
 
-/// 顶层 `repeat!(N) { <stmt>* }`：定长循环。count 仅接受数字字量；体可嵌套 repeat!。
+/// 顶层 `repeat!(N) { <stmt>* }`：定长循环。count 仅接受数字字量；体可嵌套 repeat!/if。
 fn repeat_stmt<'tok, 'src: 'tok, I>()
 -> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
     repeat_with(block_stmt())
+}
+
+/// 顶层 `if (cond) { ... } else { ... }`。体可嵌套 repeat!/if。
+fn if_stmt<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Stmt, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    if_with(block_stmt())
 }
 
 /// 解析 `irq!(pin) { on(event) { ... } ... }` 中断处理块。
@@ -616,7 +771,7 @@ fn stmt<'tok, 'src: 'tok, I>() -> impl Parser<'tok, I, (Stmt, Range<usize>), Par
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
 {
-    simple_stmt().or(irq_stmt()).or(repeat_stmt()).map_with(
+    simple_stmt().or(irq_stmt()).or(repeat_stmt()).or(if_stmt()).map_with(
         |stmt, e: &mut MapExtra<'tok, '_, I, ParserExtra<'tok, 'src>>| {
             (stmt, e.span().into_range())
         },
@@ -1111,6 +1266,48 @@ fn compile_stmt(
             bytecode.extend_from_slice(&len.to_le_bytes());
             bytecode.extend_from_slice(&delay.to_le_bytes());
         }
+        Stmt::If { cond, then, else_ } => {
+            // cond 编译进主字节码流，得到 cond_reg。
+            let cond_reg = compile_expr(cond, registry, vars, next_reg, bytecode)?;
+            // 体先编译进临时缓冲（共享外层 vars/next_reg/registry），长度已知后再发射跳转。
+            let mut then_buf: Vec<u8> = Vec::new();
+            for s in then {
+                compile_stmt(s, registry, vars, next_reg, &mut then_buf, irqs)?;
+            }
+            let mut else_buf: Vec<u8> = Vec::new();
+            for s in else_ {
+                compile_stmt(s, registry, vars, next_reg, &mut else_buf, irqs)?;
+            }
+
+            // Jump 指令长度 = 操作码(1) + i32 偏移(4)。
+            const JUMP_INSTR_LEN: usize = 1 + 4;
+
+            if else_buf.is_empty() {
+                // if (cond) { then }：cond==0 跳过 then 体。
+                //   JumpIfZero cond_reg, +then_len
+                //   <then>
+                bytecode.push(rseq_vm::Opcode::JumpIfZero as u8);
+                bytecode.push(cond_reg);
+                let off = then_buf.len() as i32;
+                bytecode.extend_from_slice(&off.to_le_bytes());
+                bytecode.extend(&then_buf);
+            } else {
+                // if (cond) { then } else { else }：
+                //   JumpIfZero cond_reg, +(then_len + JUMP_INSTR_LEN)  → 跳到 else
+                //   <then>
+                //   Jump +else_len                                            → 跳过 else
+                //   <else>
+                bytecode.push(rseq_vm::Opcode::JumpIfZero as u8);
+                bytecode.push(cond_reg);
+                let off = (then_buf.len() + JUMP_INSTR_LEN) as i32;
+                bytecode.extend_from_slice(&off.to_le_bytes());
+                bytecode.extend(&then_buf);
+                bytecode.push(rseq_vm::Opcode::Jump as u8);
+                let off2 = else_buf.len() as i32;
+                bytecode.extend_from_slice(&off2.to_le_bytes());
+                bytecode.extend(&else_buf);
+            }
+        }
     }
     Ok(())
 }
@@ -1265,11 +1462,30 @@ fn compile_expr(
                 BinOp::And => rseq_vm::Opcode::And,
                 BinOp::Or => rseq_vm::Opcode::Or,
                 BinOp::Xor => rseq_vm::Opcode::Xor,
+                BinOp::Eq => rseq_vm::Opcode::CmpEq,
+                BinOp::Ne => rseq_vm::Opcode::CmpNe,
+                BinOp::Lt => rseq_vm::Opcode::CmpLt,
+                BinOp::Le => rseq_vm::Opcode::CmpLe,
+                BinOp::Gt => rseq_vm::Opcode::CmpGt,
+                BinOp::Ge => rseq_vm::Opcode::CmpGe,
+                BinOp::AndAnd => rseq_vm::Opcode::LogAnd,
+                BinOp::OrOr => rseq_vm::Opcode::LogOr,
             };
             bytecode.push(opcode as u8);
             bytecode.push(dst);
             bytecode.push(lhs_reg);
             bytecode.push(rhs_reg);
+            Ok(dst)
+        }
+        Expr::Unary { op, expr } => {
+            let src = compile_expr(expr, registry, vars, next_reg, bytecode)?;
+            let dst = alloc_reg(next_reg)?;
+            let opcode = match op {
+                UnaryOp::Not => rseq_vm::Opcode::LogNot,
+            };
+            bytecode.push(opcode as u8);
+            bytecode.push(dst);
+            bytecode.push(src);
             Ok(dst)
         }
     }
@@ -1512,6 +1728,72 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                     _ => unreachable!(),
                 };
                 output.push_str(&format!("// r{dst} = r{lhs} {op_str} r{rhs}\n"));
+            }
+            Some(op @ (rseq_vm::Opcode::CmpEq
+            | rseq_vm::Opcode::CmpNe
+            | rseq_vm::Opcode::CmpLt
+            | rseq_vm::Opcode::CmpLe
+            | rseq_vm::Opcode::CmpGt
+            | rseq_vm::Opcode::CmpGe)) => {
+                pc += 1;
+                if pc + 2 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                let lhs = bytecode[pc + 1];
+                let rhs = bytecode[pc + 2];
+                pc += 3;
+                let op_str = match op {
+                    rseq_vm::Opcode::CmpEq => "==",
+                    rseq_vm::Opcode::CmpNe => "!=",
+                    rseq_vm::Opcode::CmpLt => "<",
+                    rseq_vm::Opcode::CmpLe => "<=",
+                    rseq_vm::Opcode::CmpGt => ">",
+                    rseq_vm::Opcode::CmpGe => ">=",
+                    _ => unreachable!(),
+                };
+                output.push_str(&format!("// r{dst} = r{lhs} {op_str} r{rhs}\n"));
+            }
+            Some(op @ (rseq_vm::Opcode::LogAnd | rseq_vm::Opcode::LogOr)) => {
+                pc += 1;
+                if pc + 2 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                let lhs = bytecode[pc + 1];
+                let rhs = bytecode[pc + 2];
+                pc += 3;
+                let op_str = match op {
+                    rseq_vm::Opcode::LogAnd => "&&",
+                    rseq_vm::Opcode::LogOr => "||",
+                    _ => unreachable!(),
+                };
+                output.push_str(&format!("// r{dst} = r{lhs} {op_str} r{rhs}\n"));
+            }
+            Some(rseq_vm::Opcode::LogNot) => {
+                pc += 1;
+                if pc + 1 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let dst = bytecode[pc];
+                let src = bytecode[pc + 1];
+                pc += 2;
+                output.push_str(&format!("// r{dst} = !r{src}\n"));
+            }
+            Some(rseq_vm::Opcode::JumpIfZero) => {
+                pc += 1;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let cond = bytecode[pc];
+                pc += 1;
+                let off = read_u32(bytecode, &mut pc)? as i32;
+                output.push_str(&format!("// if r{cond} == 0 goto +{off}\n"));
+            }
+            Some(rseq_vm::Opcode::Jump) => {
+                pc += 1;
+                let off = read_u32(bytecode, &mut pc)? as i32;
+                output.push_str(&format!("// goto +{off}\n"));
             }
             Some(rseq_vm::Opcode::WriteVar) => {
                 pc += 1;
@@ -2495,5 +2777,152 @@ mod tests {
         let decompiled = decompile(&bytecode).unwrap();
         assert!(decompiled.contains("repeat!(3) {"));
         assert!(decompiled.contains("read!(0x10, 6);"));
+    }
+
+    // ── if-else / 逻辑运算符 ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_if_else() {
+        let src = "if (a > 5) { write!(0x10, 0x01); } else { write!(0x11, 0x02); }";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::If { cond, then, else_ } => {
+                assert_eq!(then.len(), 1);
+                assert_eq!(else_.len(), 1);
+                assert!(matches!(&**cond, Expr::Binary { op: BinOp::Gt, .. }));
+            }
+            _ => panic!("expected If"),
+        }
+    }
+
+    #[test]
+    fn test_if_else_runs_correct_branch() {
+        // cond 假 (3 > 5) → else 写 0x11=2
+        let src = "if (3 > 5) { write!(0x10, 0x01); } else { write!(0x11, 0x02); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x11 && d == &[0x02]));
+        assert!(!bus.writes.iter().any(|(a, _)| *a == 0x10));
+
+        // cond 真 (5 > 3) → then 写 0x10=1
+        let src = "if (5 > 3) { write!(0x10, 0x01); } else { write!(0x11, 0x02); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x10 && d == &[0x01]));
+        assert!(!bus.writes.iter().any(|(a, _)| *a == 0x11));
+    }
+
+    #[test]
+    fn test_if_without_else() {
+        let false_src = "if (1 > 2) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(false_src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.is_empty());
+
+        let true_src = "if (2 > 1) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(true_src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x10 && d == &[0x01]));
+    }
+
+    #[test]
+    fn test_if_with_logical_and() {
+        // (5>3) && (2>1) → 真
+        let src = "if ((5 > 3) && (2 > 1)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x10 && d == &[0x01]));
+
+        // (5>3) && (2>5) → 假
+        let src = "if ((5 > 3) && (2 > 5)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.is_empty());
+    }
+
+    #[test]
+    fn test_if_with_logical_or() {
+        // (1>2) || (2>1) → 真
+        let src = "if ((1 > 2) || (2 > 1)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x10 && d == &[0x01]));
+
+        // (1>2) || (2>5) → 假
+        let src = "if ((1 > 2) || (2 > 5)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.is_empty());
+    }
+
+    #[test]
+    fn test_if_with_logical_not() {
+        // !(1==1) → !1 → 0 → 假
+        let src = "if (!(1 == 1)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.is_empty());
+
+        // !(1==2) → !0 → 1 → 真
+        let src = "if (!(1 == 2)) { write!(0x10, 0x01); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x10 && d == &[0x01]));
+    }
+
+    #[test]
+    fn test_else_if_chain() {
+        // 1>2 假, 2>1 真 → 写 0x11=2
+        let src = "if (1 > 2) { write!(0x10, 0x01); } else if (2 > 1) { write!(0x11, 0x02); } else { write!(0x12, 0x03); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x11 && d == &[0x02]));
+        assert!(!bus.writes.iter().any(|(a, _)| *a == 0x10 || *a == 0x12));
+    }
+
+    #[test]
+    fn test_if_nested_in_else() {
+        // 1>2 假 → else → 内层 if 3>2 真 → 写 0x11=2
+        let src = "if (1 > 2) { write!(0x10, 0x01); } else { if (3 > 2) { write!(0x11, 0x02); } }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert!(bus.writes.iter().any(|(a, d)| *a == 0x11 && d == &[0x02]));
+        assert!(!bus.writes.iter().any(|(a, _)| *a == 0x10));
+    }
+
+    #[test]
+    fn test_if_nested_in_repeat() {
+        // repeat!(3) { if (1 > 0) { write!(0x10, 0x01); } } → 3 次写
+        let src = "repeat!(3) { if (1 > 0) { write!(0x10, 0x01); } }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.writes.len(), 3);
+        assert!(bus.writes.iter().all(|(a, d)| *a == 0x10 && d == &[0x01]));
+    }
+
+    #[test]
+    fn test_decompile_if_else() {
+        let src = "if (3 > 5) { write!(0x10, 0x01); } else { write!(0x11, 0x02); }";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let decompiled = decompile(&bc).unwrap();
+        // 线性伪指令：条件跳转 + 无条件跳转 + 比较。
+        assert!(decompiled.contains("// if r"));
+        assert!(decompiled.contains("goto"));
+        assert!(decompiled.contains(">")); // CmpGt（3 > 5）
+        assert!(decompiled.contains("write!(0x10, 0x01);"));
+        assert!(decompiled.contains("write!(0x11, 0x02);"));
     }
 }

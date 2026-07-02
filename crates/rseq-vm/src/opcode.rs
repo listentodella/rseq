@@ -34,6 +34,11 @@ pub enum Opcode {
     /// `print!("fmt", v1, v2, ...)`：读 n_vars + 各寄存器索引 + fmt 字符串，
     /// 调 `Bus::log_vars`（默认实现就地格式化 `{}`/`{x}` 后委托 `log`）。
     LogVar = 0x28,
+    /// `wait!(pin)`：读 `pin:u8` + `timeout_ms:u32`，调 `Bus::wait_irq`。
+    /// MCU 侧阻塞至该中断引脚发生边沿（或超时返回 `BusError::Timeout`）；
+    /// 主机/模拟侧默认 no-op 放行，由内联派发序列（紧跟本指令之后的
+    /// `ReadVar` 快照 + 按掩码 `And`/`JumpIfZero` 分支）判多状态。
+    WaitIrq = 0x29,
     Read = 0x01,
     Write = 0x02,
     Update = 0x03,
@@ -74,6 +79,7 @@ impl Opcode {
             0x26 => Some(Self::Jump),
             0x27 => Some(Self::Log),
             0x28 => Some(Self::LogVar),
+            0x29 => Some(Self::WaitIrq),
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
             0x03 => Some(Self::Update),

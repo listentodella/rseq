@@ -113,8 +113,12 @@ mod serial {
             // delays (e.g. a 200 ms sensor-settling gap between Trace frames).
             match self.port.read(buf) {
                 Ok(n) => Ok(n),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    Ok(0)
+                }
                 Err(_) => Err(LinkError::Io),
             }
         }

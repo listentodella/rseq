@@ -14,9 +14,23 @@
 /// - `Delay` 的 `us` 为延时微秒数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusOp {
-    Read { addr: u32, data: Vec<u8> },
-    Write { addr: u32, data: Vec<u8> },
-    Delay { us: u32 },
+    Read {
+        addr: u32,
+        data: Vec<u8>,
+    },
+    Write {
+        addr: u32,
+        data: Vec<u8>,
+    },
+    Delay {
+        us: u32,
+    },
     /// `print!("msg")` 日志。
-    Log { msg: String },
+    Log {
+        msg: String,
+    },
+    /// `wait!(pin)` 命中：一次中断等待结束（边沿到达）。
+    Irq {
+        pin: u8,
+    },
 }

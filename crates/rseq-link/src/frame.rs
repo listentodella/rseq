@@ -180,7 +180,11 @@ impl<const N: usize> FrameDecoder<N> {
                             continue;
                         }
                         self.pos = 3;
-                        self.state = if self.len == 0 { State::Crc } else { State::Payload };
+                        self.state = if self.len == 0 {
+                            State::Crc
+                        } else {
+                            State::Payload
+                        };
                     }
                     i += 1;
                 }

@@ -27,8 +27,8 @@ pub use error::LinkError;
 pub use frame::{Frame, FrameDecoder, FrameType, HOST_FRAME_BUF, MAX_TRACE_FRAME};
 pub use tracing_bus::{LinkTx, TracingBus};
 pub use wire::{
-    ExecStatus, LoadSegs, TraceRef, LOAD_VERSION, SEG_KIND_IRQ_HANDLER, SEG_KIND_IRQ_TABLE,
-    SEG_KIND_MAIN, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE,
+    ExecStatus, LOAD_VERSION, LoadSegs, SEG_KIND_IRQ_HANDLER, SEG_KIND_IRQ_TABLE, SEG_KIND_MAIN,
+    TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE, TraceRef,
 };
 
 #[cfg(feature = "std")]

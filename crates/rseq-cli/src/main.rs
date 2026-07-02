@@ -127,7 +127,11 @@ fn main() {
                 base_dir: source.base_dir.as_deref(),
             })
             .collect::<Vec<_>>();
-        let CompiledProgram { main: bytecode, irqs } = match compile_program_units(&program_units) {
+        let CompiledProgram {
+            main: bytecode,
+            irqs,
+            irq_bytecodes,
+        } = match compile_program_units(&program_units) {
             Ok(compiled) => {
                 let b = &compiled.main;
                 println!("✓ Compiled successfully ({} bytes)", b.len());
@@ -159,28 +163,27 @@ fn main() {
         };
 
         if !irqs.is_empty() {
-            println!("\nInterrupt dispatch tables (scheme A — host reads status once, then dispatches):");
+            println!(
+                "\nInterrupt handlers (auto-response mode — MCU runs on every trigger):"
+            );
             for vector in &irqs {
                 println!(
                     "  irq!({}) — read {} byte(s) @ 0x{:08x}{}:",
                     vector.pin,
                     vector.snapshot_len,
                     vector.snapshot_addr,
-                    if vector.read_clear { " (read-clears)" } else { "" }
+                    if vector.read_clear {
+                        " (read-clears)"
+                    } else {
+                        ""
+                    }
                 );
                 for arm in &vector.arms {
-                    println!(
-                        "    on({}) when status & 0x{:x}:",
-                        arm.event, arm.mask
-                    );
-                    match decompile(&arm.handler) {
-                        Ok(text) => {
-                            for line in text.lines() {
-                                println!("        {line}");
-                            }
-                        }
-                        Err(e) => println!("        <decompile error: {e:?}>"),
-                    }
+                    println!("    on({}) when status & 0x{:x}:", arm.event, arm.mask);
+                    println!("        inline body: {} statement(s)", arm.body.len());
+                }
+                if let Some(bc) = irq_bytecodes.get(&vector.pin) {
+                    println!("    Segment bytecode: {} bytes", bc.len());
                 }
             }
         }
@@ -200,7 +203,10 @@ fn main() {
                     }
                     rseq::Stmt::Let { name, expr } => {
                         println!("    Action: Bind {} = {}", name, format_expr(expr));
-                        if let rseq::Expr::Read { delay_us: Some(d), .. } = expr {
+                        if let rseq::Expr::Read {
+                            delay_us: Some(d), ..
+                        } = expr
+                        {
                             println!("    Delay: {} μs after read", d);
                         }
                     }
@@ -266,13 +272,15 @@ fn main() {
                         }
                     }
                     rseq::Stmt::Irq { pin, arms } => {
-                        let events: Vec<&str> =
-                            arms.iter().map(|arm| arm.event.as_str()).collect();
+                        let events: Vec<&str> = arms.iter().map(|arm| arm.event.as_str()).collect();
                         println!(
                             "    Action: Interrupt handler on {pin} dispatching {} event(s): {}",
                             arms.len(),
                             events.join(", ")
                         );
+                    }
+                    rseq::Stmt::Wait { pin, timeout_ms } => {
+                        println!("    Action: Wait for interrupt on {pin} ({timeout_ms} ms)");
                     }
                     rseq::Stmt::Repeat { count, body } => {
                         println!(
@@ -282,7 +290,9 @@ fn main() {
                         );
                     }
                     rseq::Stmt::Read {
-                        addr, len, delay_us,
+                        addr,
+                        len,
+                        delay_us,
                     } => {
                         let addr_str = match addr {
                             rseq::Value::Number(n) => format!("0x{:x}", n),
@@ -298,12 +308,12 @@ fn main() {
                             println!("    Delay: {} μs after read", d);
                         }
                     }
-                    rseq::Stmt::If {
-                        cond,
-                        then,
-                        else_,
-                    } => {
-                        println!("    Action: If ({}) → {} stmt(s)", format_expr(cond), then.len());
+                    rseq::Stmt::If { cond, then, else_ } => {
+                        println!(
+                            "    Action: If ({}) → {} stmt(s)",
+                            format_expr(cond),
+                            then.len()
+                        );
                         if !else_.is_empty() {
                             println!("      Else: {} stmt(s)", else_.len());
                         }
@@ -322,6 +332,25 @@ fn main() {
         if cli.execute {
             println!("\nExecuting in MockBus...");
             let mut bus = MockBus::new();
+            if !cli.fire.is_empty() {
+                for spec in &cli.fire {
+                    let (pin, status) = parse_fire_spec(spec).unwrap_or_else(|err| {
+                        eprintln!("{err}");
+                        std::process::exit(1);
+                    });
+                    let vector = irqs.iter().find(|irq| irq.pin == pin).unwrap_or_else(|| {
+                        eprintln!("--fire references unknown irq pin '{pin}'");
+                        std::process::exit(1);
+                    });
+                    let len = vector.snapshot_len as usize;
+                    let bytes = status.to_le_bytes();
+                    bus.load(vector.snapshot_addr, &bytes[..len]);
+                    println!(
+                        "Injected irq!({}) snapshot 0x{status:08x} at 0x{:08x} ({} byte(s))",
+                        vector.pin, vector.snapshot_addr, vector.snapshot_len
+                    );
+                }
+            }
             let mut vm = Vm::new(&mut bus, &bytecode);
 
             match vm.run() {
@@ -341,7 +370,7 @@ fn main() {
 
         if let Some(path) = &cli.serial {
             #[cfg(feature = "serial")]
-            run_over_serial(path, cli.baud, &bytecode);
+            run_over_serial(path, cli.baud, &bytecode, &irq_bytecodes);
             #[cfg(not(feature = "serial"))]
             {
                 eprintln!(
@@ -356,8 +385,9 @@ fn main() {
 
 /// 经串口把字节码下发到真实 MCU,用 HostLink 收集回传的 Trace 并打印。
 #[cfg(feature = "serial")]
-fn run_over_serial(path: &str, baud: u32, bytecode: &[u8]) {
+fn run_over_serial(path: &str, baud: u32, bytecode: &[u8], irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>) {
     use rseq::link::HostLink;
+    use rseq_link::wire::{SEG_KIND_MAIN, SEG_KIND_IRQ_INT1};
 
     println!("\nDispatching to MCU over serial ({path} @ {baud} baud)...");
     let transport = match rseq_link::SerialTransport::open(path, baud) {
@@ -368,7 +398,16 @@ fn run_over_serial(path: &str, baud: u32, bytecode: &[u8]) {
         }
     };
     let mut host = HostLink::new(transport);
-    if let Err(e) = host.load(bytecode) {
+    host.set_exec_timeout(std::time::Duration::from_secs(30));
+
+    // 构造多段 LOAD
+    let mut segments: Vec<(u8, &[u8])> = vec![(SEG_KIND_MAIN, bytecode)];
+    if let Some(int1_bc) = irq_bytecodes.get("int1") {
+        segments.push((SEG_KIND_IRQ_INT1, int1_bc.as_slice()));
+        println!("  + INT1 interrupt handler ({} bytes)", int1_bc.len());
+    }
+
+    if let Err(e) = host.load_segments(&segments) {
         eprintln!("LOAD failed: {e}");
         std::process::exit(1);
     }
@@ -420,7 +459,34 @@ fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
             rseq::trace::BusOp::Log { msg } => {
                 println!("  Step {}: print {msg:?}", step + 1);
             }
+            rseq::trace::BusOp::Irq { pin } => {
+                println!("  Step {}: IRQ pin {pin} fired", step + 1);
+            }
         }
+    }
+}
+
+fn parse_fire_spec(spec: &str) -> Result<(String, u32), String> {
+    let (pin, status) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --fire '{spec}', expected <pin>=<status>"))?;
+    if pin.is_empty() {
+        return Err(format!("invalid --fire '{spec}', pin is empty"));
+    }
+    let status =
+        parse_u32_arg(status).map_err(|e| format!("invalid --fire status in '{spec}': {e}"))?;
+    Ok((pin.to_string(), status))
+}
+
+fn parse_u32_arg(text: &str) -> Result<u32, std::num::ParseIntError> {
+    let trimmed = text.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u32>()
     }
 }
 
@@ -621,7 +687,9 @@ mod tests {
             matches!(&ops[0], rseq::trace::BusOp::Write { addr: 0x40, data } if data == &[0x01, 0x02, 0x03])
         );
         assert!(matches!(&ops[1], rseq::trace::BusOp::Delay { us: 500 }));
-        assert!(matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x100, data } if data == &[0xaa]));
+        assert!(
+            matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x100, data } if data == &[0xaa])
+        );
     }
 
     #[test]
@@ -660,8 +728,13 @@ mod tests {
         // 0x2A | bit0 = 0x2B
         assert_eq!(*bus.memory().get(&0x0B).unwrap(), 0x2B);
         let ops = bus.ops();
-        assert!(matches!(&ops[1], rseq::trace::BusOp::Read { addr: 0x0B, .. }));
-        assert!(matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x0B, data } if data == &[0x2B]));
+        assert!(matches!(
+            &ops[1],
+            rseq::trace::BusOp::Read { addr: 0x0B, .. }
+        ));
+        assert!(
+            matches!(&ops[2], rseq::trace::BusOp::Write { addr: 0x0B, data } if data == &[0x2B])
+        );
     }
 
     #[test]

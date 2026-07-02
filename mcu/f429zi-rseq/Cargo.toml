@@ -1,0 +1,28 @@
+[package]
+# Must be "rustapp" for Zephyr's rust_cargo_application().
+name = "rustapp"
+version = "0.1.0"
+edition = "2021"
+description = "rseq MCU firmware: rseq-link protocol over USB CDC, real IMU SPI bus"
+license = "Apache-2.0 or MIT"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+zephyr = "0.1.0"
+log = "0.4.22"
+rseq-vm = { path = "/Volumes/tp7100s/work/rseq/crates/rseq-vm", default-features = false }
+rseq-link = { path = "/Volumes/tp7100s/work/rseq/crates/rseq-link" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = true
+
+# This app lives under the rseq repo tree but is a standalone Zephyr/Rust app
+# (built via rust_cargo_application). The empty [workspace] keeps cargo from
+# absorbing it into the parent rseq workspace; the rseq-vm/rseq-link path deps
+# still resolve through their own workspace.
+[workspace]

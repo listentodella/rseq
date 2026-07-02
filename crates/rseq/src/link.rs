@@ -11,8 +11,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use rseq_link::frame::{encode_into, FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD};
-use rseq_link::wire::{decode_trace, encode_load_main_into, ExecStatus, TraceRef};
+use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
+use rseq_link::wire::{ExecStatus, TraceRef, decode_trace, encode_load_main_into, encode_load_segments_into};
 use rseq_link::{LinkError, Transport};
 
 use crate::trace::BusOp;
@@ -30,12 +30,19 @@ pub struct ExecResult {
 impl From<TraceRef<'_>> for BusOp {
     fn from(r: TraceRef<'_>) -> Self {
         match r {
-            TraceRef::Read { addr, data } => BusOp::Read { addr, data: data.to_vec() },
-            TraceRef::Write { addr, data } => BusOp::Write { addr, data: data.to_vec() },
+            TraceRef::Read { addr, data } => BusOp::Read {
+                addr,
+                data: data.to_vec(),
+            },
+            TraceRef::Write { addr, data } => BusOp::Write {
+                addr,
+                data: data.to_vec(),
+            },
             TraceRef::Delay { us } => BusOp::Delay { us },
             TraceRef::Log { msg } => BusOp::Log {
                 msg: String::from_utf8_lossy(msg).into_owned(),
             },
+            TraceRef::Irq { pin } => BusOp::Irq { pin },
         }
     }
 }
@@ -52,6 +59,9 @@ pub struct HostLink<T> {
     dec: FrameDecoder<HOST_FRAME_BUF>,
     /// 已解码但尚未消费的帧(owned 载荷),按到达顺序排队。
     inbox: VecDeque<(FrameType, Vec<u8>)>,
+    /// EXEC 期间等待 Trace/Result 流的超时上限。中断脚本（含 `wait!`）
+    /// 需要更长的等待，故暴露 [`HostLink::set_exec_timeout`] 供 CLI 调整。
+    exec_timeout: Duration,
 }
 
 impl<T: Transport> HostLink<T> {
@@ -60,12 +70,18 @@ impl<T: Transport> HostLink<T> {
             transport,
             dec: FrameDecoder::<HOST_FRAME_BUF>::new(),
             inbox: VecDeque::new(),
+            exec_timeout: DEFAULT_TIMEOUT,
         }
     }
 
     /// 取得内部传输的可变引用(高级用法,如调整串口参数)。
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// 设置 EXEC 期间等待 Trace/Result 流的超时上限。中断脚本需比默认 5s 更长。
+    pub fn set_exec_timeout(&mut self, timeout: Duration) {
+        self.exec_timeout = timeout;
     }
 
     // ── 帧收发原语 ──────────────────────────────────────────
@@ -139,16 +155,27 @@ impl<T: Transport> HostLink<T> {
         Ok(())
     }
 
+    /// 下发多段字节码（main + irq 段）;MCU 收到后回 ACK。
+    pub fn load_segments(&mut self, segments: &[(u8, &[u8])]) -> Result<(), LinkError> {
+        let mut total_len = 2; // version + seg_count
+        for (_, bytes) in segments {
+            total_len += 3 + bytes.len(); // kind + len(u16) + bytecode
+        }
+        let mut payload = vec![0u8; total_len];
+        let n = encode_load_segments_into(&mut payload, segments);
+        self.send_frame(FrameType::Load, &payload[..n])?;
+        let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
+        Ok(())
+    }
+
     /// 触发执行;返回执行状态与期间回传的总线轨迹。
     pub fn exec(&mut self) -> Result<ExecResult, LinkError> {
         self.send_frame(FrameType::Exec, &[])?;
         let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
-        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let deadline = Instant::now() + self.exec_timeout;
         let mut traces: Vec<BusOp> = Vec::new();
         loop {
-            let (ty, p) = self
-                .next_frame(deadline)?
-                .ok_or(LinkError::Timeout)?;
+            let (ty, p) = self.next_frame(deadline)?.ok_or(LinkError::Timeout)?;
             match ty {
                 FrameType::Trace => {
                     if let Some(r) = decode_trace(&p) {
@@ -184,7 +211,9 @@ impl<T: Transport> HostLink<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rseq_link::wire::{encode_trace_delay, encode_trace_log, encode_trace_rw, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE};
+    use rseq_link::wire::{
+        TRACE_OP_READ, TRACE_OP_WRITE, encode_trace_delay, encode_trace_log, encode_trace_rw,
+    };
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
     /// 用于确定性地测试 HostLink 的帧解析与状态机,无需真实 MCU。
@@ -236,14 +265,24 @@ mod tests {
         rx.extend(&d[..n]);
         rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
 
-        let mut link = HostLink::new(ScriptTransport { rx, pos: 0, writes: Vec::new() });
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
         let res = link.exec().unwrap();
         assert_eq!(res.status, ExecStatus::Ok);
         assert_eq!(
             res.traces,
             vec![
-                BusOp::Read { addr: 0x10, data: vec![0x01, 0x02] },
-                BusOp::Write { addr: 0x20, data: vec![0xaa] },
+                BusOp::Read {
+                    addr: 0x10,
+                    data: vec![0x01, 0x02]
+                },
+                BusOp::Write {
+                    addr: 0x20,
+                    data: vec![0xaa]
+                },
                 BusOp::Delay { us: 500 },
             ]
         );
@@ -252,7 +291,11 @@ mod tests {
     #[test]
     fn load_writes_load_frame_and_consumes_ack() {
         let rx = frame(FrameType::Ack, &[]);
-        let mut link = HostLink::new(ScriptTransport { rx, pos: 0, writes: Vec::new() });
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
         link.load(&[0x01, 0x02, 0x03]).unwrap();
         // 写出的首帧应是 LOAD:sync0 sync1 type=Load ...
         let w = &link.transport_mut().writes;
@@ -262,7 +305,11 @@ mod tests {
     #[test]
     fn ping_expects_pong() {
         let rx = frame(FrameType::Pong, &[]);
-        let mut link = HostLink::new(ScriptTransport { rx, pos: 0, writes: Vec::new() });
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
         link.ping().unwrap();
         let w = &link.transport_mut().writes;
         assert_eq!(w[2], FrameType::Ping as u8);
@@ -271,8 +318,18 @@ mod tests {
     #[test]
     fn trace_ref_to_busop_round_trip() {
         let data = [0x11, 0x22];
-        let b: BusOp = TraceRef::Write { addr: 0x1234, data: &data }.into();
-        assert_eq!(b, BusOp::Write { addr: 0x1234, data: vec![0x11, 0x22] });
+        let b: BusOp = TraceRef::Write {
+            addr: 0x1234,
+            data: &data,
+        }
+        .into();
+        assert_eq!(
+            b,
+            BusOp::Write {
+                addr: 0x1234,
+                data: vec![0x11, 0x22]
+            }
+        );
     }
 
     #[test]
@@ -285,9 +342,39 @@ mod tests {
         rx.extend(&lb[..ln]);
         rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
 
-        let mut link = HostLink::new(ScriptTransport { rx, pos: 0, writes: Vec::new() });
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
         let res = link.exec().unwrap();
         assert_eq!(res.status, ExecStatus::Ok);
-        assert_eq!(res.traces, vec![BusOp::Log { msg: "hello".to_string() }]);
+        assert_eq!(
+            res.traces,
+            vec![BusOp::Log {
+                msg: "hello".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn exec_collects_irq_trace() {
+        // MCU 响应流：ACK(Exec) + Irq trace(pin=0) + Result(Ok)
+        use rseq_link::wire::encode_trace_irq;
+        let mut rx = Vec::new();
+        rx.extend(frame(FrameType::Ack, &[]));
+        let mut ib = vec![0u8; 32];
+        let n = encode_trace_irq(&mut ib, 0);
+        rx.extend(&ib[..n]);
+        rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let res = link.exec().unwrap();
+        assert_eq!(res.status, ExecStatus::Ok);
+        assert_eq!(res.traces, vec![BusOp::Irq { pin: 0 }]);
     }
 }

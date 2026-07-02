@@ -14,6 +14,8 @@ pub const TRACE_OP_WRITE: u8 = 0x02;
 pub const TRACE_OP_DELAY: u8 = 0x03;
 /// Trace op:日志（`print!`）。
 pub const TRACE_OP_LOG: u8 = 0x04;
+/// Trace op:中断等待命中（`wait!`）。
+pub const TRACE_OP_IRQ: u8 = 0x05;
 
 /// Trace 载荷最大长度(op+addr+dlen+data≤4096)。
 pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 2 + 4096;
@@ -21,11 +23,25 @@ pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 2 + 4096;
 /// 解码后的 Trace 记录,载荷切片借用自帧缓冲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceRef<'a> {
-    Read { addr: u32, data: &'a [u8] },
-    Write { addr: u32, data: &'a [u8] },
-    Delay { us: u32 },
+    Read {
+        addr: u32,
+        data: &'a [u8],
+    },
+    Write {
+        addr: u32,
+        data: &'a [u8],
+    },
+    Delay {
+        us: u32,
+    },
     /// `print!` 日志，载荷为 utf8 字节（解码端按 lossy 转 String）。
-    Log { msg: &'a [u8] },
+    Log {
+        msg: &'a [u8],
+    },
+    /// `wait!(pin)` 命中：一次中断等待结束（边沿到达），载荷携带 pin 编号。
+    Irq {
+        pin: u8,
+    },
 }
 
 /// 在 `out` 中构造一条完整的 Read/Write Trace 帧(含帧头与 CRC),返回总字节数。
@@ -100,6 +116,24 @@ pub fn encode_trace_log(out: &mut [u8], msg: &str) -> usize {
     total
 }
 
+/// 在 `out` 中构造一条 Irq Trace 帧（`wait!` 命中），返回总字节数。
+/// 载荷 = `op + pin`。`out` 需 ≥ `OVERHEAD + 2`。
+pub fn encode_trace_irq(out: &mut [u8], pin: u8) -> usize {
+    const PAYLOAD_LEN: usize = 1 + 1;
+    let total = OVERHEAD + PAYLOAD_LEN;
+    assert!(out.len() >= total, "trace irq buffer too small");
+    out[0] = 0x55;
+    out[1] = 0xAA;
+    out[2] = FrameType::Trace as u8;
+    out[3] = (PAYLOAD_LEN & 0xFF) as u8;
+    out[4] = (PAYLOAD_LEN >> 8) as u8;
+    out[5] = TRACE_OP_IRQ;
+    out[6] = pin;
+    let crc = crate::crc32::crc32(&out[2..5 + PAYLOAD_LEN]);
+    out[5 + PAYLOAD_LEN..5 + PAYLOAD_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+    total
+}
+
 /// 从 Trace 载荷解码为 [`TraceRef`]。布局不合法返回 `None`。
 pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
     if payload.is_empty() {
@@ -140,6 +174,12 @@ pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
             }
             let msg = &payload[1 + 2..1 + 2 + mlen];
             Some(TraceRef::Log { msg })
+        }
+        TRACE_OP_IRQ => {
+            if payload.len() < 1 + 1 {
+                return None;
+            }
+            Some(TraceRef::Irq { pin: payload[1] })
         }
         _ => None,
     }
@@ -193,6 +233,10 @@ pub const SEG_KIND_MAIN: u8 = 0x00;
 pub const SEG_KIND_IRQ_TABLE: u8 = 0x01;
 /// 段种类:中断处理段(预留)。
 pub const SEG_KIND_IRQ_HANDLER: u8 = 0x02;
+/// 段种类:INT1 中断处理器字节码(自动响应模式)。
+pub const SEG_KIND_IRQ_INT1: u8 = 0x10;
+/// 段种类:INT2 中断处理器字节码(自动响应模式)。
+pub const SEG_KIND_IRQ_INT2: u8 = 0x11;
 
 /// 把一段 main 字节码打包成 LOAD 载荷,写入 `out`,返回字节数。
 ///
@@ -211,6 +255,39 @@ pub fn encode_load_main_into(out: &mut [u8], bytecode: &[u8]) -> usize {
     out[3] = (len & 0xFF) as u8;
     out[4] = (len >> 8) as u8;
     out[5..5 + bytecode.len()].copy_from_slice(bytecode);
+    need
+}
+
+/// 把多段字节码打包成 LOAD 载荷,写入 `out`,返回字节数。
+///
+/// 布局:`[version=1][seg_count u8][kind u8 | seg_len u16 LE | bytecode]*`。
+pub fn encode_load_segments_into(out: &mut [u8], segments: &[(u8, &[u8])]) -> usize {
+    let mut need = 2; // version + seg_count
+    for (_, bytes) in segments {
+        need += 3 + bytes.len(); // kind + len(u16) + bytecode
+    }
+    assert!(
+        out.len() >= need,
+        "load payload buffer too small: need {need}, have {}",
+        out.len()
+    );
+    assert!(
+        segments.len() <= 255,
+        "segment count exceeds u8 limit: {}",
+        segments.len()
+    );
+
+    out[0] = LOAD_VERSION;
+    out[1] = segments.len() as u8;
+    let mut pos = 2;
+    for (kind, bytes) in segments {
+        out[pos] = *kind;
+        let len = bytes.len() as u16;
+        out[pos + 1] = (len & 0xFF) as u8;
+        out[pos + 2] = (len >> 8) as u8;
+        out[pos + 3..pos + 3 + bytes.len()].copy_from_slice(bytes);
+        pos += 3 + bytes.len();
+    }
     need
 }
 
@@ -249,14 +326,19 @@ pub fn load_segments(payload: &[u8]) -> Option<(u8, LoadSegs<'_>)> {
     }
     let version = payload[0];
     let count = payload[1] as usize;
-    Some((version, LoadSegs { rest: &payload[2..], remaining: count }))
+    Some((
+        version,
+        LoadSegs {
+            rest: &payload[2..],
+            remaining: count,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::prelude::v1::*;
-
 
     #[test]
     fn trace_rw_round_trip() {
@@ -272,7 +354,13 @@ mod tests {
         let (ty, p) = payload.expect("frame decoded");
         assert_eq!(ty, FrameType::Trace);
         let rec = decode_trace(&p).expect("trace decoded");
-        assert_eq!(rec, TraceRef::Write { addr: 0x1234, data: &data });
+        assert_eq!(
+            rec,
+            TraceRef::Write {
+                addr: 0x1234,
+                data: &data
+            }
+        );
     }
 
     #[test]
@@ -299,7 +387,26 @@ mod tests {
         });
         let (ty, p) = payload.expect("frame decoded");
         assert_eq!(ty, FrameType::Trace);
-        assert_eq!(decode_trace(&p), Some(TraceRef::Log { msg: &b"hi log"[..] }));
+        assert_eq!(
+            decode_trace(&p),
+            Some(TraceRef::Log {
+                msg: &b"hi log"[..]
+            })
+        );
+    }
+
+    #[test]
+    fn trace_irq_round_trip() {
+        let mut buf = vec![0u8; 32];
+        let n = encode_trace_irq(&mut buf, 2);
+        let mut dec = crate::frame::FrameDecoder::<{ crate::frame::HOST_FRAME_BUF }>::new();
+        let mut payload = None;
+        dec.feed(&buf[..n], |ty, p| {
+            payload = Some((ty, p.to_vec()));
+        });
+        let (ty, p) = payload.expect("frame decoded");
+        assert_eq!(ty, FrameType::Trace);
+        assert_eq!(decode_trace(&p), Some(TraceRef::Irq { pin: 2 }));
     }
 
     #[test]

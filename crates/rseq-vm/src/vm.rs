@@ -85,195 +85,183 @@ impl<'a, B: Bus> Vm<'a, B> {
         self.pc += 1;
 
         match Opcode::from_u8(opcode_byte) {
-                Some(Opcode::Read) => {
-                    let addr = self.read_u32()?;
-                    let len = self.read_len()?;
-                    let delay = self.read_u32()?;
+            Some(Opcode::Read) => {
+                let addr = self.read_u32()?;
+                let len = self.read_len()?;
+                let delay = self.read_u32()?;
 
-                    let mut buffer = [0u8; 4096];
-                    let data = &mut buffer[..len];
-                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+                let mut buffer = [0u8; 4096];
+                let data = &mut buffer[..len];
+                self.bus.read(addr, data).map_err(VmError::BusError)?;
 
-                    if delay > 0 {
-                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
-                    }
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
                 }
-                Some(Opcode::Write) => {
-                    let addr = self.read_u32()?;
-                    let len = self.read_len()?;
-                    let delay = self.read_u32()?;
+            }
+            Some(Opcode::Write) => {
+                let addr = self.read_u32()?;
+                let len = self.read_len()?;
+                let delay = self.read_u32()?;
 
-                    if self.pc + len > self.program.len() {
-                        return Err(VmError::ProgramTooShort);
-                    }
-                    let data = &self.program[self.pc..self.pc + len];
-                    self.pc += len;
-
-                    self.bus.write(addr, data).map_err(VmError::BusError)?;
-
-                    if delay > 0 {
-                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
-                    }
+                if self.pc + len > self.program.len() {
+                    return Err(VmError::ProgramTooShort);
                 }
-                Some(Opcode::Update) => {
-                    let addr = self.read_u32()?;
-                    let width = self.read_len()?;
-                    let delay = self.read_u32()?;
-                    let field_count = self.read_u32()? as usize;
+                let data = &self.program[self.pc..self.pc + len];
+                self.pc += len;
 
-                    let mut buffer = [0u8; 4096];
-                    let data = &mut buffer[..width];
-                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+                self.bus.write(addr, data).map_err(VmError::BusError)?;
 
-                    let mut reg_val = bytes_to_u64_le(data);
-                    for _ in 0..field_count {
-                        let bit_lo = self.read_u8()?;
-                        let bit_hi = self.read_u8()?;
-                        let value = self.read_u32()?;
-                        reg_val = merge_field(reg_val, bit_lo, bit_hi, value);
-                    }
-                    u64_to_bytes_le(reg_val, data);
-
-                    self.bus.write(addr, data).map_err(VmError::BusError)?;
-
-                    if delay > 0 {
-                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
-                    }
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
                 }
-                Some(Opcode::ReadVar) => {
-                    let addr = self.read_u32()?;
-                    let len = self.read_u32()?;
-                    let delay = self.read_u32()?;
-                    let dst = self.read_u8()? as usize;
+            }
+            Some(Opcode::Update) => {
+                let addr = self.read_u32()?;
+                let width = self.read_len()?;
+                let delay = self.read_u32()?;
+                let field_count = self.read_u32()? as usize;
 
-                    if len == 0 || len > 4 {
-                        return Err(VmError::InvalidLength);
-                    }
-                    let mut buffer = [0u8; 4];
-                    let data = &mut buffer[..len as usize];
-                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+                let mut buffer = [0u8; 4096];
+                let data = &mut buffer[..width];
+                self.bus.read(addr, data).map_err(VmError::BusError)?;
 
-                    let mut val = 0u32;
-                    for (i, &b) in data.iter().enumerate() {
-                        val |= (b as u32) << (8 * i);
-                    }
-                    self.regs[dst] = val;
+                let mut reg_val = bytes_to_u64_le(data);
+                for _ in 0..field_count {
+                    let bit_lo = self.read_u8()?;
+                    let bit_hi = self.read_u8()?;
+                    let value = self.read_u32()?;
+                    reg_val = merge_field(reg_val, bit_lo, bit_hi, value);
+                }
+                u64_to_bytes_le(reg_val, data);
 
-                    if delay > 0 {
-                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
-                    }
+                self.bus.write(addr, data).map_err(VmError::BusError)?;
+
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
                 }
-                Some(Opcode::LoadConst) => {
-                    let dst = self.read_u8()? as usize;
-                    let imm = self.read_u32()?;
-                    self.regs[dst] = imm;
+            }
+            Some(Opcode::ReadVar) => {
+                let addr = self.read_u32()?;
+                let len = self.read_u32()?;
+                let delay = self.read_u32()?;
+                let dst = self.read_u8()? as usize;
+
+                if len == 0 || len > 4 {
+                    return Err(VmError::InvalidLength);
                 }
-                Some(Opcode::Move) => {
-                    let dst = self.read_u8()? as usize;
-                    let src = self.read_u8()? as usize;
-                    self.regs[dst] = self.regs[src];
+                let mut buffer = [0u8; 4];
+                let data = &mut buffer[..len as usize];
+                self.bus.read(addr, data).map_err(VmError::BusError)?;
+
+                let mut val = 0u32;
+                for (i, &b) in data.iter().enumerate() {
+                    val |= (b as u32) << (8 * i);
                 }
-                Some(
-                    op @ (Opcode::Add
-                    | Opcode::Sub
-                    | Opcode::Mul
-                    | Opcode::Div
-                    | Opcode::Mod
-                    | Opcode::Shl
-                    | Opcode::Shr
-                    | Opcode::And
-                    | Opcode::Or
-                    | Opcode::Xor),
-                ) => {
-                    let dst = self.read_u8()? as usize;
-                    let lhs = self.regs[self.read_u8()? as usize];
-                    let rhs = self.regs[self.read_u8()? as usize];
-                    let result = match op {
-                        Opcode::Add => lhs.wrapping_add(rhs),
-                        Opcode::Sub => lhs.wrapping_sub(rhs),
-                        Opcode::Mul => lhs.wrapping_mul(rhs),
-                        Opcode::Div => {
-                            if rhs == 0 {
-                                return Err(VmError::DivideByZero);
-                            }
-                            lhs / rhs
+                self.regs[dst] = val;
+
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                }
+            }
+            Some(Opcode::LoadConst) => {
+                let dst = self.read_u8()? as usize;
+                let imm = self.read_u32()?;
+                self.regs[dst] = imm;
+            }
+            Some(Opcode::Move) => {
+                let dst = self.read_u8()? as usize;
+                let src = self.read_u8()? as usize;
+                self.regs[dst] = self.regs[src];
+            }
+            Some(
+                op @ (Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Mod
+                | Opcode::Shl
+                | Opcode::Shr
+                | Opcode::And
+                | Opcode::Or
+                | Opcode::Xor),
+            ) => {
+                let dst = self.read_u8()? as usize;
+                let lhs = self.regs[self.read_u8()? as usize];
+                let rhs = self.regs[self.read_u8()? as usize];
+                let result = match op {
+                    Opcode::Add => lhs.wrapping_add(rhs),
+                    Opcode::Sub => lhs.wrapping_sub(rhs),
+                    Opcode::Mul => lhs.wrapping_mul(rhs),
+                    Opcode::Div => {
+                        if rhs == 0 {
+                            return Err(VmError::DivideByZero);
                         }
-                        Opcode::Mod => {
-                            if rhs == 0 {
-                                return Err(VmError::DivideByZero);
-                            }
-                            lhs % rhs
-                        }
-                        // 移位量取 rhs 低位，避免 >= 32 时 panic。
-                        Opcode::Shl => lhs.wrapping_shl(rhs),
-                        Opcode::Shr => lhs.wrapping_shr(rhs),
-                        Opcode::And => lhs & rhs,
-                        Opcode::Or => lhs | rhs,
-                        Opcode::Xor => lhs ^ rhs,
-                        // 上面的 match 已覆盖全部进入此分支的 opcode。
-                        _ => unreachable!(),
-                    };
-                    self.regs[dst] = result;
-                }
-                // 比较：dst = lhs OP rhs ? 1 : 0。Lt/Le/Gt/Ge 按有符号 i32。
-                Some(
-                    op @ (Opcode::CmpEq
-                    | Opcode::CmpNe
-                    | Opcode::CmpLt
-                    | Opcode::CmpLe
-                    | Opcode::CmpGt
-                    | Opcode::CmpGe),
-                ) => {
-                    let dst = self.read_u8()? as usize;
-                    let lhs = self.regs[self.read_u8()? as usize];
-                    let rhs = self.regs[self.read_u8()? as usize];
-                    let (li, ri) = (lhs as i32, rhs as i32);
-                    let result: u32 = match op {
-                        Opcode::CmpEq => (lhs == rhs) as u32,
-                        Opcode::CmpNe => (lhs != rhs) as u32,
-                        Opcode::CmpLt => (li < ri) as u32,
-                        Opcode::CmpLe => (li <= ri) as u32,
-                        Opcode::CmpGt => (li > ri) as u32,
-                        Opcode::CmpGe => (li >= ri) as u32,
-                        _ => unreachable!(),
-                    };
-                    self.regs[dst] = result;
-                }
-                // 逻辑与/或（急求值非短路）：dst = (lhs!=0) OP (rhs!=0) ? 1 : 0。
-                Some(op @ (Opcode::LogAnd | Opcode::LogOr)) => {
-                    let dst = self.read_u8()? as usize;
-                    let lhs = self.regs[self.read_u8()? as usize];
-                    let rhs = self.regs[self.read_u8()? as usize];
-                    let result = match op {
-                        Opcode::LogAnd => ((lhs != 0) && (rhs != 0)) as u32,
-                        Opcode::LogOr => ((lhs != 0) || (rhs != 0)) as u32,
-                        _ => unreachable!(),
-                    };
-                    self.regs[dst] = result;
-                }
-                // 逻辑非：dst = (src==0) ? 1 : 0。
-                Some(Opcode::LogNot) => {
-                    let dst = self.read_u8()? as usize;
-                    let src = self.regs[self.read_u8()? as usize];
-                    self.regs[dst] = (src == 0) as u32;
-                }
-                // 条件跳转：cond==0 则 pc += off（off 相对读完 off 后的 pc）。
-                Some(Opcode::JumpIfZero) => {
-                    let cond = self.regs[self.read_u8()? as usize];
-                    let off = self.read_i32()?;
-                    if cond == 0 {
-                        self.pc = self
-                            .pc
-                            .checked_add_signed(off as isize)
-                            .ok_or(VmError::InvalidLength)?;
-                        if self.pc > self.program.len() {
-                            return Err(VmError::InvalidLength);
-                        }
+                        lhs / rhs
                     }
-                }
-                // 无条件跳转：pc += off。
-                Some(Opcode::Jump) => {
-                    let off = self.read_i32()?;
+                    Opcode::Mod => {
+                        if rhs == 0 {
+                            return Err(VmError::DivideByZero);
+                        }
+                        lhs % rhs
+                    }
+                    // 移位量取 rhs 低位，避免 >= 32 时 panic。
+                    Opcode::Shl => lhs.wrapping_shl(rhs),
+                    Opcode::Shr => lhs.wrapping_shr(rhs),
+                    Opcode::And => lhs & rhs,
+                    Opcode::Or => lhs | rhs,
+                    Opcode::Xor => lhs ^ rhs,
+                    // 上面的 match 已覆盖全部进入此分支的 opcode。
+                    _ => unreachable!(),
+                };
+                self.regs[dst] = result;
+            }
+            // 比较：dst = lhs OP rhs ? 1 : 0。Lt/Le/Gt/Ge 按有符号 i32。
+            Some(
+                op @ (Opcode::CmpEq
+                | Opcode::CmpNe
+                | Opcode::CmpLt
+                | Opcode::CmpLe
+                | Opcode::CmpGt
+                | Opcode::CmpGe),
+            ) => {
+                let dst = self.read_u8()? as usize;
+                let lhs = self.regs[self.read_u8()? as usize];
+                let rhs = self.regs[self.read_u8()? as usize];
+                let (li, ri) = (lhs as i32, rhs as i32);
+                let result: u32 = match op {
+                    Opcode::CmpEq => (lhs == rhs) as u32,
+                    Opcode::CmpNe => (lhs != rhs) as u32,
+                    Opcode::CmpLt => (li < ri) as u32,
+                    Opcode::CmpLe => (li <= ri) as u32,
+                    Opcode::CmpGt => (li > ri) as u32,
+                    Opcode::CmpGe => (li >= ri) as u32,
+                    _ => unreachable!(),
+                };
+                self.regs[dst] = result;
+            }
+            // 逻辑与/或（急求值非短路）：dst = (lhs!=0) OP (rhs!=0) ? 1 : 0。
+            Some(op @ (Opcode::LogAnd | Opcode::LogOr)) => {
+                let dst = self.read_u8()? as usize;
+                let lhs = self.regs[self.read_u8()? as usize];
+                let rhs = self.regs[self.read_u8()? as usize];
+                let result = match op {
+                    Opcode::LogAnd => ((lhs != 0) && (rhs != 0)) as u32,
+                    Opcode::LogOr => ((lhs != 0) || (rhs != 0)) as u32,
+                    _ => unreachable!(),
+                };
+                self.regs[dst] = result;
+            }
+            // 逻辑非：dst = (src==0) ? 1 : 0。
+            Some(Opcode::LogNot) => {
+                let dst = self.read_u8()? as usize;
+                let src = self.regs[self.read_u8()? as usize];
+                self.regs[dst] = (src == 0) as u32;
+            }
+            // 条件跳转：cond==0 则 pc += off（off 相对读完 off 后的 pc）。
+            Some(Opcode::JumpIfZero) => {
+                let cond = self.regs[self.read_u8()? as usize];
+                let off = self.read_i32()?;
+                if cond == 0 {
                     self.pc = self
                         .pc
                         .checked_add_signed(off as isize)
@@ -282,109 +270,124 @@ impl<'a, B: Bus> Vm<'a, B> {
                         return Err(VmError::InvalidLength);
                     }
                 }
-                // print!("msg")：读 len(u32) + utf8 字节，调 bus.log。不涉总线时序。
-                Some(Opcode::Log) => {
-                    let len = self.read_u32()? as usize;
-                    let end = self
-                        .pc
-                        .checked_add(len)
-                        .ok_or(VmError::InvalidLength)?;
-                    if end > self.program.len() {
-                        return Err(VmError::ProgramTooShort);
-                    }
-                    let bytes = &self.program[self.pc..end];
-                    self.pc = end;
-                    let msg = core::str::from_utf8(bytes)
-                        .map_err(|_| VmError::InvalidOpcode)?;
-                    self.bus.log(msg).map_err(VmError::BusError)?;
-                }
-                // print!("fmt", v1, ...)：读 n_vars + 寄存器索引 + fmt，调 bus.log_vars。
-                // n_vars 上限 8（栈数组），编译器强制。
-                Some(Opcode::LogVar) => {
-                    let n = self.read_u8()? as usize;
-                    if n > 8 {
-                        return Err(VmError::InvalidLength);
-                    }
-                    let mut reg_idx = [0u8; 8];
-                    for slot in reg_idx.iter_mut().take(n) {
-                        *slot = self.read_u8()?;
-                    }
-                    let fmt_len = self.read_u32()? as usize;
-                    let end = self
-                        .pc
-                        .checked_add(fmt_len)
-                        .ok_or(VmError::InvalidLength)?;
-                    if end > self.program.len() {
-                        return Err(VmError::ProgramTooShort);
-                    }
-                    let fmt_bytes = &self.program[self.pc..end];
-                    self.pc = end;
-                    let fmt = core::str::from_utf8(fmt_bytes)
-                        .map_err(|_| VmError::InvalidOpcode)?;
-                    let mut vals = [0u32; 8];
-                    for (i, slot) in reg_idx.iter().enumerate().take(n) {
-                        vals[i] = self.regs[*slot as usize];
-                    }
-                    self.bus.log_vars(fmt, &vals[..n]).map_err(VmError::BusError)?;
-                }
-                Some(Opcode::WriteVar) => {
-                    let addr = self.read_u32()?;
-                    let len = self.read_u32()?;
-                    let delay = self.read_u32()?;
-                    let src = self.read_u8()? as usize;
-
-                    if len == 0 || len > 4 {
-                        return Err(VmError::InvalidLength);
-                    }
-                    let val = self.regs[src];
-                    let mut buffer = [0u8; 4];
-                    let data = &mut buffer[..len as usize];
-                    for (i, b) in data.iter_mut().enumerate() {
-                        *b = (val >> (8 * i)) as u8;
-                    }
-
-                    self.bus.write(addr, data).map_err(VmError::BusError)?;
-
-                    if delay > 0 {
-                        self.bus.delay_us(delay).map_err(VmError::BusError)?;
-                    }
-                }
-                // `repeat!(N) { ... }`：读 count 与 body_len，把 body 重复执行 count 次。
-                // body 只编译一次（在 Loop 帧内），靠计数回跳复用，字节码不随 N 膨胀。
-                // 嵌套 repeat! 经递归 step() 自然处理——递归深度等于嵌套层数（非迭代数）。
-                Some(Opcode::Loop) => {
-                    let count = self.read_u32()?;
-                    let body_len = self.read_u32()? as usize;
-                    // body_len 必须落在程序范围内，防止 body_end 越界/回绕。
-                    let body_end = match self.pc.checked_add(body_len) {
-                        Some(end) if end <= self.program.len() => end,
-                        _ => return Err(VmError::InvalidLength),
-                    };
-                    let loop_start = self.pc;
-                    for _ in 0..count {
-                        self.pc = loop_start;
-                        while self.pc < body_end {
-                            match self.step()? {
-                                Step::Continue => {}
-                                // body 内出现 Return（DSL 不会产生，防御性）：向上传播终止。
-                                Step::Returned => return Ok(Step::Returned),
-                            }
-                        }
-                    }
-                    // 跳过 body（count==0 时也直接落到 body_end，相当于 no-op）。
-                    self.pc = body_end;
-                }
-                Some(Opcode::Return) => {
-                    return Ok(Step::Returned);
-                }
-                // UpdateVar 尚未在 VM 中实现。
-                Some(Opcode::UpdateVar) => {
-                    return Err(VmError::InvalidOpcode);
-                }
-                None => {
-                    return Err(VmError::InvalidOpcode);
+            }
+            // 无条件跳转：pc += off。
+            Some(Opcode::Jump) => {
+                let off = self.read_i32()?;
+                self.pc = self
+                    .pc
+                    .checked_add_signed(off as isize)
+                    .ok_or(VmError::InvalidLength)?;
+                if self.pc > self.program.len() {
+                    return Err(VmError::InvalidLength);
                 }
             }
+            // print!("msg")：读 len(u32) + utf8 字节，调 bus.log。不涉总线时序。
+            Some(Opcode::Log) => {
+                let len = self.read_u32()? as usize;
+                let end = self.pc.checked_add(len).ok_or(VmError::InvalidLength)?;
+                if end > self.program.len() {
+                    return Err(VmError::ProgramTooShort);
+                }
+                let bytes = &self.program[self.pc..end];
+                self.pc = end;
+                let msg = core::str::from_utf8(bytes).map_err(|_| VmError::InvalidOpcode)?;
+                self.bus.log(msg).map_err(VmError::BusError)?;
+            }
+            // print!("fmt", v1, ...)：读 n_vars + 寄存器索引 + fmt，调 bus.log_vars。
+            // n_vars 上限 8（栈数组），编译器强制。
+            Some(Opcode::LogVar) => {
+                let n = self.read_u8()? as usize;
+                if n > 8 {
+                    return Err(VmError::InvalidLength);
+                }
+                let mut reg_idx = [0u8; 8];
+                for slot in reg_idx.iter_mut().take(n) {
+                    *slot = self.read_u8()?;
+                }
+                let fmt_len = self.read_u32()? as usize;
+                let end = self.pc.checked_add(fmt_len).ok_or(VmError::InvalidLength)?;
+                if end > self.program.len() {
+                    return Err(VmError::ProgramTooShort);
+                }
+                let fmt_bytes = &self.program[self.pc..end];
+                self.pc = end;
+                let fmt = core::str::from_utf8(fmt_bytes).map_err(|_| VmError::InvalidOpcode)?;
+                let mut vals = [0u32; 8];
+                for (i, slot) in reg_idx.iter().enumerate().take(n) {
+                    vals[i] = self.regs[*slot as usize];
+                }
+                self.bus
+                    .log_vars(fmt, &vals[..n])
+                    .map_err(VmError::BusError)?;
+            }
+            // wait!(pin, timeout_ms)：阻塞至中断边沿或超时。超时由总线以
+            // BusError::Timeout 返回，VM 透传为 VmError::BusError。
+            Some(Opcode::WaitIrq) => {
+                let pin = self.read_u8()?;
+                let timeout_ms = self.read_u32()?;
+                self.bus
+                    .wait_irq(pin, timeout_ms)
+                    .map_err(VmError::BusError)?;
+            }
+            Some(Opcode::WriteVar) => {
+                let addr = self.read_u32()?;
+                let len = self.read_u32()?;
+                let delay = self.read_u32()?;
+                let src = self.read_u8()? as usize;
+
+                if len == 0 || len > 4 {
+                    return Err(VmError::InvalidLength);
+                }
+                let val = self.regs[src];
+                let mut buffer = [0u8; 4];
+                let data = &mut buffer[..len as usize];
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = (val >> (8 * i)) as u8;
+                }
+
+                self.bus.write(addr, data).map_err(VmError::BusError)?;
+
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                }
+            }
+            // `repeat!(N) { ... }`：读 count 与 body_len，把 body 重复执行 count 次。
+            // body 只编译一次（在 Loop 帧内），靠计数回跳复用，字节码不随 N 膨胀。
+            // 嵌套 repeat! 经递归 step() 自然处理——递归深度等于嵌套层数（非迭代数）。
+            Some(Opcode::Loop) => {
+                let count = self.read_u32()?;
+                let body_len = self.read_u32()? as usize;
+                // body_len 必须落在程序范围内，防止 body_end 越界/回绕。
+                let body_end = match self.pc.checked_add(body_len) {
+                    Some(end) if end <= self.program.len() => end,
+                    _ => return Err(VmError::InvalidLength),
+                };
+                let loop_start = self.pc;
+                for _ in 0..count {
+                    self.pc = loop_start;
+                    while self.pc < body_end {
+                        match self.step()? {
+                            Step::Continue => {}
+                            // body 内出现 Return（DSL 不会产生，防御性）：向上传播终止。
+                            Step::Returned => return Ok(Step::Returned),
+                        }
+                    }
+                }
+                // 跳过 body（count==0 时也直接落到 body_end，相当于 no-op）。
+                self.pc = body_end;
+            }
+            Some(Opcode::Return) => {
+                return Ok(Step::Returned);
+            }
+            // UpdateVar 尚未在 VM 中实现。
+            Some(Opcode::UpdateVar) => {
+                return Err(VmError::InvalidOpcode);
+            }
+            None => {
+                return Err(VmError::InvalidOpcode);
+            }
+        }
 
         Ok(Step::Continue)
     }
@@ -464,10 +467,19 @@ mod tests {
         // 程序: ReadVar addr=0x10 len=2 delay=0 dst=0 ; Return
         let program = [
             Opcode::ReadVar as u8,
-            0x10, 0x00, 0x00, 0x00, // addr
-            0x02, 0x00, 0x00, 0x00, // len
-            0x00, 0x00, 0x00, 0x00, // delay
-            0x00,                   // dst reg
+            0x10,
+            0x00,
+            0x00,
+            0x00, // addr
+            0x02,
+            0x00,
+            0x00,
+            0x00, // len
+            0x00,
+            0x00,
+            0x00,
+            0x00, // delay
+            0x00, // dst reg
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -483,9 +495,22 @@ mod tests {
     fn load_const_and_add_execute_correctly() {
         // 程序: LoadConst r0=10 ; LoadConst r1=20 ; Add r2=r0+r1 ; Return
         let program = [
-            Opcode::LoadConst as u8, 0x00, 0x0A, 0x00, 0x00, 0x00,
-            Opcode::LoadConst as u8, 0x01, 0x14, 0x00, 0x00, 0x00,
-            Opcode::Add as u8, 0x02, 0x00, 0x01,
+            Opcode::LoadConst as u8,
+            0x00,
+            0x0A,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::LoadConst as u8,
+            0x01,
+            0x14,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::Add as u8,
+            0x02,
+            0x00,
+            0x01,
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -498,10 +523,26 @@ mod tests {
     fn shift_and_logic_opcodes_execute() {
         // LoadConst r0=0xF0 ; LoadConst r1=4 ; Shl r2=r0<<r1 ; And r3=r2&r0 ; Return
         let program = [
-            Opcode::LoadConst as u8, 0x00, 0xF0, 0x00, 0x00, 0x00,
-            Opcode::LoadConst as u8, 0x01, 0x04, 0x00, 0x00, 0x00,
-            Opcode::Shl as u8, 0x02, 0x00, 0x01,
-            Opcode::And as u8, 0x03, 0x02, 0x00,
+            Opcode::LoadConst as u8,
+            0x00,
+            0xF0,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::LoadConst as u8,
+            0x01,
+            0x04,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::Shl as u8,
+            0x02,
+            0x00,
+            0x01,
+            Opcode::And as u8,
+            0x03,
+            0x02,
+            0x00,
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -514,9 +555,22 @@ mod tests {
     #[test]
     fn divide_by_zero_returns_error() {
         let program = [
-            Opcode::LoadConst as u8, 0x00, 0x0A, 0x00, 0x00, 0x00,
-            Opcode::LoadConst as u8, 0x01, 0x00, 0x00, 0x00, 0x00,
-            Opcode::Div as u8, 0x02, 0x00, 0x01,
+            Opcode::LoadConst as u8,
+            0x00,
+            0x0A,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::LoadConst as u8,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::Div as u8,
+            0x02,
+            0x00,
+            0x01,
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -551,6 +605,10 @@ mod tests {
         reads: u32,
         writes: u32,
         logs: Vec<String>,
+        wait_calls: u32,
+        last_wait: (u8, u32),
+        /// 非 0 时 `wait_irq` 返回 `Err(Timeout)`，用于测超时传播。
+        wait_fail: bool,
     }
 
     impl Bus for CountBus {
@@ -568,6 +626,15 @@ mod tests {
         fn log(&mut self, msg: &str) -> Result<(), BusError> {
             self.logs.push(msg.to_owned());
             Ok(())
+        }
+        fn wait_irq(&mut self, pin: u8, timeout_ms: u32) -> Result<(), BusError> {
+            self.wait_calls += 1;
+            self.last_wait = (pin, timeout_ms);
+            if self.wait_fail {
+                Err(BusError::Timeout)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -658,9 +725,22 @@ mod tests {
     fn cmp_lt_is_signed() {
         // r0 = -1 (0xFFFFFFFF), r1 = 1, r2 = (r0 < r1) → 1（有符号 -1 < 1）
         let prog = vec![
-            Opcode::LoadConst as u8, 0, 0xFF, 0xFF, 0xFF, 0xFF,
-            Opcode::LoadConst as u8, 1, 0x01, 0x00, 0x00, 0x00,
-            Opcode::CmpLt as u8, 2, 0, 1,
+            Opcode::LoadConst as u8,
+            0,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            Opcode::LoadConst as u8,
+            1,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::CmpLt as u8,
+            2,
+            0,
+            1,
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -701,11 +781,28 @@ mod tests {
     fn logical_and_and_not() {
         // r0=2, r1=0; r2=r0&&r1→0; r3=!r0→0; r4=!r1→1
         let prog = vec![
-            Opcode::LoadConst as u8, 0, 2, 0, 0, 0,
-            Opcode::LoadConst as u8, 1, 0, 0, 0, 0,
-            Opcode::LogAnd as u8, 2, 0, 1,
-            Opcode::LogNot as u8, 3, 0,
-            Opcode::LogNot as u8, 4, 1,
+            Opcode::LoadConst as u8,
+            0,
+            2,
+            0,
+            0,
+            0,
+            Opcode::LoadConst as u8,
+            1,
+            0,
+            0,
+            0,
+            0,
+            Opcode::LogAnd as u8,
+            2,
+            0,
+            1,
+            Opcode::LogNot as u8,
+            3,
+            0,
+            Opcode::LogNot as u8,
+            4,
+            1,
             Opcode::Return as u8,
         ];
         let mut bus = TestBus::new();
@@ -783,5 +880,47 @@ mod tests {
         Vm::new(&mut bus, &prog).run().unwrap();
         // 默认 log_vars 就地格式化后委托 log → CountBus.log 记录。
         assert_eq!(bus.logs, vec!["v=42 h=0xaa".to_owned()]);
+    }
+
+    // ── wait! / WaitIrq ────────────────────────────────────────────
+
+    #[test]
+    fn wait_irq_opcode_calls_bus_wait() {
+        // wait!(pin=2, timeout=1234) → WaitIrq | pin=2 | timeout=1234 ; Return
+        let prog = vec![
+            Opcode::WaitIrq as u8,
+            0x02,
+            0xD2,
+            0x04,
+            0x00,
+            0x00,
+            Opcode::Return as u8,
+        ];
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.wait_calls, 1);
+        assert_eq!(bus.last_wait, (2, 1234));
+    }
+
+    #[test]
+    fn wait_irq_timeout_propagates() {
+        // 总线返回 Timeout → Vm::run 返回 VmError::BusError(Timeout)。
+        let prog = vec![
+            Opcode::WaitIrq as u8,
+            0x00,
+            0xE8,
+            0x03,
+            0x00,
+            0x00, // pin=0, timeout=1000
+            Opcode::Return as u8,
+        ];
+        let mut bus = CountBus {
+            wait_fail: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            Vm::new(&mut bus, &prog).run(),
+            Err(VmError::BusError(BusError::Timeout))
+        );
     }
 }

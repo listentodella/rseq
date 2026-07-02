@@ -17,7 +17,10 @@ struct FmtBuf {
 
 impl FmtBuf {
     fn new() -> Self {
-        Self { buf: [0; 256], len: 0 }
+        Self {
+            buf: [0; 256],
+            len: 0,
+        }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
@@ -125,5 +128,16 @@ pub trait Bus {
         let mut buf = FmtBuf::new();
         format_vars(&mut buf, fmt, vals);
         self.log(buf.as_str())
+    }
+
+    /// 阻塞等待中断引脚 `pin` 发生边沿，或 `timeout_ms` 超时。
+    ///
+    /// `wait!(pin)` 语句编译成 `WaitIrq` 操作码，VM 执行到这里调本方法。
+    /// 默认 no-op（立即返回 `Ok`）：不模拟中断的总线（`MockBus`/`SimBus`/
+    /// 测试 `MapBus`）直接放行，便于在主机上跑派发逻辑。关心真实引脚的
+    /// 实现（MCU `ImuSpiBus` 在 PB8 上 `k_sem_take`）覆盖本方法即可；
+    /// 超时返回 [`BusError::Timeout`]，VM 据此把 `ExecStatus` 标为 `BusError`。
+    fn wait_irq(&mut self, _pin: u8, _timeout_ms: u32) -> Result<(), BusError> {
+        Ok(())
     }
 }

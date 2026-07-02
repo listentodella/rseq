@@ -7,7 +7,7 @@ use rseq_vm::{Bus, BusError};
 
 use crate::error::LinkError;
 use crate::frame::MAX_TRACE_FRAME;
-use crate::wire::{encode_trace_delay, encode_trace_log, encode_trace_rw};
+use crate::wire::{encode_trace_delay, encode_trace_irq, encode_trace_log, encode_trace_rw};
 
 /// 只能发送字节流的链路出口。`TracingBus` 只发不收。
 pub trait LinkTx {
@@ -79,24 +79,14 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
     fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
         self.inner.read(addr, data)?;
         // VM 限制 read len ≤ 4096,故 data.len() ≤ MAX_TRACE_PAYLOAD 的 data 部分。
-        let n = encode_trace_rw(
-            &mut self.buf,
-            crate::wire::TRACE_OP_READ,
-            addr,
-            data,
-        );
+        let n = encode_trace_rw(&mut self.buf, crate::wire::TRACE_OP_READ, addr, data);
         self.send(n);
         Ok(())
     }
 
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
         self.inner.write(addr, data)?;
-        let n = encode_trace_rw(
-            &mut self.buf,
-            crate::wire::TRACE_OP_WRITE,
-            addr,
-            data,
-        );
+        let n = encode_trace_rw(&mut self.buf, crate::wire::TRACE_OP_WRITE, addr, data);
         self.send(n);
         Ok(())
     }
@@ -116,13 +106,25 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
         self.send(n);
         Ok(())
     }
+
+    /// `wait!(pin)`：先让真总线阻塞等待边沿（真机=`ImuSpiBus` 在 PB8 上
+    /// `k_sem_take`），命中后再回传一条 Irq trace 给主机，标记此处发生过
+    /// 一次中断。inner 超时返回 `Timeout` 时直接传播，不发 trace。
+    fn wait_irq(&mut self, pin: u8, timeout_ms: u32) -> Result<(), BusError> {
+        self.inner.wait_irq(pin, timeout_ms)?;
+        let n = encode_trace_irq(&mut self.buf, pin);
+        self.send(n);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{
+        MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE, decode_trace,
+    };
     use std::prelude::v1::*;
-    use crate::wire::{MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE, decode_trace};
     use std::sync::{Arc, Mutex};
 
     /// 记录所有发送字节的全捕获 LinkTx。
@@ -158,25 +160,26 @@ mod tests {
         Write { addr: u32, data: Vec<u8> },
         Delay { us: u32 },
         Log { msg: Vec<u8> },
+        Irq { pin: u8 },
     }
 
     fn decoded_traces(bytes: &[u8]) -> Vec<OwnedTrace> {
-        let mut dec =
-            crate::frame::FrameDecoder::<{ crate::frame::HOST_FRAME_BUF }>::new();
+        let mut dec = crate::frame::FrameDecoder::<{ crate::frame::HOST_FRAME_BUF }>::new();
         let mut out: Vec<OwnedTrace> = Vec::new();
         dec.feed(bytes, |_ty, p| {
             if let Some(r) = decode_trace(p) {
                 out.push(match r {
-                    crate::wire::TraceRef::Read { addr, data } => {
-                        OwnedTrace::Read { addr, data: data.to_vec() }
-                    }
-                    crate::wire::TraceRef::Write { addr, data } => {
-                        OwnedTrace::Write { addr, data: data.to_vec() }
-                    }
+                    crate::wire::TraceRef::Read { addr, data } => OwnedTrace::Read {
+                        addr,
+                        data: data.to_vec(),
+                    },
+                    crate::wire::TraceRef::Write { addr, data } => OwnedTrace::Write {
+                        addr,
+                        data: data.to_vec(),
+                    },
                     crate::wire::TraceRef::Delay { us } => OwnedTrace::Delay { us },
-                    crate::wire::TraceRef::Log { msg } => {
-                        OwnedTrace::Log { msg: msg.to_vec() }
-                    }
+                    crate::wire::TraceRef::Log { msg } => OwnedTrace::Log { msg: msg.to_vec() },
+                    crate::wire::TraceRef::Irq { pin } => OwnedTrace::Irq { pin },
                 });
             }
         });
@@ -197,11 +200,17 @@ mod tests {
         assert_eq!(traces.len(), 3);
         assert_eq!(
             traces[0],
-            OwnedTrace::Read { addr: 0x10, data: vec![0, 0, 0] }
+            OwnedTrace::Read {
+                addr: 0x10,
+                data: vec![0, 0, 0]
+            }
         );
         assert_eq!(
             traces[1],
-            OwnedTrace::Write { addr: 0x20, data: vec![0xaa, 0xbb] }
+            OwnedTrace::Write {
+                addr: 0x20,
+                data: vec![0xaa, 0xbb]
+            }
         );
         assert_eq!(traces[2], OwnedTrace::Delay { us: 123 });
     }
@@ -226,5 +235,18 @@ mod tests {
         assert_eq!(TRACE_OP_WRITE, 0x02);
         assert_eq!(TRACE_OP_DELAY, 0x03);
         let _ = MAX_TRACE_PAYLOAD;
+    }
+
+    #[test]
+    fn tracing_bus_wait_emits_irq_trace() {
+        // ZeroBus.wait_irq 用默认 no-op（立即 Ok），TracingBus 应在其后
+        // 回传一条 Irq trace（pin=0）。
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = TracingBus::new(ZeroBus, CaptureTx(cap.clone()));
+        bus.wait_irq(0, 1000).unwrap();
+
+        let captured = cap.lock().unwrap().clone();
+        let traces = decoded_traces(&captured);
+        assert_eq!(traces, vec![OwnedTrace::Irq { pin: 0 }]);
     }
 }

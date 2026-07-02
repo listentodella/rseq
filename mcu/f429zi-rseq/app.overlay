@@ -1,0 +1,42 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/*
+ * Copyright (c) 2026 rseq contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * rseq MCU — 1 USB CDC-ACM port (the rseq-link transport) + the IMU SPI probe
+ * device. The board DTS already enables &usbotg_fs as zephyr_udc0 (PA11/PA12,
+ * 48 MHz PLL-Q) and &spi1 as arduino_spi (PA5/PA6/PA7, CS on PD14).
+ */
+
+/ {
+	rseq_inputs {
+		compatible = "gpio-keys";
+
+		rseq_int1: int1 {
+			gpios = <&gpiod 15 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&gpiob {
+	status = "okay";
+};
+
+/* USB CDC-ACM — the rseq-link transport channel. */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+/* IMU (QMI8660) on Arduino SPI: spi_probe_dev gives the C FFI the
+ * max-frequency and slave address used by rust_spi_bus_transceive().
+ */
+&arduino_spi {
+	spi_probe_dev: spi-device@0 {
+		compatible = "vnd,spi-device";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+	};
+};

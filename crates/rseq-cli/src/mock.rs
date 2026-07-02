@@ -1,5 +1,5 @@
-use rseq_vm::{Bus, BusError};
 use rseq::trace::BusOp;
+use rseq_vm::{Bus, BusError};
 use std::collections::HashMap;
 
 pub struct MockBus {
@@ -66,7 +66,9 @@ impl Bus for MockBus {
     }
 
     fn log(&mut self, msg: &str) -> Result<(), BusError> {
-        self.ops.push(BusOp::Log { msg: msg.to_string() });
+        self.ops.push(BusOp::Log {
+            msg: msg.to_string(),
+        });
         Ok(())
     }
 }

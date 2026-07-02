@@ -1,5 +1,36 @@
+// QMI8660 SPI initialization, extracted from
+// gpui-component/.../sequences/qmi8660-spi-default.toml (Reset + Init + Enable).
+// Transport is SPI (the MCU's ImuSpiBus); register addresses are the TOML's
+// raw 8-bit values. Delays are microseconds.
+
 chip!("qmi8660.yaml");
 
-write!(UI.RESET, 0x98, 50000);
+// ── Reset ────────────────────────────────────────────────────────────────────
+// 0x7B = CTRL9 (RESET), 0x98 = device reset; wait 50 ms, then read WHOAMI (0x02)
+// to confirm the chip is alive (expected 0x06).
+write!(UI.RESET, [0x98], 50000);
 let whoami = read!(UI.WHOAMI, 1, 100);
-write!(UI.ENCTL, 0x03);
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+// Burst-write 13 bytes to 0x1D (accel/gyro config block), then the remaining
+// config registers.
+// write!(0x1D, [0x57, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x64, 0x64, 0x00, 0x00, 0x01, 0x10], 25);
+//write!(0x3A, [0x80], 25); 
+write!(0x36, [0x08], 50);
+write!(0x37, [0x02], 50);
+write!(0x38, [0x08], 50);
+write!(0x39, [0x07], 50);
+write!(0x43, [0x06], 50);  
+write!(0x47, [0x00], 50);
+
+write!(0x44, [0x50], 5); 
+write!(0x45, [0x02], 5);
+write!(0x48, [0x00], 5);
+write!(0x49, [0x00], 5);
+write!(0x53, [0x40], 50);   // FIFO config
+write!(0x51, [0x64], 50);
+write!(0x52, [0xFC], 50);
+
+// ── Enable Accel + Gyro ─────────────────────────────────────────────────────
+// 0x3D = CTRL7 (ENCTL), 0x03 = enable accel + gyro; wait 200 ms to settle.
+write!(UI.ENCTL, [0x03], 200000);

@@ -5,13 +5,13 @@
 //! - `rseq-mcu-sim --serial PATH [BAUD]`  打开串口,进入 `mcu_loop`(需 `serial` feature)
 
 #[cfg(feature = "serial")]
-use std::sync::atomic::AtomicBool;
-#[cfg(feature = "serial")]
 use std::sync::Arc;
-
 #[cfg(feature = "serial")]
-use rseq_mcu_sim::{mcu_loop, SimBus};
+use std::sync::atomic::AtomicBool;
+
 use rseq_mcu_sim::run_self_test;
+#[cfg(feature = "serial")]
+use rseq_mcu_sim::{SimBus, mcu_loop};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

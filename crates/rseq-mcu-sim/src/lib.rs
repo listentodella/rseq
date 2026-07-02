@@ -9,14 +9,14 @@
 //! `mcu_loop` 的协议逻辑不变。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use rseq_link::frame::{encode_into, FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD};
-use rseq_link::wire::{load_segments, ExecStatus, SEG_KIND_MAIN};
-use rseq_link::{LinkError, Transport, TracingBus};
+use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
+use rseq_link::wire::{ExecStatus, SEG_KIND_MAIN, load_segments};
+use rseq_link::{LinkError, TracingBus, Transport};
 use rseq_vm::{Bus, BusError, Vm};
 
 /// MCU 程序读缓冲(每次最多从 transport 读这么多字节)。
@@ -155,8 +155,8 @@ pub fn mcu_loop<B: Bus, T: Transport>(
 pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
     use rseq::link::HostLink;
     use rseq::trace::BusOp;
-    use rseq_link::wire::ExecStatus as EStatus;
     use rseq_link::MockTransport;
+    use rseq_link::wire::ExecStatus as EStatus;
 
     let src = "write!(0x40, [0x01, 0x02, 0x03], 500);\nwrite!(0x100, 0xaa);\n";
     let program = rseq::parse(src).map_err(|e| format!("parse: {e:?}"))?;
@@ -180,9 +180,15 @@ pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
     stop.store(true, Ordering::SeqCst);
 
     let expected = vec![
-        BusOp::Write { addr: 0x40, data: vec![0x01, 0x02, 0x03] },
+        BusOp::Write {
+            addr: 0x40,
+            data: vec![0x01, 0x02, 0x03],
+        },
         BusOp::Delay { us: 500 },
-        BusOp::Write { addr: 0x100, data: vec![0xaa] },
+        BusOp::Write {
+            addr: 0x100,
+            data: vec![0xaa],
+        },
     ];
     if res.status != EStatus::Ok {
         return Err(format!("exec status not Ok: {:?}", res.status).into());

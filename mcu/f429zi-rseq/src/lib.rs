@@ -44,8 +44,8 @@ mod ffi {
         pub fn rust_uart_init() -> i32;
         pub fn rust_uart_read(buf: *mut u8, len: usize) -> i32;
         pub fn rust_uart_write(data: *const u8, len: usize) -> i32;
+        pub fn rust_event_wait(timeout_ms: u32) -> i32;
         pub fn rust_kernel_delay_us(us: u32);
-        pub fn rust_kernel_sleep_ms(ms: u32);
         pub fn rust_printk(s: *const u8, len: usize);
 
         pub fn rust_spi_bus_is_ready() -> i32;
@@ -110,6 +110,8 @@ impl Transport for CdcTransport {
 /// Scratch for SPI frames: 1 header byte + payload. QMI8660 reads are <=4 and
 /// writes are small, so 64 is ample; oversized ops fail with AccessSizeMismatch.
 const SPI_SCRATCH: usize = 64;
+const SPI_MAX_PAYLOAD: usize = SPI_SCRATCH - 1;
+const QMI8660_FIFO_DATA_REG: u8 = 0x57;
 
 /// rseq [`Bus`] over the IMU's SPI. The rseq DSL encodes a plain 8-bit register
 /// number as the `u32` address, so `addr & 0xff` is the register. QMI8660 SPI
@@ -147,24 +149,18 @@ impl ImuSpiBus {
             ffi::rust_spi_cs_set_high();
         }
     }
-}
 
-impl Bus for ImuSpiBus {
-    fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+    fn read_chunk(reg: u8, data: &mut [u8]) -> Result<(), BusError> {
         let len = data.len();
         if len == 0 || len + 1 > SPI_SCRATCH {
             return Err(BusError::AccessSizeMismatch);
         }
 
-        let reg = (addr & 0xff) as u8;
         let mut tx = [0u8; SPI_SCRATCH];
         let mut rx = [0u8; SPI_SCRATCH];
-        tx[0] = reg | 0x80; // read
+        tx[0] = reg | 0x80;
         let total = 1 + len;
 
-        // printk(&alloc::format!(
-        //     "rseq: spi read start reg=0x{reg:02x} len={len}\n"
-        // ));
         Self::cs_low()?;
         let ret =
             unsafe { ffi::rust_spi_bus_transceive(tx.as_ptr(), total, rx.as_mut_ptr(), total) };
@@ -177,10 +173,30 @@ impl Bus for ImuSpiBus {
         }
 
         data.copy_from_slice(&rx[1..1 + len]);
-        // printk(&alloc::format!(
-        //     "rseq: spi read ok reg=0x{reg:02x} first=0x{:02x}\n",
-        //     data[0]
-        // ));
+        Ok(())
+    }
+}
+
+impl Bus for ImuSpiBus {
+    fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+        let len = data.len();
+        if len == 0 {
+            return Err(BusError::AccessSizeMismatch);
+        }
+
+        let reg = (addr & 0xff) as u8;
+
+        if len <= SPI_MAX_PAYLOAD {
+            return Self::read_chunk(reg, data);
+        }
+
+        if reg != QMI8660_FIFO_DATA_REG {
+            return Err(BusError::AccessSizeMismatch);
+        }
+
+        for chunk in data.chunks_mut(SPI_MAX_PAYLOAD) {
+            Self::read_chunk(reg, chunk)?;
+        }
         Ok(())
     }
 
@@ -243,22 +259,7 @@ impl Bus for ImuSpiBus {
 /// 不在 ISR 中运行 VM（避免阻塞 SPI/I2C）。
 #[no_mangle]
 pub extern "C" fn rust_irq_int1_triggered() {
-    // 调试：记录 ISR 被调用
-    unsafe {
-        ffi::rust_printk(b"rseq: ISR triggered\n".as_ptr(), 20);
-    }
-
-    // 设置标志
     IRQ_PENDING[0].store(true, Ordering::Release);
-
-    // 验证标志已设置
-    unsafe {
-        if IRQ_PENDING[0].load(Ordering::Acquire) {
-            ffi::rust_printk(b"rseq: ISR flag set OK\n".as_ptr(), 22);
-        } else {
-            ffi::rust_printk(b"rseq: ISR flag NOT set!\n".as_ptr(), 24);
-        }
-    }
 }
 
 // ============================================================================
@@ -277,6 +278,22 @@ fn send_frame<T: Transport>(t: &mut T, ty: FrameType, payload: &[u8]) -> Result<
     t.write(&buf[..n])
 }
 
+fn run_pending_irqs<B: Bus>(bus: &mut B) {
+    for pin_id in 0..MAX_IRQ_HANDLERS {
+        if !IRQ_PENDING[pin_id].swap(false, Ordering::Acquire) {
+            continue;
+        }
+
+        unsafe {
+            if let Some(handler) = &IRQ_HANDLERS[pin_id] {
+                if let Err(e) = Vm::new(bus, &handler.bytecode).run() {
+                    printk(&alloc::format!("rseq: irq handler error: {:?}\n", e));
+                }
+            }
+        }
+    }
+}
+
 /// MCU-side main loop: decode frames from `transport`, dispatch Load/Exec/
 /// Reset/Ping, and reply Ack/Trace/Result/Pong. `stop` is polled each iteration.
 /// The transport's `read` is expected to block (the CDC UART does), so there is
@@ -291,39 +308,10 @@ fn mcu_loop<B: Bus, T: Transport>(
     let mut inbox: VecDeque<(FrameType, Vec<u8>)> = VecDeque::new();
     let mut bytecode: Vec<u8> = Vec::new();
 
-    let mut loop_counter: u32 = 0;
-
     printk("rseq: main loop start\n");
 
     loop {
-        printk("rseq: [LOOP START]\n");
-
-        // 每 10 次循环打印一次心跳（而不是 100 次）
-        loop_counter = loop_counter.wrapping_add(1);
-        if loop_counter % 10 == 0 {
-            printk("rseq: loop tick\n");
-        }
-
-        // 检查 IRQ 待处理标志（在处理主机命令之前）
-        for pin_id in 0..MAX_IRQ_HANDLERS {
-            if IRQ_PENDING[pin_id].swap(false, Ordering::Acquire) {
-                printk("rseq: irq pending detected, running handler\n");
-                unsafe {
-                    if let Some(handler) = &IRQ_HANDLERS[pin_id] {
-                        printk("rseq: executing irq bytecode\n");
-                        // 在主循环上下文中运行 IRQ 处理段字节码
-                        match Vm::new(&mut bus, &handler.bytecode).run() {
-                            Ok(()) => printk("rseq: irq handler completed ok\n"),
-                            Err(e) => {
-                                printk("rseq: irq handler error\n");
-                            }
-                        }
-                    } else {
-                        printk("rseq: irq pending but no handler registered\n");
-                    }
-                }
-            }
-        }
+        run_pending_irqs(&mut bus);
 
         // Pull the next complete frame, responding to `stop` while waiting.
         let (ty, payload) = loop {
@@ -332,26 +320,9 @@ fn mcu_loop<B: Bus, T: Transport>(
                 return Ok(());
             }
 
-            // 先检查 IRQ（在内层 loop 中）
-            for pin_id in 0..MAX_IRQ_HANDLERS {
-                if IRQ_PENDING[pin_id].swap(false, Ordering::Acquire) {
-                    printk("rseq: [inner] irq pending detected\n");
-                    unsafe {
-                        if let Some(handler) = &IRQ_HANDLERS[pin_id] {
-                            printk("rseq: [inner] executing irq bytecode\n");
-                            match Vm::new(&mut bus, &handler.bytecode).run() {
-                                Ok(()) => printk("rseq: [inner] irq handler ok\n"),
-                                Err(e) => {
-                                    printk(&alloc::format!("rseq: [inner] irq handler error: {:?}\n", e));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            run_pending_irqs(&mut bus);
 
             if let Some(f) = inbox.pop_front() {
-                printk("rseq: got frame from inbox\n");
                 break f;
             }
 
@@ -365,12 +336,14 @@ fn mcu_loop<B: Bus, T: Transport>(
             };
 
             if n == 0 {
-                // 无数据：短暂休眠避免空转，然后继续循环（回到 IRQ 检查）
-                unsafe { ffi::rust_kernel_sleep_ms(1) };  // 缩短到 1ms
+                // Sleep until CDC RX or INT1 wakes the loop. The long timeout is
+                // only a defensive fallback; normal IRQ latency is event-driven.
+                unsafe {
+                    ffi::rust_event_wait(1000);
+                }
                 continue;
             }
 
-            printk("rseq: read frame data\n");
             let mut captured: Vec<(FrameType, Vec<u8>)> = Vec::new();
             dec.feed(&read_buf[..n], |ty, p| {
                 captured.push((ty, p.to_vec()));
@@ -407,7 +380,7 @@ fn mcu_loop<B: Bus, T: Transport>(
             }
             FrameType::Exec => {
                 printk("rseq: EXEC start\n");
-                if let Err(e) = send_frame(&mut transport, FrameType::Ack, &[]) {
+                if let Err(_e) = send_frame(&mut transport, FrameType::Ack, &[]) {
                     printk("rseq: send Ack failed\n");
                     continue;
                 }
@@ -426,7 +399,7 @@ fn mcu_loop<B: Bus, T: Transport>(
                     }
                 };
                 printk("rseq: sending Result frame\n");
-                if let Err(e) = send_frame(&mut transport, FrameType::Result, &[status as u8]) {
+                if let Err(_e) = send_frame(&mut transport, FrameType::Result, &[status as u8]) {
                     printk("rseq: send Result failed\n");
                     continue;
                 }

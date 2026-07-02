@@ -39,6 +39,7 @@ static bool rseq_int1_ready;
 
 // 声明 Rust 侧的回调函数
 extern void rust_irq_int1_triggered(void);
+extern void rust_event_notify(void);
 
 static void rseq_int1_isr(const struct device *port, struct gpio_callback *cb,
                           uint32_t pins)
@@ -49,6 +50,7 @@ static void rseq_int1_isr(const struct device *port, struct gpio_callback *cb,
     k_sem_give(&rseq_int1_sem);
     // 同时通知 Rust 侧设置待处理标志
     rust_irq_int1_triggered();
+    rust_event_notify();
 }
 
 static void rseq_int1_sem_drain(void)

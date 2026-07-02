@@ -163,9 +163,7 @@ fn main() {
         };
 
         if !irqs.is_empty() {
-            println!(
-                "\nInterrupt handlers (auto-response mode — MCU runs on every trigger):"
-            );
+            println!("\nInterrupt handlers (auto-response mode — MCU runs on every trigger):");
             for vector in &irqs {
                 println!(
                     "  irq!({}) — read {} byte(s) @ 0x{:08x}{}:",
@@ -385,9 +383,14 @@ fn main() {
 
 /// 经串口把字节码下发到真实 MCU,用 HostLink 收集回传的 Trace 并打印。
 #[cfg(feature = "serial")]
-fn run_over_serial(path: &str, baud: u32, bytecode: &[u8], irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>) {
+fn run_over_serial(
+    path: &str,
+    baud: u32,
+    bytecode: &[u8],
+    irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
+) {
     use rseq::link::HostLink;
-    use rseq_link::wire::{SEG_KIND_MAIN, SEG_KIND_IRQ_INT1};
+    use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
 
     println!("\nDispatching to MCU over serial ({path} @ {baud} baud)...");
     let transport = match rseq_link::SerialTransport::open(path, baud) {

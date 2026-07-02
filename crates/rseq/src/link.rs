@@ -12,7 +12,9 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
-use rseq_link::wire::{ExecStatus, TraceRef, decode_trace, encode_load_main_into, encode_load_segments_into};
+use rseq_link::wire::{
+    ExecStatus, TraceRef, decode_trace, encode_load_main_into, encode_load_segments_into,
+};
 use rseq_link::{LinkError, Transport};
 
 use crate::trace::BusOp;

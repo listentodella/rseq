@@ -117,6 +117,18 @@ static const struct device *const serial_dev = DEVICE_DT_GET(DT_NODELABEL(cdc_ac
 
 K_MSGQ_DEFINE(uart_rx_msgq, sizeof(uint8_t), 1024, 4);
 K_MUTEX_DEFINE(uart_tx_mutex);
+K_SEM_DEFINE(rseq_event_sem, 0, 1);
+
+void rust_event_notify(void)
+{
+	k_sem_give(&rseq_event_sem);
+}
+
+int rust_event_wait(uint32_t timeout_ms)
+{
+	return k_sem_take(&rseq_event_sem,
+			  timeout_ms == 0U ? K_FOREVER : K_MSEC(timeout_ms));
+}
 
 static void uart_irq_cb(const struct device *dev, void *user_data)
 {
@@ -138,6 +150,7 @@ static void uart_irq_cb(const struct device *dev, void *user_data)
 		for (int i = 0; i < n; i++) {
 			(void)k_msgq_put(&uart_rx_msgq, &buf[i], K_NO_WAIT);
 		}
+		rust_event_notify();
 	}
 }
 

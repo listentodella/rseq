@@ -98,6 +98,25 @@ impl<'a, B: Bus> Vm<'a, B> {
                     self.bus.delay_us(delay).map_err(VmError::BusError)?;
                 }
             }
+            Some(Opcode::ReadDyn) => {
+                let addr = self.read_u32()?;
+                let delay = self.read_u32()?;
+                let src = self.read_u8()? as usize;
+                let len = self.regs[src] as usize;
+                if len > 4096 {
+                    return Err(VmError::InvalidLength);
+                }
+
+                if len != 0 {
+                    let mut buffer = [0u8; 4096];
+                    let data = &mut buffer[..len];
+                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+                }
+
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                }
+            }
             Some(Opcode::Write) => {
                 let addr = self.read_u32()?;
                 let len = self.read_len()?;
@@ -605,6 +624,7 @@ mod tests {
         reads: u32,
         writes: u32,
         logs: Vec<String>,
+        read_lens: Vec<usize>,
         wait_calls: u32,
         last_wait: (u8, u32),
         /// 非 0 时 `wait_irq` 返回 `Err(Timeout)`，用于测超时传播。
@@ -612,8 +632,9 @@ mod tests {
     }
 
     impl Bus for CountBus {
-        fn read(&mut self, _addr: u32, _data: &mut [u8]) -> Result<(), BusError> {
+        fn read(&mut self, _addr: u32, data: &mut [u8]) -> Result<(), BusError> {
             self.reads += 1;
+            self.read_lens.push(data.len());
             Ok(())
         }
         fn write(&mut self, _addr: u32, _data: &[u8]) -> Result<(), BusError> {
@@ -667,6 +688,23 @@ mod tests {
         Vm::new(&mut bus, &prog).run().unwrap();
         assert_eq!(bus.reads, 3);
         assert_eq!(bus.writes, 0);
+    }
+
+    #[test]
+    fn read_dyn_uses_len_register() {
+        // r0=3; ReadDyn addr=0x20 delay=0 len=r0; Return
+        let mut prog = vec![Opcode::LoadConst as u8, 0];
+        prog.extend_from_slice(&3u32.to_le_bytes());
+        prog.push(Opcode::ReadDyn as u8);
+        prog.extend_from_slice(&0x20u32.to_le_bytes());
+        prog.extend_from_slice(&0u32.to_le_bytes());
+        prog.push(0);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(bus.reads, 1);
+        assert_eq!(bus.read_lens, vec![3]);
     }
 
     #[test]

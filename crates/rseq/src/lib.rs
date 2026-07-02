@@ -382,10 +382,9 @@ pub struct Program {
 
 /// 完整编译产物：线性主程序字节码 + 若干中断模板。
 ///
-/// `irq!(pin)` 块不再预编译独立处理段，而是存为模板（掩码 + AST 体）；
-/// 派发逻辑由 `wait!(pin)` 在编译期内联进 main 字节码（`WaitIrq` + 读快照 +
-/// 按掩码 `And`/`JumpIfZero` 分支 + 各 arm 体），故 MCU/sim/主机行为一致，
-/// 无需在线协议传中断表，也无需 MCU 侧派发器。
+/// `irq!(pin)` 块先整理为模板（掩码 + AST 体）：`wait!(pin)` 可把派发逻辑
+/// 内联进 main 字节码；多单元编译/CLI 还会为 MCU 自动响应模式生成独立
+/// IRQ 处理段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledProgram {
     /// 上电初始化等顺序执行的字节码，以 Return 结尾。`wait!` 的内联派发
@@ -1386,19 +1385,16 @@ fn compile_stmt(
                     bytecode.extend_from_slice(&delay.to_le_bytes());
                 }
                 Value::Ident(name) => {
-                    // 运行时变量：发射 ReadVar + 立即丢弃结果
+                    // 运行时变量：发射 ReadDyn，按寄存器中的长度读取并丢弃结果。
+                    // 这用于 FIFO drain：先 `let fifo_len = read!(STATUS...)`，
+                    // 再 `read!(FIFO_DATA, fifo_len)` 精确读取当前 FIFO 字节数。
                     let len_reg = *vars
                         .get(name)
                         .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
-
-                    // ReadVar 会把数据读入一个临时寄存器（但我们不关心结果）
-                    // 为了保持语义一致（独立的 read! 不保存结果），分配一个临时寄存器
-                    let _temp_reg = alloc_reg(next_reg)?;
-
-                    // 实际上我们需要一个新的操作码来支持"运行时变量长度的 Read（不存寄存器）"
-                    // 当前的 ReadVar 最多读 4 字节并存入寄存器，不适合大块数据
-                    // 暂时回退到编译期常量检查
-                    return Err(CompileError::NumberExpected);
+                    bytecode.push(rseq_vm::Opcode::ReadDyn as u8);
+                    bytecode.extend_from_slice(&addr.to_le_bytes());
+                    bytecode.extend_from_slice(&delay.to_le_bytes());
+                    bytecode.push(len_reg);
                 }
                 _ => return Err(CompileError::UnsupportedValue),
             }
@@ -1706,13 +1702,20 @@ fn compile_irq_segment(
         // 编译 arm 体
         let mut body_buf: Vec<u8> = Vec::new();
         for s in &arm.body {
-            compile_stmt(s, registry, &mut vars, &mut next_reg, &mut body_buf, &mut Vec::new())
-                .map_err(|e| SourceDiagnostic {
-                    unit: 0,
-                    span: 0..0,
-                    message: format!("IRQ arm body compilation failed: {}", e),
-                    help: None,
-                })?;
+            compile_stmt(
+                s,
+                registry,
+                &mut vars,
+                &mut next_reg,
+                &mut body_buf,
+                &mut Vec::new(),
+            )
+            .map_err(|e| SourceDiagnostic {
+                unit: 0,
+                span: 0..0,
+                message: format!("IRQ arm body compilation failed: {}", e),
+                help: None,
+            })?;
         }
 
         // JumpIfZero r_test, +body_len
@@ -2190,6 +2193,21 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                 let src = bytecode[pc];
                 pc += 1;
                 output.push_str(&format!("write!(0x{addr:x}, r{src} /* {len} bytes */"));
+                if delay > 0 {
+                    output.push_str(&format!(", {delay}"));
+                }
+                output.push_str(");\n");
+            }
+            Some(rseq_vm::Opcode::ReadDyn) => {
+                pc += 1;
+                let addr = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let src = bytecode[pc];
+                pc += 1;
+                output.push_str(&format!("read!(0x{addr:x}, r{src}"));
                 if delay > 0 {
                     output.push_str(&format!(", {delay}"));
                 }
@@ -3244,6 +3262,25 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_read_stmt_allows_variable_len() {
+        let src = "let n = 6; read!(0x10, n, 100);";
+        let bytecode = compile(&parse(src).unwrap()).unwrap();
+        let pos = bytecode
+            .iter()
+            .position(|&b| b == rseq_vm::Opcode::ReadDyn as u8)
+            .expect("contains ReadDyn");
+        assert_eq!(
+            u32::from_le_bytes(bytecode[pos + 1..pos + 5].try_into().unwrap()),
+            0x10
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytecode[pos + 5..pos + 9].try_into().unwrap()),
+            100
+        );
+        assert_eq!(bytecode[pos + 9], 0);
+    }
+
+    #[test]
     fn test_decompile_read_stmt() {
         let src = "read!(0x10, 6, 100);";
         let bytecode = compile(&parse(src).unwrap()).unwrap();
@@ -3262,6 +3299,27 @@ mod tests {
         let decompiled = decompile(&bytecode).unwrap();
         assert!(decompiled.contains("repeat!(3) {"));
         assert!(decompiled.contains("read!(0x10, 6);"));
+    }
+
+    #[test]
+    fn test_compile_irq_segment_allows_dynamic_fifo_read() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        irq!(int1) {
+            on(fifo_watermark) {
+                let fifo_l = read!(UI.FIFO_STATUSL, 1);
+                read!(UI.FIFO_DATA, fifo_l);
+            }
+        }
+        "#;
+        let program = parse(src).unwrap();
+        let compiled = compile_program_units(&[ProgramUnit {
+            program: &program,
+            base_dir: Some(&qmi_base()),
+        }])
+        .unwrap();
+        let int1 = compiled.irq_bytecodes.get("int1").expect("int1 handler");
+        assert!(int1.iter().any(|&b| b == rseq_vm::Opcode::ReadDyn as u8));
     }
 
     // ── if-else / 逻辑运算符 ────────────────────────────────────────

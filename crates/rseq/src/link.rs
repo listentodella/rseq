@@ -438,4 +438,35 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn observe_next_trace_receives_without_writing() {
+        let mut rx = Vec::new();
+        let mut rb = vec![0u8; 64];
+        let n = encode_trace_report(
+            &mut rb,
+            0x10,
+            &[ReportArgRef::U32(42), ReportArgRef::Bytes(&[0xde, 0xad])],
+        );
+        rx.extend(&rb[..n]);
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let op = link
+            .observe_next_trace(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            op,
+            BusOp::Report {
+                kind: 0x10,
+                args: vec![ReportArg::U32(42), ReportArg::Bytes(vec![0xde, 0xad]),],
+            }
+        );
+        assert!(link.transport_mut().writes.is_empty());
+    }
 }

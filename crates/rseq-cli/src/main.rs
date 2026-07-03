@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long)]
     serial: Option<String>,
 
+    /// 只监听已运行 MCU 主动回传的 Trace/Report,不解析脚本,不发送 LOAD/EXEC/PING。
+    #[arg(long, alias = "observe-only", alias = "rx-only")]
+    watch: bool,
+
     /// 串口波特率(默认 115200)。
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
@@ -55,6 +59,32 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.watch {
+        let Some(path) = cli.serial.as_deref() else {
+            eprintln!("--watch requires --serial <port>");
+            std::process::exit(2);
+        };
+
+        #[cfg(feature = "serial")]
+        {
+            if watch_ignores_source_options(&cli) {
+                println!(
+                    "Watch mode: skipping source parsing/compilation and sending no control frames."
+                );
+            }
+            run_watch(path, cli.baud);
+            return;
+        }
+        #[cfg(not(feature = "serial"))]
+        {
+            eprintln!(
+                "--watch --serial {path} 需要以 `serial` feature 编译 \
+                 (cargo run -p rseq-cli --features serial -- ... --watch --serial ...)"
+            );
+            std::process::exit(2);
+        }
+    }
 
     if cli.decompile {
         if cli.manifest.is_some() || !cli.run.is_empty() {
@@ -445,17 +475,40 @@ fn run_over_serial(
 
     if !irq_bytecodes.is_empty() {
         println!("\nObserving report events. Press Ctrl-C to stop.");
-        let mut seq: u64 = 0;
-        loop {
-            match host.observe_next_trace(std::time::Duration::from_secs(1)) {
-                Ok(Some(op)) => {
-                    print_observed_report(&op, &mut seq);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("observe failed: {e}");
-                    std::process::exit(1);
-                }
+        observe_reports_forever(&mut host);
+    }
+}
+
+#[cfg(feature = "serial")]
+fn run_watch(path: &str, baud: u32) {
+    use rseq::link::HostLink;
+
+    println!("\nWatching MCU reports over serial ({path} @ {baud} baud)...");
+    println!("No LOAD/EXEC/PING frames will be sent. Press Ctrl-C to stop.");
+
+    let transport = match rseq_link::SerialTransport::open(path, baud) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open serial {path} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut host = HostLink::new(transport);
+    observe_reports_forever(&mut host);
+}
+
+#[cfg(feature = "serial")]
+fn observe_reports_forever<T: rseq_link::Transport>(host: &mut rseq::link::HostLink<T>) {
+    let mut seq: u64 = 0;
+    loop {
+        match host.observe_next_trace(std::time::Duration::from_secs(1)) {
+            Ok(Some(op)) => {
+                print_observed_report(&op, &mut seq);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("observe failed: {e}");
+                std::process::exit(1);
             }
         }
     }
@@ -613,6 +666,17 @@ fn parse_u32_arg(text: &str) -> Result<u32, std::num::ParseIntError> {
     } else {
         trimmed.parse::<u32>()
     }
+}
+
+fn watch_ignores_source_options(cli: &Cli) -> bool {
+    cli.decompile
+        || cli.execute
+        || !cli.fire.is_empty()
+        || !cli.file.is_empty()
+        || cli.hex.is_some()
+        || cli.manifest.is_some()
+        || cli.output.is_some()
+        || !cli.run.is_empty()
 }
 
 fn load_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, String> {

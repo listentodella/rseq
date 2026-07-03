@@ -1,5 +1,5 @@
-use rseq::trace::BusOp;
-use rseq_vm::{Bus, BusError};
+use rseq::trace::{BusOp, ReportArg as OwnedReportArg};
+use rseq_vm::{Bus, BusError, ReportArg};
 use std::collections::HashMap;
 
 pub struct MockBus {
@@ -68,6 +68,20 @@ impl Bus for MockBus {
     fn log(&mut self, msg: &str) -> Result<(), BusError> {
         self.ops.push(BusOp::Log {
             msg: msg.to_string(),
+        });
+        Ok(())
+    }
+
+    fn report(&mut self, kind: u32, args: &[ReportArg<'_>]) -> Result<(), BusError> {
+        self.ops.push(BusOp::Report {
+            kind,
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    ReportArg::U32(v) => OwnedReportArg::U32(*v),
+                    ReportArg::Bytes(bytes) => OwnedReportArg::Bytes(bytes.to_vec()),
+                })
+                .collect(),
         });
         Ok(())
     }

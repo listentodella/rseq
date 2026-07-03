@@ -323,6 +323,23 @@ fn main() {
                             println!("    Action: Print {msg:?} vars({})", vars.join(", "));
                         }
                     }
+                    rseq::Stmt::Report { kind, values } => {
+                        let kind = match kind {
+                            rseq::Value::Number(n) => format!("0x{n:x}"),
+                            rseq::Value::Ident(name) => name.clone(),
+                            _ => "unknown".to_string(),
+                        };
+                        let args = values
+                            .iter()
+                            .map(format_expr)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if args.is_empty() {
+                            println!("    Action: Report event kind={kind}");
+                        } else {
+                            println!("    Action: Report event kind={kind} args({args})");
+                        }
+                    }
                 }
             }
         }
@@ -425,6 +442,78 @@ fn run_over_serial(
             std::process::exit(1);
         }
     }
+
+    if !irq_bytecodes.is_empty() {
+        println!("\nObserving report events. Press Ctrl-C to stop.");
+        let mut seq: u64 = 0;
+        loop {
+            match host.observe_next_trace(std::time::Duration::from_secs(1)) {
+                Ok(Some(op)) => {
+                    print_observed_report(&op, &mut seq);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("observe failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+fn print_observed_report(op: &rseq::trace::BusOp, seq: &mut u64) {
+    if let rseq::trace::BusOp::Report { kind, args } = op {
+        *seq += 1;
+        if *kind == rseq::REPORT_KIND_FIFO_RAW {
+            print_fifo_raw_report(*seq, args);
+        } else {
+            print_named_report(*seq, *kind, args);
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+fn print_fifo_raw_report(seq: u64, args: &[rseq::trace::ReportArg]) {
+    let fifo_len = args.iter().find_map(|arg| match arg {
+        rseq::trace::ReportArg::U32(v) => Some(*v),
+        _ => None,
+    });
+    let data = args.iter().find_map(|arg| match arg {
+        rseq::trace::ReportArg::Bytes(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    });
+
+    match data {
+        Some(bytes) => {
+            let hex = bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match fifo_len {
+                Some(len) => println!(
+                    "FIFO_RAW #{seq}: fifo_len={len} data_len={} data=[{hex}]",
+                    bytes.len()
+                ),
+                None => println!("FIFO_RAW #{seq}: data_len={} data=[{hex}]", bytes.len()),
+            }
+        }
+        None => {
+            println!("FIFO_RAW #{seq}: missing raw bytes arg ({args:?})");
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+fn print_named_report(seq: u64, kind: u32, args: &[rseq::trace::ReportArg]) {
+    let label = report_kind_label(kind);
+    let vals = format_report_args(args);
+    if vals.is_empty() {
+        println!("{label} #{seq}");
+    } else {
+        println!("{label} #{seq}: {vals}");
+    }
 }
 
 /// 按执行顺序打印总线操作(MockBus 回放与串口回传 Trace 共用)。
@@ -465,8 +554,41 @@ fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
             rseq::trace::BusOp::Irq { pin } => {
                 println!("  Step {}: IRQ pin {pin} fired", step + 1);
             }
+            rseq::trace::BusOp::Report { kind, args } => {
+                let label = report_kind_label(*kind);
+                let vals = format_report_args(args);
+                println!("  Step {}: Report {label} args [{vals}]", step + 1);
+            }
         }
     }
+}
+
+fn report_kind_label(kind: u32) -> String {
+    rseq::report_kind_name(kind).map_or_else(|| format!("kind=0x{kind:x}"), |name| name.to_string())
+}
+
+fn format_report_args(args: &[rseq::trace::ReportArg]) -> String {
+    args.iter()
+        .map(|arg| match arg {
+            rseq::trace::ReportArg::U32(v) => {
+                format!("u32=0x{v:08x} ({})", *v as i32)
+            }
+            rseq::trace::ReportArg::Bytes(bytes) => {
+                let preview = bytes
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if bytes.len() > 16 {
+                    format!("bytes[{}]=[{preview} ...]", bytes.len())
+                } else {
+                    format!("bytes[{}]=[{preview}]", bytes.len())
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_fire_spec(spec: &str) -> Result<(String, u32), String> {

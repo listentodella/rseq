@@ -3,11 +3,14 @@
 //! MCU 端 = 真实 I2C/SPI `Bus` 实现 + `TracingBus` + `LinkTx`(UART)。
 //! TX 失败时尽量不影响总线操作本身(观测是尽力而为)。
 
-use rseq_vm::{Bus, BusError};
+use rseq_vm::{Bus, BusError, ReportArg};
 
 use crate::error::LinkError;
 use crate::frame::MAX_TRACE_FRAME;
-use crate::wire::{encode_trace_delay, encode_trace_irq, encode_trace_log, encode_trace_rw};
+use crate::wire::{
+    MAX_REPORT_ARGS, ReportArgRef, encode_trace_delay, encode_trace_irq, encode_trace_log,
+    encode_trace_report, encode_trace_rw,
+};
 
 /// 只能发送字节流的链路出口。`TracingBus` 只发不收。
 pub trait LinkTx {
@@ -116,13 +119,32 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
         self.send(n);
         Ok(())
     }
+
+    /// `report!`：先让底层总线处理（默认 no-op），再回传一条 Report trace。
+    fn report(&mut self, kind: u32, args: &[ReportArg<'_>]) -> Result<(), BusError> {
+        self.inner.report(kind, args)?;
+        if args.len() > MAX_REPORT_ARGS {
+            return Err(BusError::AccessSizeMismatch);
+        }
+        let mut wire_args = [ReportArgRef::U32(0); MAX_REPORT_ARGS];
+        for (slot, arg) in wire_args.iter_mut().zip(args.iter()) {
+            *slot = match arg {
+                ReportArg::U32(v) => ReportArgRef::U32(*v),
+                ReportArg::Bytes(bytes) => ReportArgRef::Bytes(bytes),
+            };
+        }
+        let n = encode_trace_report(&mut self.buf, kind, &wire_args[..args.len()]);
+        self.send(n);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wire::{
-        MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_WRITE, decode_trace,
+        MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_REPORT, TRACE_OP_WRITE,
+        decode_trace,
     };
     use std::prelude::v1::*;
     use std::sync::{Arc, Mutex};
@@ -156,11 +178,33 @@ mod tests {
     /// 解码后的 Trace 的 owned 镜像——数据从帧缓冲拷出,避免借用逃逸出闭包。
     #[derive(Debug, PartialEq, Eq)]
     enum OwnedTrace {
-        Read { addr: u32, data: Vec<u8> },
-        Write { addr: u32, data: Vec<u8> },
-        Delay { us: u32 },
-        Log { msg: Vec<u8> },
-        Irq { pin: u8 },
+        Read {
+            addr: u32,
+            data: Vec<u8>,
+        },
+        Write {
+            addr: u32,
+            data: Vec<u8>,
+        },
+        Delay {
+            us: u32,
+        },
+        Log {
+            msg: Vec<u8>,
+        },
+        Irq {
+            pin: u8,
+        },
+        Report {
+            kind: u32,
+            args: Vec<OwnedReportArg>,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum OwnedReportArg {
+        U32(u32),
+        Bytes(Vec<u8>),
     }
 
     fn decoded_traces(bytes: &[u8]) -> Vec<OwnedTrace> {
@@ -180,6 +224,17 @@ mod tests {
                     crate::wire::TraceRef::Delay { us } => OwnedTrace::Delay { us },
                     crate::wire::TraceRef::Log { msg } => OwnedTrace::Log { msg: msg.to_vec() },
                     crate::wire::TraceRef::Irq { pin } => OwnedTrace::Irq { pin },
+                    crate::wire::TraceRef::Report { kind, args } => OwnedTrace::Report {
+                        kind,
+                        args: args
+                            .as_slice()
+                            .iter()
+                            .map(|arg| match arg {
+                                ReportArgRef::U32(v) => OwnedReportArg::U32(*v),
+                                ReportArgRef::Bytes(bytes) => OwnedReportArg::Bytes(bytes.to_vec()),
+                            })
+                            .collect(),
+                    },
                 });
             }
         });
@@ -248,5 +303,31 @@ mod tests {
         let captured = cap.lock().unwrap().clone();
         let traces = decoded_traces(&captured);
         assert_eq!(traces, vec![OwnedTrace::Irq { pin: 0 }]);
+    }
+
+    #[test]
+    fn tracing_bus_report_emits_report_trace() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = TracingBus::new(ZeroBus, CaptureTx(cap.clone()));
+        bus.report(0x10, &[ReportArg::U32(42), ReportArg::Bytes(&[0xde, 0xad])])
+            .unwrap();
+
+        let captured = cap.lock().unwrap().clone();
+        let traces = decoded_traces(&captured);
+        assert_eq!(
+            traces,
+            vec![OwnedTrace::Report {
+                kind: 0x10,
+                args: vec![
+                    OwnedReportArg::U32(42),
+                    OwnedReportArg::Bytes(vec![0xde, 0xad]),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn report_op_constant_matches_wire_decode() {
+        assert_eq!(TRACE_OP_REPORT, 0x06);
     }
 }

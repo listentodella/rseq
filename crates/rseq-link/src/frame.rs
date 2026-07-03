@@ -18,9 +18,9 @@ pub const OVERHEAD: usize = HEADER_LEN + CRC_LEN;
 pub const SYNC0: u8 = 0x55;
 pub const SYNC1: u8 = 0xAA;
 
-/// 一条 Trace 帧(R/W)的最大载荷:op(1)+addr(4)+dlen(2)+data(≤4096) = 4103。
-/// 对应整帧最大 4103 + OVERHEAD = 4112。VM 的 read/write 已被限到 4096 字节。
-pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 2 + 4096;
+/// 一条 Trace 帧的最大载荷。R/W 为 4103；`report!` 可携带 1 个 4096B
+/// raw buffer 加最多 7 个 u32 参数，因此上限为 4140。
+pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 1 + 7 * (1 + 4) + (1 + 2 + 4096);
 pub const MAX_TRACE_FRAME: usize = MAX_TRACE_PAYLOAD + OVERHEAD;
 
 /// 主机侧解码缓冲容量:需容纳最大可能帧(LOAD 可携带最大 65535 字节载荷)。

@@ -17,7 +17,7 @@ use rseq_link::wire::{
 };
 use rseq_link::{LinkError, Transport};
 
-use crate::trace::BusOp;
+use crate::trace::{BusOp, ReportArg};
 
 /// 一次 EXEC 的结果:执行状态码 + 期间回传并解码的总线轨迹。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,19 @@ impl From<TraceRef<'_>> for BusOp {
                 msg: String::from_utf8_lossy(msg).into_owned(),
             },
             TraceRef::Irq { pin } => BusOp::Irq { pin },
+            TraceRef::Report { kind, args } => BusOp::Report {
+                kind,
+                args: args
+                    .as_slice()
+                    .iter()
+                    .map(|arg| match arg {
+                        rseq_link::wire::ReportArgRef::U32(v) => ReportArg::U32(*v),
+                        rseq_link::wire::ReportArgRef::Bytes(bytes) => {
+                            ReportArg::Bytes(bytes.to_vec())
+                        }
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -195,6 +208,22 @@ impl<T: Transport> HostLink<T> {
         }
     }
 
+    /// 在 EXEC 之外继续观察 MCU→Host Trace。用于自动 IRQ handler 后台上报。
+    /// 超时返回 `Ok(None)`，调用方可继续轮询或用于刷新 UI。
+    pub fn observe_next_trace(&mut self, timeout: Duration) -> Result<Option<BusOp>, LinkError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some((ty, p)) = self.next_frame(deadline)? else {
+                return Ok(None);
+            };
+            if ty == FrameType::Trace {
+                if let Some(r) = decode_trace(&p) {
+                    return Ok(Some(BusOp::from(r)));
+                }
+            }
+        }
+    }
+
     /// 复位 MCU 程序区;收到 ACK 即返回。
     pub fn reset(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Reset, &[])?;
@@ -214,7 +243,8 @@ impl<T: Transport> HostLink<T> {
 mod tests {
     use super::*;
     use rseq_link::wire::{
-        TRACE_OP_READ, TRACE_OP_WRITE, encode_trace_delay, encode_trace_log, encode_trace_rw,
+        ReportArgRef, TRACE_OP_READ, TRACE_OP_WRITE, encode_trace_delay, encode_trace_log,
+        encode_trace_report, encode_trace_rw,
     };
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
@@ -378,5 +408,34 @@ mod tests {
         let res = link.exec().unwrap();
         assert_eq!(res.status, ExecStatus::Ok);
         assert_eq!(res.traces, vec![BusOp::Irq { pin: 0 }]);
+    }
+
+    #[test]
+    fn exec_collects_report_trace() {
+        let mut rx = Vec::new();
+        rx.extend(frame(FrameType::Ack, &[]));
+        let mut rb = vec![0u8; 64];
+        let n = encode_trace_report(
+            &mut rb,
+            0x10,
+            &[ReportArgRef::U32(42), ReportArgRef::Bytes(&[0xde, 0xad])],
+        );
+        rx.extend(&rb[..n]);
+        rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let res = link.exec().unwrap();
+        assert_eq!(res.status, ExecStatus::Ok);
+        assert_eq!(
+            res.traces,
+            vec![BusOp::Report {
+                kind: 0x10,
+                args: vec![ReportArg::U32(42), ReportArg::Bytes(vec![0xde, 0xad]),],
+            }]
+        );
     }
 }

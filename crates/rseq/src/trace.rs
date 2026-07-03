@@ -8,6 +8,13 @@
 //!
 //! 三处共用同一类型,便于回环对比(MockBus 记录 ↔ 链路解码)。
 
+/// `report!` 的一个已解码参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportArg {
+    U32(u32),
+    Bytes(Vec<u8>),
+}
+
 /// 一条已执行的总线操作。
 ///
 /// - `Read`/`Write` 的 `data` 为读出/写入的字节序列;
@@ -32,5 +39,10 @@ pub enum BusOp {
     /// `wait!(pin)` 命中：一次中断等待结束（边沿到达）。
     Irq {
         pin: u8,
+    },
+    /// `report!(kind, ...)` 结构化数据上报。
+    Report {
+        kind: u32,
+        args: Vec<ReportArg>,
     },
 }

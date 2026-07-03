@@ -1,5 +1,5 @@
-use crate::bus::{Bus, BusError};
-use crate::opcode::Opcode;
+use crate::bus::{Bus, BusError, ReportArg};
+use crate::opcode::{Opcode, REPORT_ARG_BYTES, REPORT_ARG_U32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
@@ -20,6 +20,10 @@ enum Step {
 
 /// 通用寄存器数量。寄存器以 u8 索引，故最多 256 个。
 pub const REG_COUNT: usize = 256;
+/// `let data = read!(..., len)` 的原始数据缓冲数量。第一版只保留一个
+/// 4096 字节 slot，避免 MCU 栈/内存预算失控。
+pub const DATA_BUF_COUNT: usize = 1;
+pub const DATA_BUF_LEN: usize = 4096;
 
 pub struct Vm<'a, B: Bus> {
     bus: &'a mut B,
@@ -27,6 +31,8 @@ pub struct Vm<'a, B: Bus> {
     program: &'a [u8],
     /// 通用寄存器文件，供算术/逻辑指令使用。
     regs: [u32; REG_COUNT],
+    data_bufs: [[u8; DATA_BUF_LEN]; DATA_BUF_COUNT],
+    data_lens: [usize; DATA_BUF_COUNT],
 }
 
 impl<'a, B: Bus> Vm<'a, B> {
@@ -36,6 +42,8 @@ impl<'a, B: Bus> Vm<'a, B> {
             pc: 0,
             program,
             regs: [0; REG_COUNT],
+            data_bufs: [[0; DATA_BUF_LEN]; DATA_BUF_COUNT],
+            data_lens: [0; DATA_BUF_COUNT],
         }
     }
 
@@ -110,6 +118,29 @@ impl<'a, B: Bus> Vm<'a, B> {
                 if len != 0 {
                     let mut buffer = [0u8; 4096];
                     let data = &mut buffer[..len];
+                    self.bus.read(addr, data).map_err(VmError::BusError)?;
+                }
+
+                if delay > 0 {
+                    self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                }
+            }
+            Some(Opcode::ReadBuf) => {
+                let addr = self.read_u32()?;
+                let delay = self.read_u32()?;
+                let len_src = self.read_u8()? as usize;
+                let dst_buf = self.read_u8()? as usize;
+                if dst_buf >= DATA_BUF_COUNT {
+                    return Err(VmError::InvalidLength);
+                }
+                let len = self.regs[len_src] as usize;
+                if len > DATA_BUF_LEN {
+                    return Err(VmError::InvalidLength);
+                }
+
+                self.data_lens[dst_buf] = len;
+                if len != 0 {
+                    let data = &mut self.data_bufs[dst_buf][..len];
                     self.bus.read(addr, data).map_err(VmError::BusError)?;
                 }
 
@@ -349,6 +380,39 @@ impl<'a, B: Bus> Vm<'a, B> {
                     .wait_irq(pin, timeout_ms)
                     .map_err(VmError::BusError)?;
             }
+            // report!(kind, ...)：按 typed args 上报 u32 和/或原始字节。
+            Some(Opcode::Report) => {
+                let kind = self.read_u32()?;
+                let n = self.read_u8()? as usize;
+                if n > 8 {
+                    return Err(VmError::InvalidLength);
+                }
+                let mut tags = [0u8; 8];
+                let mut idxs = [0u8; 8];
+                for i in 0..n {
+                    tags[i] = self.read_u8()?;
+                    idxs[i] = self.read_u8()?;
+                }
+
+                let mut args = [ReportArg::U32(0); 8];
+                for i in 0..n {
+                    args[i] = match tags[i] {
+                        REPORT_ARG_U32 => ReportArg::U32(self.regs[idxs[i] as usize]),
+                        REPORT_ARG_BYTES => {
+                            let buf = idxs[i] as usize;
+                            if buf >= DATA_BUF_COUNT {
+                                return Err(VmError::InvalidLength);
+                            }
+                            let len = self.data_lens[buf];
+                            ReportArg::Bytes(&self.data_bufs[buf][..len])
+                        }
+                        _ => return Err(VmError::InvalidOpcode),
+                    };
+                }
+                self.bus
+                    .report(kind, &args[..n])
+                    .map_err(VmError::BusError)?;
+            }
             Some(Opcode::WriteVar) => {
                 let addr = self.read_u32()?;
                 let len = self.read_u32()?;
@@ -450,7 +514,7 @@ fn merge_field(reg_val: u64, bit_lo: u8, bit_hi: u8, value: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{Bus, BusError};
+    use crate::bus::{Bus, BusError, ReportArg};
 
     /// 简易 mock bus，仅用于 VM 单元测试。
     struct TestBus {
@@ -625,6 +689,7 @@ mod tests {
         writes: u32,
         logs: Vec<String>,
         read_lens: Vec<usize>,
+        reports: Vec<(u32, Vec<OwnedReportArg>)>,
         wait_calls: u32,
         last_wait: (u8, u32),
         /// 非 0 时 `wait_irq` 返回 `Err(Timeout)`，用于测超时传播。
@@ -657,6 +722,24 @@ mod tests {
                 Ok(())
             }
         }
+        fn report(&mut self, kind: u32, args: &[ReportArg<'_>]) -> Result<(), BusError> {
+            self.reports.push((
+                kind,
+                args.iter()
+                    .map(|arg| match arg {
+                        ReportArg::U32(v) => OwnedReportArg::U32(*v),
+                        ReportArg::Bytes(bytes) => OwnedReportArg::Bytes(bytes.to_vec()),
+                    })
+                    .collect(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum OwnedReportArg {
+        U32(u32),
+        Bytes(Vec<u8>),
     }
 
     /// 构造 `read!(addr, 1, 0)` 的 13 字节编码。
@@ -705,6 +788,64 @@ mod tests {
         Vm::new(&mut bus, &prog).run().unwrap();
         assert_eq!(bus.reads, 1);
         assert_eq!(bus.read_lens, vec![3]);
+    }
+
+    #[test]
+    fn report_sends_register_values_to_bus() {
+        // r0=42; r1=0xaa; Report kind=0x10 values=[r0,r1]; Return
+        let mut prog = vec![Opcode::LoadConst as u8, 0];
+        prog.extend_from_slice(&42u32.to_le_bytes());
+        prog.push(Opcode::LoadConst as u8);
+        prog.push(1);
+        prog.extend_from_slice(&0xaau32.to_le_bytes());
+        prog.push(Opcode::Report as u8);
+        prog.extend_from_slice(&0x10u32.to_le_bytes());
+        prog.push(2);
+        prog.push(REPORT_ARG_U32);
+        prog.push(0);
+        prog.push(REPORT_ARG_U32);
+        prog.push(1);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(
+            bus.reports,
+            vec![(
+                0x10,
+                vec![OwnedReportArg::U32(42), OwnedReportArg::U32(0xaa)]
+            )]
+        );
+    }
+
+    #[test]
+    fn read_buf_then_report_sends_bytes() {
+        // r0=3; ReadBuf addr=0x20 len=r0 -> buf0; Report kind=0x01 [r0, buf0]
+        let mut prog = vec![Opcode::LoadConst as u8, 0];
+        prog.extend_from_slice(&3u32.to_le_bytes());
+        prog.push(Opcode::ReadBuf as u8);
+        prog.extend_from_slice(&0x20u32.to_le_bytes());
+        prog.extend_from_slice(&0u32.to_le_bytes());
+        prog.push(0);
+        prog.push(0);
+        prog.push(Opcode::Report as u8);
+        prog.extend_from_slice(&0x01u32.to_le_bytes());
+        prog.push(2);
+        prog.push(REPORT_ARG_U32);
+        prog.push(0);
+        prog.push(REPORT_ARG_BYTES);
+        prog.push(0);
+        prog.push(Opcode::Return as u8);
+
+        let mut bus = CountBus::default();
+        Vm::new(&mut bus, &prog).run().unwrap();
+        assert_eq!(
+            bus.reports,
+            vec![(
+                0x01,
+                vec![OwnedReportArg::U32(3), OwnedReportArg::Bytes(vec![0, 0, 0])]
+            )]
+        );
     }
 
     #[test]

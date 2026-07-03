@@ -8,6 +8,12 @@ pub enum BusError {
     HardwareFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportArg<'a> {
+    U32(u32),
+    Bytes(&'a [u8]),
+}
+
 /// 固定容量栈缓冲，实现 [`core::fmt::Write`]。供 [`Bus::log_vars`] 的默认实现
 /// 把 `print!("..{}", v)` 格式化成字符串再交给 [`Bus::log`]，无需 alloc。
 struct FmtBuf {
@@ -139,5 +145,41 @@ pub trait Bus {
     /// 超时返回 [`BusError::Timeout`]，VM 据此把 `ExecStatus` 标为 `BusError`。
     fn wait_irq(&mut self, _pin: u8, _timeout_ms: u32) -> Result<(), BusError> {
         Ok(())
+    }
+
+    /// 结构化数据上报（`report!(kind, ...)`）。默认 no-op：不关心上报的总线
+    /// 实现可不变；`TracingBus` 会把它编码为 MCU→Host Trace 帧。
+    fn report(&mut self, _kind: u32, _args: &[ReportArg<'_>]) -> Result<(), BusError> {
+        Ok(())
+    }
+}
+
+impl<T: Bus + ?Sized> Bus for &mut T {
+    fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+        (**self).read(addr, data)
+    }
+
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+        (**self).write(addr, data)
+    }
+
+    fn delay_us(&mut self, us: u32) -> Result<(), BusError> {
+        (**self).delay_us(us)
+    }
+
+    fn log(&mut self, msg: &str) -> Result<(), BusError> {
+        (**self).log(msg)
+    }
+
+    fn log_vars(&mut self, fmt: &str, vals: &[u32]) -> Result<(), BusError> {
+        (**self).log_vars(fmt, vals)
+    }
+
+    fn wait_irq(&mut self, pin: u8, timeout_ms: u32) -> Result<(), BusError> {
+        (**self).wait_irq(pin, timeout_ms)
+    }
+
+    fn report(&mut self, kind: u32, args: &[ReportArg<'_>]) -> Result<(), BusError> {
+        (**self).report(kind, args)
     }
 }

@@ -158,7 +158,7 @@ pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
     use rseq_link::MockTransport;
     use rseq_link::wire::ExecStatus as EStatus;
 
-    let src = "write!(0x40, [0x01, 0x02, 0x03], 500);\nwrite!(0x100, 0xaa);\n";
+    let src = "write!(0x40, [0x01, 0x02, 0x03], 500);\nlet n = 42;\nreport!(0x10, n, n + 1);\nwrite!(0x100, 0xaa);\n";
     let program = rseq::parse(src).map_err(|e| format!("parse: {e:?}"))?;
     let bytecode = rseq::compile(&program).map_err(|e| format!("compile: {e:?}"))?;
 
@@ -185,6 +185,13 @@ pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
             data: vec![0x01, 0x02, 0x03],
         },
         BusOp::Delay { us: 500 },
+        BusOp::Report {
+            kind: 0x10,
+            args: vec![
+                rseq::trace::ReportArg::U32(42),
+                rseq::trace::ReportArg::U32(43),
+            ],
+        },
         BusOp::Write {
             addr: 0x100,
             data: vec![0xaa],

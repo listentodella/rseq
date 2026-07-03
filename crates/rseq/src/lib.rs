@@ -25,6 +25,21 @@ pub use chip::{
 
 type ParserExtra<'tok, 'src> = extra::Err<Rich<'tok, Token<'src>>>;
 
+pub const REPORT_KIND_FIFO_RAW: u32 = 0x01;
+pub const REPORT_KIND_AMD: u32 = 0x02;
+pub const REPORT_KIND_SMD: u32 = 0x03;
+pub const REPORT_KIND_DRDY: u32 = 0x04;
+
+pub fn report_kind_name(kind: u32) -> Option<&'static str> {
+    match kind {
+        REPORT_KIND_FIFO_RAW => Some("FIFO_RAW"),
+        REPORT_KIND_AMD => Some("AMD"),
+        REPORT_KIND_SMD => Some("SMD"),
+        REPORT_KIND_DRDY => Some("DRDY"),
+        _ => None,
+    }
+}
+
 #[derive(Logos, Clone, PartialEq, Debug)]
 enum Token<'a> {
     Error,
@@ -54,6 +69,8 @@ enum Token<'a> {
     RepeatMacro,
     #[token("print!")]
     PrintMacro,
+    #[token("report!")]
+    ReportMacro,
     #[token("wait!")]
     WaitMacro,
     #[token("if")]
@@ -171,6 +188,7 @@ impl fmt::Display for Token<'_> {
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
             Self::PrintMacro => write!(f, "print!"),
+            Self::ReportMacro => write!(f, "report!"),
             Self::WaitMacro => write!(f, "wait!"),
             Self::If => write!(f, "if"),
             Self::Else => write!(f, "else"),
@@ -271,6 +289,12 @@ pub enum Stmt {
     Print {
         msg: String,
         vars: Vec<String>,
+    },
+    /// `report!(kind, expr...)`：结构化数据上报。kind 为事件类型编号或
+    /// 内置事件类型名（如 FIFO_RAW），参数可混合 u32 表达式与 raw data 变量。
+    Report {
+        kind: Value,
+        values: Vec<Expr>,
     },
     /// `wait!(pin[, timeout_ms])`：阻塞至该中断引脚发生边沿（或超时），
     /// 紧随其后的内联派发序列读中断状态快照、按 `irq!(pin)` 各 arm 的
@@ -699,6 +723,28 @@ where
         .then_ignore(just(Token::Semicolon).or_not())
         .map(|(msg, vars)| Stmt::Print { msg, vars });
 
+    let report_stmt = just(Token::ReportMacro)
+        .ignore_then(
+            select! {
+                Token::Number(n) => Value::Number(n),
+                Token::Ident(s) => Value::Ident(s.to_string()),
+            }
+            .then(
+                just(Token::Comma)
+                    .ignore_then(
+                        expr()
+                            .separated_by(just(Token::Comma))
+                            .allow_trailing()
+                            .collect::<Vec<_>>(),
+                    )
+                    .or_not()
+                    .map(|v| v.unwrap_or_default()),
+            )
+            .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(kind, values)| Stmt::Report { kind, values });
+
     // wait!(pin[, timeout_ms])：阻塞等中断边沿。timeout 缺省 4000ms。
     let wait_stmt = just(Token::WaitMacro)
         .ignore_then(
@@ -720,6 +766,7 @@ where
         .or(write_stmt)
         .or(read_stmt)
         .or(print_stmt)
+        .or(report_stmt)
         .or(wait_stmt)
 }
 
@@ -919,6 +966,14 @@ pub enum CompileError {
     WaitWithoutIrq(String),
     /// 中断状态快照宽于 4 字节，内联派发装不进单个 u32 寄存器。
     SnapshotTooWide(u32),
+    /// `report!` 单条事件携带过多参数。
+    ReportTooManyValues(usize),
+    /// 这里需要 u32 标量变量，但拿到了 raw buffer 变量。
+    ExpectedScalar(String),
+    /// VM 第一版仅提供一个 raw data buffer slot。
+    BufferOverflow,
+    /// 未知的 `report!` 类型名。
+    UnknownReportKind(String),
 }
 
 impl fmt::Display for CompileError {
@@ -951,8 +1006,29 @@ impl fmt::Display for CompileError {
                     "interrupt status snapshot is {w} bytes wide, >4 not supported by inline dispatch"
                 )
             }
+            Self::ReportTooManyValues(n) => {
+                write!(f, "report! supports at most 8 args, got {n}")
+            }
+            Self::ExpectedScalar(name) => {
+                write!(f, "'{name}' is raw data; use it only as a report! argument")
+            }
+            Self::BufferOverflow => {
+                write!(
+                    f,
+                    "only one raw data buffer variable is supported in this VM profile"
+                )
+            }
+            Self::UnknownReportKind(name) => {
+                write!(f, "unknown report kind '{name}'")
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarBinding {
+    Reg(u8),
+    Buf(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1090,6 +1166,7 @@ pub fn compile_program(
     let mut bytecode = Vec::new();
     let mut vars = HashMap::new();
     let mut next_reg: u16 = 0;
+    let mut next_buf: u8 = 0;
     let mut irqs = Vec::new();
     compile_into(
         program,
@@ -1098,6 +1175,7 @@ pub fn compile_program(
         &mut bytecode,
         &mut vars,
         &mut next_reg,
+        &mut next_buf,
         &mut irqs,
         &mut HashMap::new(),
     )?;
@@ -1154,6 +1232,7 @@ pub fn compile_program_units(
     let mut main_bytecode = Vec::new();
     let mut vars = HashMap::new();
     let mut next_reg: u16 = 0;
+    let mut next_buf: u8 = 0;
     let mut irqs = Vec::new();
     let mut irq_bytecodes: HashMap<String, Vec<u8>> = HashMap::new();
 
@@ -1165,6 +1244,7 @@ pub fn compile_program_units(
             &mut main_bytecode,
             &mut vars,
             &mut next_reg,
+            &mut next_buf,
             &mut irqs,
             &mut irq_bytecodes,
         )
@@ -1200,8 +1280,9 @@ fn compile_into(
     base_dir: Option<&Path>,
     registry: &mut ChipRegistry,
     bytecode: &mut Vec<u8>,
-    vars: &mut HashMap<String, u8>,
+    vars: &mut HashMap<String, VarBinding>,
     next_reg: &mut u16,
+    next_buf: &mut u8,
     irqs: &mut Vec<IrqTemplate>,
     _irq_bytecodes: &mut HashMap<String, Vec<u8>>,
 ) -> Result<(), CompileDiagnostic> {
@@ -1218,7 +1299,7 @@ fn compile_into(
 
     // 第二遍：编译语句
     for (idx, stmt) in program.stmts.iter().enumerate() {
-        if let Err(error) = compile_stmt(stmt, registry, vars, next_reg, bytecode, irqs) {
+        if let Err(error) = compile_stmt(stmt, registry, vars, next_reg, next_buf, bytecode, irqs) {
             return Err(compile_diagnostic(program, idx, error));
         }
     }
@@ -1229,8 +1310,9 @@ fn compile_into(
 fn compile_stmt(
     stmt: &Stmt,
     registry: &ChipRegistry,
-    vars: &mut HashMap<String, u8>,
+    vars: &mut HashMap<String, VarBinding>,
     next_reg: &mut u16,
+    next_buf: &mut u8,
     bytecode: &mut Vec<u8>,
     irqs: &mut Vec<IrqTemplate>,
 ) -> Result<(), CompileError> {
@@ -1242,11 +1324,26 @@ fn compile_stmt(
             irqs.push(tmpl);
         }
         Stmt::Wait { pin, timeout_ms } => {
-            compile_wait(pin, *timeout_ms, irqs, registry, vars, next_reg, bytecode)?;
+            compile_wait(
+                pin,
+                *timeout_ms,
+                irqs,
+                registry,
+                vars,
+                next_reg,
+                next_buf,
+                bytecode,
+            )?;
         }
         Stmt::Let { name, expr } => {
-            let dst = compile_expr(expr, registry, vars, next_reg, bytecode)?;
-            vars.insert(name.clone(), dst);
+            if let Some(buf) = compile_read_buffer_binding(
+                name, expr, registry, vars, next_reg, next_buf, bytecode,
+            )? {
+                vars.insert(name.clone(), VarBinding::Buf(buf));
+            } else {
+                let dst = compile_expr(expr, registry, vars, next_reg, bytecode)?;
+                vars.insert(name.clone(), VarBinding::Reg(dst));
+            }
         }
         Stmt::Write {
             addr,
@@ -1285,9 +1382,7 @@ fn compile_stmt(
             // 写入一个由 let 绑定的变量：变量的值在运行期保存在寄存器里，
             // 因此发射 WriteVar，由 VM 在执行时把寄存器的低字节写入总线。
             if let Value::Ident(name) = val {
-                let src = *vars
-                    .get(name)
-                    .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
+                let src = require_reg(vars, name)?;
                 // 与标量 `write!(addr, n)` 保持一致：默认写 1 字节（低 8 位）。
                 let len: u32 = 1;
                 bytecode.push(rseq_vm::Opcode::WriteVar as u8);
@@ -1357,7 +1452,7 @@ fn compile_stmt(
             // 与既有 `let` 语义一致。body 只编译一份，VM 靠 Loop 计数回跳复用。
             let mut body_buf: Vec<u8> = Vec::new();
             for s in body {
-                compile_stmt(s, registry, vars, next_reg, &mut body_buf, irqs)?;
+                compile_stmt(s, registry, vars, next_reg, next_buf, &mut body_buf, irqs)?;
             }
             if body_buf.is_empty() {
                 return Ok(());
@@ -1388,9 +1483,7 @@ fn compile_stmt(
                     // 运行时变量：发射 ReadDyn，按寄存器中的长度读取并丢弃结果。
                     // 这用于 FIFO drain：先 `let fifo_len = read!(STATUS...)`，
                     // 再 `read!(FIFO_DATA, fifo_len)` 精确读取当前 FIFO 字节数。
-                    let len_reg = *vars
-                        .get(name)
-                        .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
+                    let len_reg = require_reg(vars, name)?;
                     bytecode.push(rseq_vm::Opcode::ReadDyn as u8);
                     bytecode.extend_from_slice(&addr.to_le_bytes());
                     bytecode.extend_from_slice(&delay.to_le_bytes());
@@ -1405,11 +1498,11 @@ fn compile_stmt(
             // 体先编译进临时缓冲（共享外层 vars/next_reg/registry），长度已知后再发射跳转。
             let mut then_buf: Vec<u8> = Vec::new();
             for s in then {
-                compile_stmt(s, registry, vars, next_reg, &mut then_buf, irqs)?;
+                compile_stmt(s, registry, vars, next_reg, next_buf, &mut then_buf, irqs)?;
             }
             let mut else_buf: Vec<u8> = Vec::new();
             for s in else_ {
-                compile_stmt(s, registry, vars, next_reg, &mut else_buf, irqs)?;
+                compile_stmt(s, registry, vars, next_reg, next_buf, &mut else_buf, irqs)?;
             }
 
             // Jump 指令长度 = 操作码(1) + i32 偏移(4)。
@@ -1458,13 +1551,36 @@ fn compile_stmt(
                 bytecode.push(rseq_vm::Opcode::LogVar as u8);
                 bytecode.push(pvars.len() as u8);
                 for name in pvars {
-                    let reg = *vars
-                        .get(name)
-                        .ok_or_else(|| CompileError::UndefinedVariable(name.clone()))?;
+                    let reg = require_reg(vars, name)?;
                     bytecode.push(reg);
                 }
                 bytecode.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 bytecode.extend(bytes);
+            }
+        }
+        Stmt::Report { kind, values } => {
+            if values.len() > 8 {
+                return Err(CompileError::ReportTooManyValues(values.len()));
+            }
+            let kind = resolve_report_kind(kind)?;
+            let mut args = Vec::with_capacity(values.len());
+            for value in values {
+                if let Expr::Ident(name) = value {
+                    if let Some(VarBinding::Buf(buf)) = vars.get(name) {
+                        args.push((rseq_vm::REPORT_ARG_BYTES, *buf));
+                        continue;
+                    }
+                }
+                let reg = compile_expr(value, registry, vars, next_reg, bytecode)?;
+                args.push((rseq_vm::REPORT_ARG_U32, reg));
+            }
+
+            bytecode.push(rseq_vm::Opcode::Report as u8);
+            bytecode.extend_from_slice(&kind.to_le_bytes());
+            bytecode.push(args.len() as u8);
+            for (tag, idx) in args {
+                bytecode.push(tag);
+                bytecode.push(idx);
             }
         }
     }
@@ -1582,8 +1698,9 @@ fn compile_wait(
     timeout_ms: u32,
     irqs: &[IrqTemplate],
     registry: &ChipRegistry,
-    vars: &mut HashMap<String, u8>,
+    vars: &mut HashMap<String, VarBinding>,
     next_reg: &mut u16,
+    next_buf: &mut u8,
     bytecode: &mut Vec<u8>,
 ) -> Result<(), CompileError> {
     let tmpl = irqs
@@ -1627,7 +1744,15 @@ fn compile_wait(
         // 量出长度后再发 JumpIfZero。
         let mut body_buf: Vec<u8> = Vec::new();
         for s in &arm.body {
-            compile_stmt(s, registry, vars, next_reg, &mut body_buf, &mut Vec::new())?;
+            compile_stmt(
+                s,
+                registry,
+                vars,
+                next_reg,
+                next_buf,
+                &mut body_buf,
+                &mut Vec::new(),
+            )?;
         }
 
         // JumpIfZero r_test, +body_len
@@ -1659,6 +1784,7 @@ fn compile_irq_segment(
 ) -> Result<(), SourceDiagnostic> {
     let mut vars = HashMap::new();
     let mut next_reg: u16 = 0;
+    let mut next_buf: u8 = 0;
 
     // ReadVar snapshot_addr, snapshot_len, delay=0 -> r_snap
     let r_snap = alloc_reg(&mut next_reg).map_err(|e| SourceDiagnostic {
@@ -1707,6 +1833,7 @@ fn compile_irq_segment(
                 registry,
                 &mut vars,
                 &mut next_reg,
+                &mut next_buf,
                 &mut body_buf,
                 &mut Vec::new(),
             )
@@ -1741,11 +1868,103 @@ fn alloc_reg(next_reg: &mut u16) -> Result<u8, CompileError> {
     Ok(reg)
 }
 
+fn alloc_buf(next_buf: &mut u8) -> Result<u8, CompileError> {
+    if *next_buf >= rseq_vm::DATA_BUF_COUNT as u8 {
+        return Err(CompileError::BufferOverflow);
+    }
+    let buf = *next_buf;
+    *next_buf += 1;
+    Ok(buf)
+}
+
+fn require_reg(vars: &HashMap<String, VarBinding>, name: &str) -> Result<u8, CompileError> {
+    match vars.get(name) {
+        Some(VarBinding::Reg(reg)) => Ok(*reg),
+        Some(VarBinding::Buf(_)) => Err(CompileError::ExpectedScalar(name.to_string())),
+        None => Err(CompileError::UndefinedVariable(name.to_string())),
+    }
+}
+
+fn resolve_report_kind(kind: &Value) -> Result<u32, CompileError> {
+    match kind {
+        Value::Number(n) => Ok(*n),
+        Value::Ident(name) => match name.as_str() {
+            "FIFO_RAW" => Ok(REPORT_KIND_FIFO_RAW),
+            "AMD" => Ok(REPORT_KIND_AMD),
+            "SMD" => Ok(REPORT_KIND_SMD),
+            "DRDY" => Ok(REPORT_KIND_DRDY),
+            _ => Err(CompileError::UnknownReportKind(name.clone())),
+        },
+        _ => Err(CompileError::UnsupportedValue),
+    }
+}
+
+fn compile_len_to_reg(
+    len: &Value,
+    vars: &HashMap<String, VarBinding>,
+    next_reg: &mut u16,
+    bytecode: &mut Vec<u8>,
+) -> Result<Option<u8>, CompileError> {
+    match len {
+        Value::Number(n) if *n > 4 => {
+            if *n > rseq_vm::DATA_BUF_LEN as u32 {
+                return Err(CompileError::UnsupportedValue);
+            }
+            let reg = alloc_reg(next_reg)?;
+            bytecode.push(rseq_vm::Opcode::LoadConst as u8);
+            bytecode.push(reg);
+            bytecode.extend_from_slice(&n.to_le_bytes());
+            Ok(Some(reg))
+        }
+        Value::Number(_) => Ok(None),
+        Value::Ident(name) => Ok(Some(require_reg(vars, name)?)),
+        _ => Err(CompileError::UnsupportedValue),
+    }
+}
+
+fn compile_read_buffer_binding(
+    name: &str,
+    expr: &Expr,
+    registry: &ChipRegistry,
+    vars: &mut HashMap<String, VarBinding>,
+    next_reg: &mut u16,
+    next_buf: &mut u8,
+    bytecode: &mut Vec<u8>,
+) -> Result<Option<u8>, CompileError> {
+    let Expr::Read {
+        addr,
+        len,
+        delay_us,
+    } = expr
+    else {
+        return Ok(None);
+    };
+
+    let Some(len_reg) = compile_len_to_reg(len, vars, next_reg, bytecode)? else {
+        return Ok(None);
+    };
+
+    let addr = resolve_u32(addr, registry)?;
+    let delay = delay_us.unwrap_or(0);
+    let buf = match vars.get(name) {
+        Some(VarBinding::Buf(existing)) => *existing,
+        _ => alloc_buf(next_buf)?,
+    };
+
+    bytecode.push(rseq_vm::Opcode::ReadBuf as u8);
+    bytecode.extend_from_slice(&addr.to_le_bytes());
+    bytecode.extend_from_slice(&delay.to_le_bytes());
+    bytecode.push(len_reg);
+    bytecode.push(buf);
+
+    Ok(Some(buf))
+}
+
 /// 将表达式编译为字节码，返回存放结果的寄存器索引。
 fn compile_expr(
     expr: &Expr,
     registry: &ChipRegistry,
-    vars: &mut HashMap<String, u8>,
+    vars: &mut HashMap<String, VarBinding>,
     next_reg: &mut u16,
     bytecode: &mut Vec<u8>,
 ) -> Result<u8, CompileError> {
@@ -1757,10 +1976,7 @@ fn compile_expr(
             bytecode.extend_from_slice(&n.to_le_bytes());
             Ok(dst)
         }
-        Expr::Ident(name) => vars
-            .get(name)
-            .copied()
-            .ok_or_else(|| CompileError::UndefinedVariable(name.clone())),
+        Expr::Ident(name) => require_reg(vars, name),
         Expr::Read {
             addr,
             len,
@@ -1862,6 +2078,15 @@ fn compile_help(error: &CompileError) -> Option<String> {
         CompileError::RegisterOverflow => Some(
             "the program uses too many live values; reduce the number of let bindings".to_string(),
         ),
+        CompileError::ExpectedScalar(name) => Some(format!(
+            "`{name}` holds raw bytes; pass it to report! directly instead of using it in arithmetic, print!, write!, or length expressions"
+        )),
+        CompileError::BufferOverflow => Some(
+            "reuse the same raw data variable name, or report the current buffer before reading another raw payload".to_string(),
+        ),
+        CompileError::UnknownReportKind(name) => Some(format!(
+            "use a numeric kind like 0x01, or one of the built-in kind names FIFO_RAW, AMD, SMD, or DRDY; '{name}' is not defined"
+        )),
         CompileError::UnknownEvent(name) => Some(format!(
             "'{name}' is not a known interrupt event; use an `event:` name declared on an interrupt_status field in the chip YAML"
         )),
@@ -2172,6 +2397,37 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                     }
                 ));
             }
+            Some(rseq_vm::Opcode::Report) => {
+                pc += 1;
+                let kind = read_u32(bytecode, &mut pc)?;
+                if pc >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let n = bytecode[pc] as usize;
+                pc += 1;
+                if n > 8 || pc + n * 2 > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let tag = bytecode[pc];
+                    let idx = bytecode[pc + 1];
+                    pc += 2;
+                    match tag {
+                        rseq_vm::REPORT_ARG_U32 => args.push(format!("r{idx}")),
+                        rseq_vm::REPORT_ARG_BYTES => args.push(format!("buf{idx}")),
+                        _ => return Err(DecompileError::InvalidOpcode),
+                    }
+                }
+                let kind_expr = report_kind_name(kind)
+                    .map_or_else(|| format!("0x{kind:x}"), |name| name.to_string());
+                output.push_str(&format!("report!({kind_expr}"));
+                if !args.is_empty() {
+                    output.push_str(", ");
+                    output.push_str(&args.join(", "));
+                }
+                output.push_str(");\n");
+            }
             Some(rseq_vm::Opcode::WaitIrq) => {
                 pc += 1;
                 if pc + 4 >= bytecode.len() {
@@ -2213,6 +2469,22 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                 }
                 output.push_str(");\n");
             }
+            Some(rseq_vm::Opcode::ReadBuf) => {
+                pc += 1;
+                let addr = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                if pc + 1 >= bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let len_src = bytecode[pc];
+                let dst_buf = bytecode[pc + 1];
+                pc += 2;
+                output.push_str(&format!("// buf{dst_buf} = read!(0x{addr:x}, r{len_src}"));
+                if delay > 0 {
+                    output.push_str(&format!(", {delay}"));
+                }
+                output.push_str(");\n");
+            }
             Some(rseq_vm::Opcode::UpdateVar) => {
                 return Err(DecompileError::InvalidOpcode);
             }
@@ -2234,6 +2506,7 @@ mod tests {
         mem: HashMap<u32, u8>,
         writes: Vec<(u32, Vec<u8>)>,
         logs: Vec<String>,
+        reports: Vec<(u32, Vec<ReportArgOwned>)>,
     }
 
     impl MapBus {
@@ -2242,6 +2515,7 @@ mod tests {
                 mem: HashMap::new(),
                 writes: Vec::new(),
                 logs: Vec::new(),
+                reports: Vec::new(),
             }
         }
     }
@@ -2267,6 +2541,28 @@ mod tests {
             self.logs.push(msg.to_string());
             Ok(())
         }
+        fn report(
+            &mut self,
+            kind: u32,
+            args: &[rseq_vm::ReportArg<'_>],
+        ) -> Result<(), rseq_vm::BusError> {
+            self.reports.push((
+                kind,
+                args.iter()
+                    .map(|arg| match arg {
+                        rseq_vm::ReportArg::U32(v) => ReportArgOwned::U32(*v),
+                        rseq_vm::ReportArg::Bytes(bytes) => ReportArgOwned::Bytes(bytes.to_vec()),
+                    })
+                    .collect(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ReportArgOwned {
+        U32(u32),
+        Bytes(Vec<u8>),
     }
 
     fn qmi_base() -> std::path::PathBuf {
@@ -3554,6 +3850,74 @@ mod tests {
         let mut bus = MapBus::new();
         rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
         assert_eq!(bus.logs, vec!["a=42 b=0xaa".to_string()]);
+    }
+
+    // ── report! / raw buffer ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_report_fifo_raw() {
+        let src = "let fifo_len = 3; let data = read!(0x20, fifo_len); report!(FIFO_RAW, fifo_len, data);";
+        let program = parse(src).unwrap();
+        match &program.stmts[2] {
+            Stmt::Report { kind, values } => {
+                assert_eq!(kind, &Value::Ident("FIFO_RAW".to_string()));
+                assert_eq!(values.len(), 2);
+            }
+            _ => panic!("expected Report"),
+        }
+    }
+
+    #[test]
+    fn test_report_fifo_raw_compiles_read_buf() {
+        let src = "let fifo_len = 3; let data = read!(0x20, fifo_len); report!(FIFO_RAW, fifo_len, data);";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        assert!(
+            bc.iter().any(|&b| b == rseq_vm::Opcode::ReadBuf as u8),
+            "bytecode: {bc:02x?}"
+        );
+        assert!(
+            bc.iter().any(|&b| b == rseq_vm::Opcode::Report as u8),
+            "bytecode: {bc:02x?}"
+        );
+    }
+
+    #[test]
+    fn test_report_fifo_raw_runs_with_len_and_bytes() {
+        let src = "let fifo_len = 3; let data = read!(0x20, fifo_len); report!(FIFO_RAW, fifo_len, data);";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x20, 0xaa);
+        bus.mem.insert(0x21, 0xbb);
+        bus.mem.insert(0x22, 0xcc);
+
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(
+            bus.reports,
+            vec![(
+                0x01,
+                vec![
+                    ReportArgOwned::U32(3),
+                    ReportArgOwned::Bytes(vec![0xaa, 0xbb, 0xcc]),
+                ],
+            )]
+        );
+    }
+
+    #[test]
+    fn test_report_reserved_kinds_compile() {
+        let src = "report!(AMD, 1); report!(SMD, 2); report!(DRDY, 3);";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(
+            bus.reports,
+            vec![
+                (REPORT_KIND_AMD, vec![ReportArgOwned::U32(1)]),
+                (REPORT_KIND_SMD, vec![ReportArgOwned::U32(2)]),
+                (REPORT_KIND_DRDY, vec![ReportArgOwned::U32(3)]),
+            ]
+        );
     }
 
     #[test]

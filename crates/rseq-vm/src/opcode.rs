@@ -39,6 +39,9 @@ pub enum Opcode {
     /// 主机/模拟侧默认 no-op 放行，由内联派发序列（紧跟本指令之后的
     /// `ReadVar` 快照 + 按掩码 `And`/`JumpIfZero` 分支）判多状态。
     WaitIrq = 0x29,
+    /// `report!(kind, ...)`：读 `kind:u32` + typed args，调 `Bus::report`
+    /// 上报一条二进制事件。用于 MCU→Host 的结构化数据出口。
+    Report = 0x2A,
     Read = 0x01,
     Write = 0x02,
     Update = 0x03,
@@ -51,8 +54,14 @@ pub enum Opcode {
     /// `read!(addr, len_reg)`：运行时从寄存器读取长度，读取结果丢弃。
     /// 用于 FIFO 这类必须先读长度、再按实际长度 drain 的顺序读寄存器。
     ReadDyn = 0x08,
+    /// `let data = read!(addr, len_reg)`：运行时从寄存器读取长度，把原始字节
+    /// 保存到 VM 的有界数据缓冲，供后续 `report!(..., data)` 上报。
+    ReadBuf = 0x09,
     Return = 0xFF,
 }
+
+pub const REPORT_ARG_U32: u8 = 0x01;
+pub const REPORT_ARG_BYTES: u8 = 0x02;
 
 impl Opcode {
     pub fn from_u8(n: u8) -> Option<Self> {
@@ -83,6 +92,7 @@ impl Opcode {
             0x27 => Some(Self::Log),
             0x28 => Some(Self::LogVar),
             0x29 => Some(Self::WaitIrq),
+            0x2A => Some(Self::Report),
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
             0x03 => Some(Self::Update),
@@ -91,6 +101,7 @@ impl Opcode {
             0x06 => Some(Self::ReadVar),
             0x07 => Some(Self::Loop),
             0x08 => Some(Self::ReadDyn),
+            0x09 => Some(Self::ReadBuf),
             0xFF => Some(Self::Return),
             _ => None,
         }

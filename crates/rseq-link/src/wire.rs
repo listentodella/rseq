@@ -16,9 +16,12 @@ pub const TRACE_OP_DELAY: u8 = 0x03;
 pub const TRACE_OP_LOG: u8 = 0x04;
 /// Trace op:中断等待命中（`wait!`）。
 pub const TRACE_OP_IRQ: u8 = 0x05;
+/// Trace op:结构化上报（`report!`）。
+pub const TRACE_OP_REPORT: u8 = 0x06;
 
-/// Trace 载荷最大长度(op+addr+dlen+data≤4096)。
-pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 2 + 4096;
+/// Trace 载荷最大长度。R/W 为 4103；`report!` 可携带 1 个 4096B raw
+/// buffer 加最多 7 个 u32 参数，因此上限为 4140。
+pub const MAX_TRACE_PAYLOAD: usize = 1 + 4 + 1 + 7 * (1 + 4) + (1 + 2 + 4096);
 
 /// 解码后的 Trace 记录,载荷切片借用自帧缓冲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +45,53 @@ pub enum TraceRef<'a> {
     Irq {
         pin: u8,
     },
+    /// `report!(kind, ...)` 结构化上报，参数可混合 u32 与 raw bytes。
+    Report {
+        kind: u32,
+        args: ReportArgs<'a>,
+    },
+}
+
+// ── report! Trace 载荷 ───────────────────────────────────────
+pub const REPORT_ARG_U32: u8 = 0x01;
+pub const REPORT_ARG_BYTES: u8 = 0x02;
+/// 单条 `report!` 最多携带的参数数量。
+pub const MAX_REPORT_ARGS: usize = 8;
+/// 单条 `report!` 最多携带 1 个 raw bytes 参数。
+pub const MAX_REPORT_RAW_ARGS: usize = 1;
+pub const MAX_REPORT_RAW_BYTES: usize = 4096;
+/// 当前 report payload 最大长度：op+kind+argc + 7*u32 args + 1*raw arg。
+pub const MAX_REPORT_PAYLOAD: usize = 1 + 4 + 1 + 7 * (1 + 4) + (1 + 2 + MAX_REPORT_RAW_BYTES);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportArgRef<'a> {
+    U32(u32),
+    Bytes(&'a [u8]),
+}
+
+/// 解码后的 `report!` 参数集合，固定数组避免 `no_std` 下分配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportArgs<'a> {
+    args: [ReportArgRef<'a>; MAX_REPORT_ARGS],
+    len: u8,
+}
+
+impl<'a> ReportArgs<'a> {
+    pub const fn new(args: [ReportArgRef<'a>; MAX_REPORT_ARGS], len: u8) -> Self {
+        Self { args, len }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[ReportArgRef<'a>] {
+        &self.args[..self.len()]
+    }
 }
 
 /// 在 `out` 中构造一条完整的 Read/Write Trace 帧(含帧头与 CRC),返回总字节数。
@@ -134,6 +184,71 @@ pub fn encode_trace_irq(out: &mut [u8], pin: u8) -> usize {
     total
 }
 
+/// 在 `out` 中构造一条 Report Trace 帧（`report!`），返回总字节数。
+/// 载荷 = `op + kind:u32 + argc:u8 + typed args...`。
+pub fn encode_trace_report(out: &mut [u8], kind: u32, args: &[ReportArgRef<'_>]) -> usize {
+    assert!(
+        args.len() <= MAX_REPORT_ARGS,
+        "report args exceed MAX_REPORT_ARGS"
+    );
+    let mut payload_len = 1 + 4 + 1;
+    let mut raw_args = 0usize;
+    for arg in args {
+        match arg {
+            ReportArgRef::U32(_) => payload_len += 1 + 4,
+            ReportArgRef::Bytes(bytes) => {
+                raw_args += 1;
+                assert!(
+                    raw_args <= MAX_REPORT_RAW_ARGS,
+                    "report supports at most one raw bytes arg"
+                );
+                assert!(
+                    bytes.len() <= MAX_REPORT_RAW_BYTES,
+                    "report raw bytes exceed MAX_REPORT_RAW_BYTES"
+                );
+                payload_len += 1 + 2 + bytes.len();
+            }
+        }
+    }
+    let total = OVERHEAD + payload_len;
+    assert!(
+        out.len() >= total,
+        "trace report buffer too small: need {total}, have {}",
+        out.len()
+    );
+    out[0] = 0x55;
+    out[1] = 0xAA;
+    out[2] = FrameType::Trace as u8;
+    out[3] = (payload_len & 0xFF) as u8;
+    out[4] = (payload_len >> 8) as u8;
+    out[5] = TRACE_OP_REPORT;
+    out[6..10].copy_from_slice(&kind.to_le_bytes());
+    out[10] = args.len() as u8;
+    let mut pos = 11;
+    for arg in args {
+        match arg {
+            ReportArgRef::U32(value) => {
+                out[pos] = REPORT_ARG_U32;
+                pos += 1;
+                out[pos..pos + 4].copy_from_slice(&value.to_le_bytes());
+                pos += 4;
+            }
+            ReportArgRef::Bytes(bytes) => {
+                out[pos] = REPORT_ARG_BYTES;
+                pos += 1;
+                let len = bytes.len() as u16;
+                out[pos..pos + 2].copy_from_slice(&len.to_le_bytes());
+                pos += 2;
+                out[pos..pos + bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+            }
+        }
+    }
+    let crc = crate::crc32::crc32(&out[2..5 + payload_len]);
+    out[5 + payload_len..5 + payload_len + 4].copy_from_slice(&crc.to_le_bytes());
+    total
+}
+
 /// 从 Trace 载荷解码为 [`TraceRef`]。布局不合法返回 `None`。
 pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
     if payload.is_empty() {
@@ -180,6 +295,61 @@ pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
                 return None;
             }
             Some(TraceRef::Irq { pin: payload[1] })
+        }
+        TRACE_OP_REPORT => {
+            if payload.len() < 1 + 4 + 1 {
+                return None;
+            }
+            let kind = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let count = payload[5] as usize;
+            if count > MAX_REPORT_ARGS {
+                return None;
+            }
+            let mut args = [ReportArgRef::U32(0); MAX_REPORT_ARGS];
+            let mut raw_args = 0usize;
+            let mut pos = 6;
+            for slot in args.iter_mut().take(count) {
+                if pos >= payload.len() {
+                    return None;
+                }
+                match payload[pos] {
+                    REPORT_ARG_U32 => {
+                        pos += 1;
+                        if pos + 4 > payload.len() {
+                            return None;
+                        }
+                        *slot = ReportArgRef::U32(u32::from_le_bytes([
+                            payload[pos],
+                            payload[pos + 1],
+                            payload[pos + 2],
+                            payload[pos + 3],
+                        ]));
+                        pos += 4;
+                    }
+                    REPORT_ARG_BYTES => {
+                        raw_args += 1;
+                        if raw_args > MAX_REPORT_RAW_ARGS {
+                            return None;
+                        }
+                        pos += 1;
+                        if pos + 2 > payload.len() {
+                            return None;
+                        }
+                        let len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+                        pos += 2;
+                        if len > MAX_REPORT_RAW_BYTES || pos + len > payload.len() {
+                            return None;
+                        }
+                        *slot = ReportArgRef::Bytes(&payload[pos..pos + len]);
+                        pos += len;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(TraceRef::Report {
+                kind,
+                args: ReportArgs::new(args, count as u8),
+            })
         }
         _ => None,
     }

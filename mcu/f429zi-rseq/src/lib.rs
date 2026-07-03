@@ -278,7 +278,7 @@ fn send_frame<T: Transport>(t: &mut T, ty: FrameType, payload: &[u8]) -> Result<
     t.write(&buf[..n])
 }
 
-fn run_pending_irqs<B: Bus>(bus: &mut B) {
+fn run_pending_irqs<B: Bus, T: Transport>(bus: &mut B, transport: &mut T) {
     for pin_id in 0..MAX_IRQ_HANDLERS {
         if !IRQ_PENDING[pin_id].swap(false, Ordering::Acquire) {
             continue;
@@ -286,7 +286,8 @@ fn run_pending_irqs<B: Bus>(bus: &mut B) {
 
         unsafe {
             if let Some(handler) = &IRQ_HANDLERS[pin_id] {
-                if let Err(e) = Vm::new(bus, &handler.bytecode).run() {
+                let mut tracing = TracingBus::new(&mut *bus, &mut *transport);
+                if let Err(e) = Vm::new(&mut tracing, &handler.bytecode).run() {
                     printk(&alloc::format!("rseq: irq handler error: {:?}\n", e));
                 }
             }
@@ -311,7 +312,7 @@ fn mcu_loop<B: Bus, T: Transport>(
     printk("rseq: main loop start\n");
 
     loop {
-        run_pending_irqs(&mut bus);
+        run_pending_irqs(&mut bus, &mut transport);
 
         // Pull the next complete frame, responding to `stop` while waiting.
         let (ty, payload) = loop {
@@ -320,7 +321,7 @@ fn mcu_loop<B: Bus, T: Transport>(
                 return Ok(());
             }
 
-            run_pending_irqs(&mut bus);
+            run_pending_irqs(&mut bus, &mut transport);
 
             if let Some(f) = inbox.pop_front() {
                 break f;

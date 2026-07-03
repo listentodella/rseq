@@ -85,3 +85,54 @@ cargo run --package rseq-mcu-sim --features serial -- --serial /dev/ttyUSB1 1152
 | `rseq-mcu-sim` | 进程内模拟 MCU(`mcu_loop` + `--self-test`), 供联调与集成测试 |
 
 真实 MCU 移植时, 把 `rseq-link` 的 `SimBus` 换成 HAL 的 `Bus` 实现、`Transport` 换成 UART, `mcu_loop` 的协议逻辑无需改动.
+
+## 中断命令
+
+`irq!(pin) { on(event) { ... } }` 声明中断事件处理块, `wait!(pin, timeout_ms)` 在字节码中等待一次中断并内联派发:
+
+```rseq
+chip!("qmi8660.yaml");
+
+irq!(int1) {
+    on(fifo_watermark) {
+        write!(UI.ENCTL, 0x03);
+    }
+}
+
+wait!(int1, 10000);
+```
+
+主机模拟可用 `--fire` 预置中断状态快照:
+
+```bash
+cargo run -p rseq-cli -- -f examples/qmi8660_irq.rseq --execute --fire int1=0x40
+```
+
+F429ZI 固件中 `int1` 映射为 PB8 active-high。真机执行到 `wait!` 时 Zephyr GPIO ISR 只唤醒信号量, VM 在线程上下文继续运行, 然后读取 `0x58` 中断状态快照并执行匹配的 `on(...)` 代码。
+
+## FIFO 上报与解析
+
+中断处理块可以读取 FIFO 长度和 FIFO 数据后, 用 `report!(FIFO_RAW, fifo_len, data)` 主动上报原始 FIFO bytes。CLI 端通过 `report_format!` 解析这些 bytes, 支持按 DSL 声明的字段顺序打印原始 `i16` 或换算后的物理量。
+
+```rseq
+report_format!(FIFO_RAW, i16_le, {
+    fields: [gx, gy, gz, ax, ay, az],
+    gyro_fields: [gx, gy, gz],
+    accel_fields: [ax, ay, az],
+    accel_fs_g: 16,
+    gyro_fs_dps: 4096,
+    output: physical_f32,
+});
+```
+
+只监听已运行 MCU 上报数据:
+
+```bash
+cargo run -q -p rseq-cli --features serial -- \
+  -f examples/qmi8660_fifo.rseq \
+  --watch \
+  --serial /dev/cu.usbmodem314201 \
+  --baud 115200
+```
+
+更完整的 FIFO report 语法、字段顺序、`physical_f32`/`raw_i16` 输出和 `frame_id`/`timestamp` 掉帧检查说明见 [SPEC-FIFO-REPORT.md](SPEC-FIFO-REPORT.md)。

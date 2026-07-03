@@ -6,7 +6,8 @@
  *    bring-up diagnostics (logs go to USART3 / ST-Link VCP).
  *  - rust_uart_init/read/write: the CDC-ACM UART (RX irq→K_MSGQ, blocking;
  *    TX uart_poll_out under a mutex) used as the rseq-link Transport.
- *  - rust_kernel_delay_us/sleep_ms: timing for the Bus::delay_us path.
+ *  - rust_uptime_us/kernel_delay_us/sleep_ms: timing for report metadata and
+ *    the Bus::delay_us path.
  *  - rust_printk: raw console output from Rust (bypasses the log backend).
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -220,6 +221,11 @@ int rust_uart_write(const uint8_t *data, size_t len)
 void rust_kernel_sleep_ms(uint32_t ms)
 {
 	k_sleep(K_MSEC(ms));
+}
+
+uint64_t rust_uptime_us(void)
+{
+	return k_cyc_to_us_floor64(k_cycle_get_64());
 }
 
 void rust_kernel_delay_us(uint32_t us)

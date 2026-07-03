@@ -3,6 +3,7 @@ use rseq::{
     CompiledProgram, Manifest, ProgramUnit, compile_program_units, decompile, parse_detailed,
 };
 use rseq_vm::Vm;
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 pub mod mock;
@@ -499,11 +500,11 @@ fn run_watch(path: &str, baud: u32) {
 
 #[cfg(feature = "serial")]
 fn observe_reports_forever<T: rseq_link::Transport>(host: &mut rseq::link::HostLink<T>) {
-    let mut seq: u64 = 0;
+    let mut state = ReportObserveState::default();
     loop {
         match host.observe_next_trace(std::time::Duration::from_secs(1)) {
             Ok(Some(op)) => {
-                print_observed_report(&op, &mut seq);
+                print_observed_report(&op, &mut state);
             }
             Ok(None) => {}
             Err(e) => {
@@ -515,19 +516,93 @@ fn observe_reports_forever<T: rseq_link::Transport>(host: &mut rseq::link::HostL
 }
 
 #[cfg(feature = "serial")]
-fn print_observed_report(op: &rseq::trace::BusOp, seq: &mut u64) {
-    if let rseq::trace::BusOp::Report { kind, args } = op {
-        *seq += 1;
+#[derive(Default)]
+struct ReportObserveState {
+    seq: u64,
+    last_frame_id: Option<u32>,
+    last_timestamp_us: Option<u64>,
+    next_fifo_sample_index: u64,
+}
+
+#[cfg(feature = "serial")]
+struct ReportObserveInfo {
+    seq: u64,
+    meta: Option<rseq::trace::ReportMeta>,
+    frame_gap: Option<u32>,
+    frame_reset: Option<(u32, u32)>,
+    dt_us: Option<u64>,
+    timestamp_rewind: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "serial")]
+impl ReportObserveState {
+    fn next(&mut self, meta: Option<rseq::trace::ReportMeta>) -> ReportObserveInfo {
+        self.seq += 1;
+
+        let mut frame_gap = None;
+        let mut frame_reset = None;
+        let mut dt_us = None;
+        let mut timestamp_rewind = None;
+
+        if let Some(meta) = meta {
+            if let Some(prev) = self.last_frame_id {
+                if meta.frame_id == prev.wrapping_add(1) {
+                    // expected path
+                } else if meta.frame_id > prev {
+                    frame_gap = Some(meta.frame_id - prev - 1);
+                } else {
+                    frame_reset = Some((prev, meta.frame_id));
+                }
+            }
+            self.last_frame_id = Some(meta.frame_id);
+
+            if meta.timestamp_valid() {
+                if let Some(prev) = self.last_timestamp_us {
+                    if meta.timestamp_us >= prev {
+                        dt_us = Some(meta.timestamp_us - prev);
+                    } else {
+                        timestamp_rewind = Some((prev, meta.timestamp_us));
+                    }
+                }
+                self.last_timestamp_us = Some(meta.timestamp_us);
+            }
+        }
+
+        ReportObserveInfo {
+            seq: self.seq,
+            meta,
+            frame_gap,
+            frame_reset,
+            dt_us,
+            timestamp_rewind,
+        }
+    }
+
+    fn reserve_fifo_samples(&mut self, count: usize) -> u64 {
+        let base = self.next_fifo_sample_index;
+        self.next_fifo_sample_index = self.next_fifo_sample_index.saturating_add(count as u64);
+        base
+    }
+}
+
+#[cfg(feature = "serial")]
+fn print_observed_report(op: &rseq::trace::BusOp, state: &mut ReportObserveState) {
+    if let rseq::trace::BusOp::Report { meta, kind, args } = op {
+        let info = state.next(*meta);
         if *kind == rseq::REPORT_KIND_FIFO_RAW {
-            print_fifo_raw_report(*seq, args);
+            print_fifo_raw_report(&info, args, state);
         } else {
-            print_named_report(*seq, *kind, args);
+            print_named_report(&info, *kind, args);
         }
     }
 }
 
 #[cfg(feature = "serial")]
-fn print_fifo_raw_report(seq: u64, args: &[rseq::trace::ReportArg]) {
+fn print_fifo_raw_report(
+    info: &ReportObserveInfo,
+    args: &[rseq::trace::ReportArg],
+    state: &mut ReportObserveState,
+) {
     let fifo_len = args.iter().find_map(|arg| match arg {
         rseq::trace::ReportArg::U32(v) => Some(*v),
         _ => None,
@@ -544,29 +619,197 @@ fn print_fifo_raw_report(seq: u64, args: &[rseq::trace::ReportArg]) {
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
+            let decoded = decode_qmi8660_fifo_samples(bytes);
+            let sample_base = state.reserve_fifo_samples(decoded.samples.len());
+            let decode_summary = format_qmi8660_fifo_decode(sample_base, &decoded);
+            let health = format_fifo_raw_health(fifo_len, bytes.len(), &decoded);
             match fifo_len {
                 Some(len) => println!(
-                    "FIFO_RAW #{seq}: fifo_len={len} data_len={} data=[{hex}]",
-                    bytes.len()
+                    "FIFO_RAW #{}{}: fifo_len={len} data_len={} samples={}{} data=[{hex}]",
+                    info.seq,
+                    format_report_watch_meta(info),
+                    bytes.len(),
+                    decoded.samples.len(),
+                    health
                 ),
-                None => println!("FIFO_RAW #{seq}: data_len={} data=[{hex}]", bytes.len()),
+                None => println!(
+                    "FIFO_RAW #{}{}: data_len={} samples={}{} data=[{hex}]",
+                    info.seq,
+                    format_report_watch_meta(info),
+                    bytes.len(),
+                    decoded.samples.len(),
+                    health
+                ),
+            }
+            if !decode_summary.is_empty() {
+                println!("  {decode_summary}");
             }
         }
         None => {
-            println!("FIFO_RAW #{seq}: missing raw bytes arg ({args:?})");
+            println!(
+                "FIFO_RAW #{}{}: missing raw bytes arg ({args:?})",
+                info.seq,
+                format_report_watch_meta(info)
+            );
         }
     }
 }
 
+const QMI8660_FIFO_SAMPLE_BYTES: usize = 12;
+const FIFO_DECODE_PREVIEW_SAMPLES: usize = 8;
+const QMI8660_ACCEL_FULL_SCALE_G: f64 = 16.0;
+const QMI8660_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
+const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
+const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qmi8660FifoSample {
+    gx: i16,
+    gy: i16,
+    gz: i16,
+    ax: i16,
+    ay: i16,
+    az: i16,
+}
+
+impl Qmi8660FifoSample {
+    fn gyro_rad_s(self) -> (f64, f64, f64) {
+        (
+            qmi8660_gyro_raw_to_rad_s(self.gx),
+            qmi8660_gyro_raw_to_rad_s(self.gy),
+            qmi8660_gyro_raw_to_rad_s(self.gz),
+        )
+    }
+
+    fn accel_m_s2(self) -> (f64, f64, f64) {
+        (
+            qmi8660_accel_raw_to_m_s2(self.ax),
+            qmi8660_accel_raw_to_m_s2(self.ay),
+            qmi8660_accel_raw_to_m_s2(self.az),
+        )
+    }
+}
+
+fn qmi8660_accel_raw_to_m_s2(raw: i16) -> f64 {
+    raw as f64 * QMI8660_ACCEL_FULL_SCALE_G * STANDARD_GRAVITY_MPS2 / I16_FULL_SCALE_COUNTS
+}
+
+fn qmi8660_gyro_raw_to_rad_s(raw: i16) -> f64 {
+    raw as f64 * QMI8660_GYRO_FULL_SCALE_DPS / I16_FULL_SCALE_COUNTS * std::f64::consts::PI / 180.0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Qmi8660FifoDecode {
+    samples: Vec<Qmi8660FifoSample>,
+    trailing_bytes: usize,
+}
+
+fn decode_qmi8660_fifo_samples(data: &[u8]) -> Qmi8660FifoDecode {
+    let mut samples = Vec::with_capacity(data.len() / QMI8660_FIFO_SAMPLE_BYTES);
+    for chunk in data.chunks_exact(QMI8660_FIFO_SAMPLE_BYTES) {
+        samples.push(Qmi8660FifoSample {
+            gx: i16::from_le_bytes([chunk[0], chunk[1]]),
+            gy: i16::from_le_bytes([chunk[2], chunk[3]]),
+            gz: i16::from_le_bytes([chunk[4], chunk[5]]),
+            ax: i16::from_le_bytes([chunk[6], chunk[7]]),
+            ay: i16::from_le_bytes([chunk[8], chunk[9]]),
+            az: i16::from_le_bytes([chunk[10], chunk[11]]),
+        });
+    }
+
+    Qmi8660FifoDecode {
+        samples,
+        trailing_bytes: data.len() % QMI8660_FIFO_SAMPLE_BYTES,
+    }
+}
+
+fn format_fifo_raw_health(
+    fifo_len: Option<u32>,
+    data_len: usize,
+    decoded: &Qmi8660FifoDecode,
+) -> String {
+    let mut out = String::new();
+    if let Some(fifo_len) = fifo_len {
+        if fifo_len as usize != data_len {
+            let _ = write!(out, " len_mismatch=status:{fifo_len},data:{data_len}");
+        }
+    }
+    if decoded.trailing_bytes != 0 {
+        let _ = write!(out, " partial_bytes={}", decoded.trailing_bytes);
+    }
+    out
+}
+
+fn format_qmi8660_fifo_decode(sample_base: u64, decoded: &Qmi8660FifoDecode) -> String {
+    if decoded.samples.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("decoded(qmi8660 gyro_rad_s acc_m_s2): ");
+    for (idx, sample) in decoded
+        .samples
+        .iter()
+        .take(FIFO_DECODE_PREVIEW_SAMPLES)
+        .enumerate()
+    {
+        if idx != 0 {
+            out.push_str("; ");
+        }
+        let sample_index = sample_base + idx as u64;
+        let (gx, gy, gz) = sample.gyro_rad_s();
+        let (ax, ay, az) = sample.accel_m_s2();
+        let _ = write!(
+            out,
+            "[{sample_index}] gyro=({gx:.3},{gy:.3},{gz:.3}) acc=({ax:.3},{ay:.3},{az:.3})",
+        );
+    }
+    if decoded.samples.len() > FIFO_DECODE_PREVIEW_SAMPLES {
+        let _ = write!(
+            out,
+            "; ... +{} samples",
+            decoded.samples.len() - FIFO_DECODE_PREVIEW_SAMPLES
+        );
+    }
+    out
+}
+
 #[cfg(feature = "serial")]
-fn print_named_report(seq: u64, kind: u32, args: &[rseq::trace::ReportArg]) {
+fn print_named_report(info: &ReportObserveInfo, kind: u32, args: &[rseq::trace::ReportArg]) {
     let label = report_kind_label(kind);
     let vals = format_report_args(args);
     if vals.is_empty() {
-        println!("{label} #{seq}");
+        println!("{label} #{}{}", info.seq, format_report_watch_meta(info));
     } else {
-        println!("{label} #{seq}: {vals}");
+        println!(
+            "{label} #{}{}: {vals}",
+            info.seq,
+            format_report_watch_meta(info)
+        );
     }
+}
+
+#[cfg(feature = "serial")]
+fn format_report_watch_meta(info: &ReportObserveInfo) -> String {
+    let mut out = String::new();
+    if let Some(meta) = info.meta {
+        let _ = write!(out, " frame_id={}", meta.frame_id);
+        if meta.timestamp_valid() {
+            let _ = write!(out, " ts_us={}", meta.timestamp_us);
+            if let Some(dt) = info.dt_us {
+                let _ = write!(out, " dt_us={dt}");
+            }
+        }
+    }
+    if let Some(gap) = info.frame_gap {
+        let _ = write!(out, " frame_gap={gap}");
+    }
+    if let Some((prev, current)) = info.frame_reset {
+        let _ = write!(out, " frame_id_reset={prev}->{current}");
+    }
+    if let Some((prev, current)) = info.timestamp_rewind {
+        let _ = write!(out, " ts_rewind={prev}->{current}");
+    }
+    out
 }
 
 /// 按执行顺序打印总线操作(MockBus 回放与串口回传 Trace 共用)。
@@ -607,10 +850,14 @@ fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
             rseq::trace::BusOp::Irq { pin } => {
                 println!("  Step {}: IRQ pin {pin} fired", step + 1);
             }
-            rseq::trace::BusOp::Report { kind, args } => {
+            rseq::trace::BusOp::Report { meta, kind, args } => {
                 let label = report_kind_label(*kind);
                 let vals = format_report_args(args);
-                println!("  Step {}: Report {label} args [{vals}]", step + 1);
+                println!(
+                    "  Step {}: Report {label}{} args [{vals}]",
+                    step + 1,
+                    format_report_meta(*meta)
+                );
             }
         }
     }
@@ -642,6 +889,18 @@ fn format_report_args(args: &[rseq::trace::ReportArg]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_report_meta(meta: Option<rseq::trace::ReportMeta>) -> String {
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let _ = write!(out, " frame_id={}", meta.frame_id);
+    if meta.timestamp_valid() {
+        let _ = write!(out, " ts_us={}", meta.timestamp_us);
+    }
+    out
 }
 
 fn parse_fire_spec(spec: &str) -> Result<(String, u32), String> {
@@ -935,5 +1194,68 @@ mod tests {
         let snippet: String = src.chars().skip(span.start).take(span.len()).collect();
 
         assert_eq!(snippet, "update!(UI.WHOAMI.value, 0x08);");
+    }
+
+    #[test]
+    fn test_decode_qmi8660_fifo_samples_physical_units() {
+        let bytes = [
+            0x01, 0x00, // gx = 1
+            0xff, 0xff, // gy = -1
+            0x34, 0x12, // gz = 0x1234
+            0x00, 0x80, // ax = -32768
+            0xff, 0x7f, // ay = 32767
+            0x00, 0x00, // az = 0
+        ];
+        let decoded = decode_qmi8660_fifo_samples(&bytes);
+
+        assert_eq!(decoded.trailing_bytes, 0);
+        assert_eq!(
+            decoded.samples,
+            vec![Qmi8660FifoSample {
+                gx: 1,
+                gy: -1,
+                gz: 0x1234,
+                ax: -32768,
+                ay: 32767,
+                az: 0,
+            }]
+        );
+        assert_eq!(
+            format_qmi8660_fifo_decode(10, &decoded),
+            "decoded(qmi8660 gyro_rad_s acc_m_s2): [10] gyro=(0.002,-0.002,10.167) acc=(-156.906,156.902,0.000)"
+        );
+    }
+
+    #[test]
+    fn test_qmi8660_accel_one_g_formats_near_earth_gravity() {
+        let sample = Qmi8660FifoSample {
+            gx: 0,
+            gy: 0,
+            gz: 0,
+            ax: 0,
+            ay: 0,
+            az: 2048,
+        };
+        let decoded = Qmi8660FifoDecode {
+            samples: vec![sample],
+            trailing_bytes: 0,
+        };
+
+        assert_eq!(
+            format_qmi8660_fifo_decode(0, &decoded),
+            "decoded(qmi8660 gyro_rad_s acc_m_s2): [0] gyro=(0.000,0.000,0.000) acc=(0.000,0.000,9.807)"
+        );
+    }
+
+    #[test]
+    fn test_fifo_raw_health_reports_mismatch_and_partial_bytes() {
+        let decoded = decode_qmi8660_fifo_samples(&[0; 13]);
+
+        assert_eq!(decoded.samples.len(), 1);
+        assert_eq!(decoded.trailing_bytes, 1);
+        assert_eq!(
+            format_fifo_raw_health(Some(12), 13, &decoded),
+            " len_mismatch=status:12,data:13 partial_bytes=1"
+        );
     }
 }

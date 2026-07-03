@@ -74,6 +74,7 @@ impl Bus for MockBus {
 
     fn report(&mut self, kind: u32, args: &[ReportArg<'_>]) -> Result<(), BusError> {
         self.ops.push(BusOp::Report {
+            meta: None,
             kind,
             args: args
                 .iter()

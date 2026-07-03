@@ -186,6 +186,7 @@ pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
         },
         BusOp::Delay { us: 500 },
         BusOp::Report {
+            meta: None,
             kind: 0x10,
             args: vec![
                 rseq::trace::ReportArg::U32(42),
@@ -200,10 +201,19 @@ pub fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
     if res.status != EStatus::Ok {
         return Err(format!("exec status not Ok: {:?}", res.status).into());
     }
-    if res.traces != expected {
+    let mut traces = res.traces;
+    for op in &mut traces {
+        if let BusOp::Report { meta, .. } = op {
+            if meta.is_none() {
+                return Err("report trace missing v2 metadata".into());
+            }
+            *meta = None;
+        }
+    }
+    if traces != expected {
         return Err(format!(
             "trace mismatch:\n  got: {:?}\n  exp: {:?}",
-            res.traces, expected
+            traces, expected
         )
         .into());
     }

@@ -3,14 +3,18 @@
 //! MCU 端 = 真实 I2C/SPI `Bus` 实现 + `TracingBus` + `LinkTx`(UART)。
 //! TX 失败时尽量不影响总线操作本身(观测是尽力而为)。
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use rseq_vm::{Bus, BusError, ReportArg};
 
 use crate::error::LinkError;
 use crate::frame::MAX_TRACE_FRAME;
 use crate::wire::{
-    MAX_REPORT_ARGS, ReportArgRef, encode_trace_delay, encode_trace_irq, encode_trace_log,
-    encode_trace_report, encode_trace_rw,
+    MAX_REPORT_ARGS, REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta, encode_trace_delay,
+    encode_trace_irq, encode_trace_log, encode_trace_report_v2, encode_trace_rw,
 };
+
+static NEXT_REPORT_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 
 /// 只能发送字节流的链路出口。`TracingBus` 只发不收。
 pub trait LinkTx {
@@ -32,6 +36,7 @@ pub struct TracingBus<B, L, const BUF: usize = MAX_TRACE_FRAME> {
     pub inner: B,
     tx: L,
     buf: [u8; BUF],
+    clock_us: Option<fn() -> u64>,
 }
 
 /// 默认缓冲(`MAX_TRACE_FRAME`)的构造入口——多数场景直接用这个,
@@ -42,6 +47,18 @@ impl<B, L: LinkTx> TracingBus<B, L, MAX_TRACE_FRAME> {
             inner,
             tx,
             buf: [0; MAX_TRACE_FRAME],
+            clock_us: None,
+        }
+    }
+
+    /// 使用调用方提供的单调时钟构造。`report!` Trace 会携带该时钟读数
+    /// 作为 `timestamp_us`。
+    pub fn new_with_clock(inner: B, tx: L, clock_us: fn() -> u64) -> Self {
+        Self {
+            inner,
+            tx,
+            buf: [0; MAX_TRACE_FRAME],
+            clock_us: Some(clock_us),
         }
     }
 }
@@ -58,6 +75,35 @@ impl<B, L: LinkTx, const BUF: usize> TracingBus<B, L, BUF> {
             inner,
             tx,
             buf: [0; BUF],
+            clock_us: None,
+        }
+    }
+
+    /// 用指定大小的缓冲与单调时钟构造。
+    pub fn with_buf_and_clock(inner: B, tx: L, clock_us: fn() -> u64) -> Self {
+        assert!(
+            BUF >= MAX_TRACE_FRAME,
+            "TracingBus BUF must be >= MAX_TRACE_FRAME ({MAX_TRACE_FRAME})"
+        );
+        Self {
+            inner,
+            tx,
+            buf: [0; BUF],
+            clock_us: Some(clock_us),
+        }
+    }
+
+    fn next_report_meta(&self) -> ReportMeta {
+        let timestamp_us = self.clock_us.map(|clock| clock()).unwrap_or(0);
+        let flags = if self.clock_us.is_some() {
+            REPORT_FLAG_TIMESTAMP_VALID
+        } else {
+            0
+        };
+        ReportMeta {
+            flags,
+            frame_id: NEXT_REPORT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
+            timestamp_us,
         }
     }
 
@@ -133,7 +179,8 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
                 ReportArg::Bytes(bytes) => ReportArgRef::Bytes(bytes),
             };
         }
-        let n = encode_trace_report(&mut self.buf, kind, &wire_args[..args.len()]);
+        let meta = self.next_report_meta();
+        let n = encode_trace_report_v2(&mut self.buf, meta, kind, &wire_args[..args.len()]);
         self.send(n);
         Ok(())
     }
@@ -143,8 +190,8 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
 mod tests {
     use super::*;
     use crate::wire::{
-        MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_REPORT, TRACE_OP_WRITE,
-        decode_trace,
+        MAX_TRACE_PAYLOAD, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_REPORT, TRACE_OP_REPORT_V2,
+        TRACE_OP_WRITE, decode_trace,
     };
     use std::prelude::v1::*;
     use std::sync::{Arc, Mutex};
@@ -196,6 +243,7 @@ mod tests {
             pin: u8,
         },
         Report {
+            meta: Option<crate::wire::ReportMeta>,
             kind: u32,
             args: Vec<OwnedReportArg>,
         },
@@ -224,7 +272,8 @@ mod tests {
                     crate::wire::TraceRef::Delay { us } => OwnedTrace::Delay { us },
                     crate::wire::TraceRef::Log { msg } => OwnedTrace::Log { msg: msg.to_vec() },
                     crate::wire::TraceRef::Irq { pin } => OwnedTrace::Irq { pin },
-                    crate::wire::TraceRef::Report { kind, args } => OwnedTrace::Report {
+                    crate::wire::TraceRef::Report { meta, kind, args } => OwnedTrace::Report {
+                        meta,
                         kind,
                         args: args
                             .as_slice()
@@ -314,20 +363,26 @@ mod tests {
 
         let captured = cap.lock().unwrap().clone();
         let traces = decoded_traces(&captured);
+        assert_eq!(traces.len(), 1);
+        let OwnedTrace::Report { meta, kind, args } = &traces[0] else {
+            panic!("expected report trace");
+        };
+        let meta = meta.expect("report v2 meta");
+        assert_eq!(meta.flags, 0);
+        assert_eq!(meta.timestamp_us, 0);
+        assert_eq!(*kind, 0x10);
         assert_eq!(
-            traces,
-            vec![OwnedTrace::Report {
-                kind: 0x10,
-                args: vec![
-                    OwnedReportArg::U32(42),
-                    OwnedReportArg::Bytes(vec![0xde, 0xad]),
-                ],
-            }]
+            args,
+            &vec![
+                OwnedReportArg::U32(42),
+                OwnedReportArg::Bytes(vec![0xde, 0xad]),
+            ]
         );
     }
 
     #[test]
     fn report_op_constant_matches_wire_decode() {
         assert_eq!(TRACE_OP_REPORT, 0x06);
+        assert_eq!(TRACE_OP_REPORT_V2, 0x07);
     }
 }

@@ -15,6 +15,20 @@ pub enum ReportArg {
     Bytes(Vec<u8>),
 }
 
+/// `report!` 上报帧的链路元信息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportMeta {
+    pub flags: u8,
+    pub frame_id: u32,
+    pub timestamp_us: u64,
+}
+
+impl ReportMeta {
+    pub const fn timestamp_valid(&self) -> bool {
+        self.flags & rseq_link::wire::REPORT_FLAG_TIMESTAMP_VALID != 0
+    }
+}
+
 /// 一条已执行的总线操作。
 ///
 /// - `Read`/`Write` 的 `data` 为读出/写入的字节序列;
@@ -42,6 +56,7 @@ pub enum BusOp {
     },
     /// `report!(kind, ...)` 结构化数据上报。
     Report {
+        meta: Option<ReportMeta>,
         kind: u32,
         args: Vec<ReportArg>,
     },

@@ -17,7 +17,7 @@ use rseq_link::wire::{
 };
 use rseq_link::{LinkError, Transport};
 
-use crate::trace::{BusOp, ReportArg};
+use crate::trace::{BusOp, ReportArg, ReportMeta};
 
 /// 一次 EXEC 的结果:执行状态码 + 期间回传并解码的总线轨迹。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +45,12 @@ impl From<TraceRef<'_>> for BusOp {
                 msg: String::from_utf8_lossy(msg).into_owned(),
             },
             TraceRef::Irq { pin } => BusOp::Irq { pin },
-            TraceRef::Report { kind, args } => BusOp::Report {
+            TraceRef::Report { meta, kind, args } => BusOp::Report {
+                meta: meta.map(|meta| ReportMeta {
+                    flags: meta.flags,
+                    frame_id: meta.frame_id,
+                    timestamp_us: meta.timestamp_us,
+                }),
                 kind,
                 args: args
                     .as_slice()
@@ -243,8 +248,9 @@ impl<T: Transport> HostLink<T> {
 mod tests {
     use super::*;
     use rseq_link::wire::{
-        ReportArgRef, TRACE_OP_READ, TRACE_OP_WRITE, encode_trace_delay, encode_trace_log,
-        encode_trace_report, encode_trace_rw,
+        REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta as WireReportMeta, TRACE_OP_READ,
+        TRACE_OP_WRITE, encode_trace_delay, encode_trace_log, encode_trace_report,
+        encode_trace_report_v2, encode_trace_rw,
     };
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
@@ -433,6 +439,7 @@ mod tests {
         assert_eq!(
             res.traces,
             vec![BusOp::Report {
+                meta: None,
                 kind: 0x10,
                 args: vec![ReportArg::U32(42), ReportArg::Bytes(vec![0xde, 0xad]),],
             }]
@@ -463,10 +470,51 @@ mod tests {
         assert_eq!(
             op,
             BusOp::Report {
+                meta: None,
                 kind: 0x10,
                 args: vec![ReportArg::U32(42), ReportArg::Bytes(vec![0xde, 0xad]),],
             }
         );
         assert!(link.transport_mut().writes.is_empty());
+    }
+
+    #[test]
+    fn observe_next_trace_preserves_report_v2_meta() {
+        let mut rx = Vec::new();
+        let mut rb = vec![0u8; 96];
+        let n = encode_trace_report_v2(
+            &mut rb,
+            WireReportMeta {
+                flags: REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 7,
+                timestamp_us: 123_456,
+            },
+            0x10,
+            &[ReportArgRef::U32(42)],
+        );
+        rx.extend(&rb[..n]);
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let op = link
+            .observe_next_trace(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            op,
+            BusOp::Report {
+                meta: Some(ReportMeta {
+                    flags: REPORT_FLAG_TIMESTAMP_VALID,
+                    frame_id: 7,
+                    timestamp_us: 123_456,
+                }),
+                kind: 0x10,
+                args: vec![ReportArg::U32(42)],
+            }
+        );
     }
 }

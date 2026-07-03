@@ -45,6 +45,7 @@ mod ffi {
         pub fn rust_uart_read(buf: *mut u8, len: usize) -> i32;
         pub fn rust_uart_write(data: *const u8, len: usize) -> i32;
         pub fn rust_event_wait(timeout_ms: u32) -> i32;
+        pub fn rust_uptime_us() -> u64;
         pub fn rust_kernel_delay_us(us: u32);
         pub fn rust_printk(s: *const u8, len: usize);
 
@@ -75,6 +76,10 @@ fn check(ret: i32) -> Result<(), i32> {
 /// log backend so bring-up diagnostics are visible even if `set_logger` fails.
 fn printk(s: &str) {
     unsafe { ffi::rust_printk(s.as_ptr(), s.len()) };
+}
+
+fn report_timestamp_us() -> u64 {
+    unsafe { ffi::rust_uptime_us() }
 }
 
 // ============================================================================
@@ -286,7 +291,8 @@ fn run_pending_irqs<B: Bus, T: Transport>(bus: &mut B, transport: &mut T) {
 
         unsafe {
             if let Some(handler) = &IRQ_HANDLERS[pin_id] {
-                let mut tracing = TracingBus::new(&mut *bus, &mut *transport);
+                let mut tracing =
+                    TracingBus::new_with_clock(&mut *bus, &mut *transport, report_timestamp_us);
                 if let Err(e) = Vm::new(&mut tracing, &handler.bytecode).run() {
                     printk(&alloc::format!("rseq: irq handler error: {:?}\n", e));
                 }
@@ -390,7 +396,8 @@ fn mcu_loop<B: Bus, T: Transport>(
                 } else {
                     // TracingBus borrows transport as LinkTx during EXEC;
                     // into_inner reclaims the bus and releases the borrow.
-                    let mut tracing = TracingBus::new(bus, &mut transport);
+                    let mut tracing =
+                        TracingBus::new_with_clock(bus, &mut transport, report_timestamp_us);
                     let res = Vm::new(&mut tracing, &bytecode).run();
                     let (b, _) = tracing.into_inner();
                     bus = b;

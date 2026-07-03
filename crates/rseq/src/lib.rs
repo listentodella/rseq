@@ -252,6 +252,7 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReportOptionValue {
     Number(u32),
+    Ident(String),
     IdentArray(Vec<String>),
 }
 
@@ -259,6 +260,7 @@ impl fmt::Display for ReportOptionValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Number(value) => write!(f, "{value}"),
+            Self::Ident(value) => write!(f, "{value}"),
             Self::IdentArray(values) => {
                 write!(f, "[")?;
                 for (idx, value) in values.iter().enumerate() {
@@ -549,7 +551,11 @@ where
         .map(ReportOptionValue::IdentArray)
         .delimited_by(just(Token::LBracket), just(Token::RBracket));
 
-    let option_value = select! { Token::Number(n) => ReportOptionValue::Number(n) }.or(ident_array);
+    let ident = select! { Token::Ident(s) => ReportOptionValue::Ident(s.to_string()) };
+
+    let option_value = select! { Token::Number(n) => ReportOptionValue::Number(n) }
+        .or(ident_array)
+        .or(ident);
 
     select! { Token::Ident(s) => s.to_string() }
         .then_ignore(just(Token::Colon))
@@ -3955,7 +3961,7 @@ mod tests {
 
     #[test]
     fn test_parse_report_format_fifo_raw() {
-        let src = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });";
+        let src = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096, output: physical_f32 });";
         let program = parse(src).unwrap();
         match &program.stmts[0] {
             Stmt::ReportFormat {
@@ -3997,6 +4003,10 @@ mod tests {
                         ),
                         ("accel_fs_g".to_string(), ReportOptionValue::Number(16)),
                         ("gyro_fs_dps".to_string(), ReportOptionValue::Number(4096)),
+                        (
+                            "output".to_string(),
+                            ReportOptionValue::Ident("physical_f32".to_string()),
+                        ),
                     ]
                 );
             }
@@ -4009,7 +4019,7 @@ mod tests {
         let empty = compile(&parse("").unwrap()).unwrap();
         let with_format = compile(
             &parse(
-                "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });",
+                "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096, output: physical_f32 });",
             )
             .unwrap(),
         )

@@ -721,6 +721,22 @@ const DEFAULT_QMI8660_ACCEL_FULL_SCALE_G: f64 = 16.0;
 const DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
 const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
+const DEFAULT_REPORT_OUTPUT_MODE: ReportOutputMode = ReportOutputMode::PhysicalF32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportOutputMode {
+    PhysicalF32,
+    RawI16,
+}
+
+impl ReportOutputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PhysicalF32 => "physical_f32",
+            Self::RawI16 => "raw_i16",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum ReportDecoder {
@@ -735,6 +751,7 @@ struct I16LeReportDecoder {
     gyro_fields: Vec<String>,
     accel_fs_g: f64,
     gyro_fs_dps: f64,
+    output: ReportOutputMode,
 }
 
 impl I16LeReportDecoder {
@@ -937,12 +954,14 @@ fn format_i16_le_fifo_decode(
         return String::new();
     }
 
-    let mut out = format!("decoded({}", decoder.label);
-    if !decoder.gyro_fields.is_empty() {
-        out.push_str(" gyro_rad_s");
-    }
-    if !decoder.accel_fields.is_empty() {
-        out.push_str(" acc_m_s2");
+    let mut out = format!("decoded({} {}", decoder.label, decoder.output.as_str());
+    if decoder.output == ReportOutputMode::PhysicalF32 {
+        if !decoder.gyro_fields.is_empty() {
+            out.push_str(" gyro_rad_s");
+        }
+        if !decoder.accel_fields.is_empty() {
+            out.push_str(" acc_m_s2");
+        }
     }
     out.push_str("): ");
     let scaled_fields = scaled_field_names(decoder);
@@ -958,21 +977,30 @@ fn format_i16_le_fifo_decode(
         }
         let sample_index = sample_base + idx as u64;
         let _ = write!(out, "[{sample_index}]");
-        if !decoder.gyro_fields.is_empty() {
-            let gyro = format_scaled_fields(sample, decoder, &decoder.gyro_fields, |raw| {
-                gyro_raw_to_rad_s(raw, decoder.gyro_fs_dps)
-            });
-            let _ = write!(out, " gyro=({gyro})");
-        }
-        if !decoder.accel_fields.is_empty() {
-            let accel = format_scaled_fields(sample, decoder, &decoder.accel_fields, |raw| {
-                accel_raw_to_m_s2(raw, decoder.accel_fs_g)
-            });
-            let _ = write!(out, " acc=({accel})");
-        }
-        let raw = format_raw_fields(sample, decoder, &scaled_fields);
-        if !raw.is_empty() {
-            let _ = write!(out, " raw=({raw})");
+        match decoder.output {
+            ReportOutputMode::PhysicalF32 => {
+                if !decoder.gyro_fields.is_empty() {
+                    let gyro = format_scaled_fields(sample, decoder, &decoder.gyro_fields, |raw| {
+                        gyro_raw_to_rad_s(raw, decoder.gyro_fs_dps)
+                    });
+                    let _ = write!(out, " gyro=({gyro})");
+                }
+                if !decoder.accel_fields.is_empty() {
+                    let accel =
+                        format_scaled_fields(sample, decoder, &decoder.accel_fields, |raw| {
+                            accel_raw_to_m_s2(raw, decoder.accel_fs_g)
+                        });
+                    let _ = write!(out, " acc=({accel})");
+                }
+                let raw = format_raw_fields(sample, decoder, &scaled_fields);
+                if !raw.is_empty() {
+                    let _ = write!(out, " raw=({raw})");
+                }
+            }
+            ReportOutputMode::RawI16 => {
+                let raw = format_raw_fields(sample, decoder, &[]);
+                let _ = write!(out, " raw=({raw})");
+            }
         }
     }
     if decoded.samples.len() > FIFO_DECODE_PREVIEW_SAMPLES {
@@ -1325,6 +1353,32 @@ fn report_option_ident_array(
     }
 }
 
+fn report_option_ident(
+    decoder: &str,
+    option: &str,
+    value: &rseq::ReportOptionValue,
+) -> Result<String, String> {
+    match value {
+        rseq::ReportOptionValue::Ident(value) => Ok(value.clone()),
+        _ => Err(format!("{decoder} option '{option}' must be an identifier")),
+    }
+}
+
+fn report_output_mode(
+    decoder: &str,
+    option: &str,
+    value: &rseq::ReportOptionValue,
+) -> Result<ReportOutputMode, String> {
+    let value = report_option_ident(decoder, option, value)?;
+    match value.as_str() {
+        "physical_f32" => Ok(ReportOutputMode::PhysicalF32),
+        "raw_i16" => Ok(ReportOutputMode::RawI16),
+        _ => Err(format!(
+            "{decoder} option '{option}' must be physical_f32 or raw_i16, got '{value}'"
+        )),
+    }
+}
+
 fn validated_report_decoder(decoder: ReportDecoder) -> Result<ReportDecoder, String> {
     decoder.validate()?;
     Ok(decoder)
@@ -1337,6 +1391,7 @@ fn make_i16_le_decoder(
     accel_fields: Vec<String>,
     accel_fs_g: f64,
     gyro_fs_dps: f64,
+    output: ReportOutputMode,
 ) -> Result<ReportDecoder, String> {
     validated_report_decoder(ReportDecoder::I16Le(I16LeReportDecoder {
         label: label.to_string(),
@@ -1345,6 +1400,7 @@ fn make_i16_le_decoder(
         accel_fields,
         accel_fs_g,
         gyro_fs_dps,
+        output,
     }))
 }
 
@@ -1359,6 +1415,7 @@ fn build_report_decoder(
             let mut gyro_fields = Vec::new();
             let mut accel_fs_g = DEFAULT_QMI8660_ACCEL_FULL_SCALE_G;
             let mut gyro_fs_dps = DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS;
+            let mut output = DEFAULT_REPORT_OUTPUT_MODE;
             for (name, value) in options {
                 match name.as_str() {
                     "fields" => fields = Some(report_option_ident_array(decoder, name, value)?),
@@ -1368,9 +1425,10 @@ fn build_report_decoder(
                     "gyro_fields" => gyro_fields = report_option_ident_array(decoder, name, value)?,
                     "accel_fs_g" => accel_fs_g = report_option_number(decoder, name, value)?,
                     "gyro_fs_dps" => gyro_fs_dps = report_option_number(decoder, name, value)?,
+                    "output" => output = report_output_mode(decoder, name, value)?,
                     _ => {
                         return Err(format!(
-                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, accel_fs_g, or gyro_fs_dps"
+                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, accel_fs_g, gyro_fs_dps, or output"
                         ));
                     }
                 }
@@ -1384,18 +1442,21 @@ fn build_report_decoder(
                 accel_fields,
                 accel_fs_g,
                 gyro_fs_dps,
+                output,
             )
         }
         "qmi8660_fifo6" => {
             let mut accel_fs_g = DEFAULT_QMI8660_ACCEL_FULL_SCALE_G;
             let mut gyro_fs_dps = DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS;
+            let mut output = DEFAULT_REPORT_OUTPUT_MODE;
             for (name, value) in options {
                 match name.as_str() {
                     "accel_fs_g" => accel_fs_g = report_option_number(decoder, name, value)?,
                     "gyro_fs_dps" => gyro_fs_dps = report_option_number(decoder, name, value)?,
+                    "output" => output = report_output_mode(decoder, name, value)?,
                     _ => {
                         return Err(format!(
-                            "unknown qmi8660_fifo6 option '{name}', expected accel_fs_g or gyro_fs_dps"
+                            "unknown qmi8660_fifo6 option '{name}', expected accel_fs_g, gyro_fs_dps, or output"
                         ));
                     }
                 }
@@ -1410,6 +1471,7 @@ fn build_report_decoder(
                 ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
                 accel_fs_g,
                 gyro_fs_dps,
+                output,
             )
         }
         _ => Err(format!(
@@ -1681,6 +1743,20 @@ mod tests {
         gyro_fields: &[&str],
         accel_fields: &[&str],
     ) -> I16LeReportDecoder {
+        test_decoder_with_output(
+            fields,
+            gyro_fields,
+            accel_fields,
+            DEFAULT_REPORT_OUTPUT_MODE,
+        )
+    }
+
+    fn test_decoder_with_output(
+        fields: &[&str],
+        gyro_fields: &[&str],
+        accel_fields: &[&str],
+        output: ReportOutputMode,
+    ) -> I16LeReportDecoder {
         I16LeReportDecoder {
             label: "i16_le".to_string(),
             fields: fields.iter().map(|field| (*field).to_string()).collect(),
@@ -1694,6 +1770,7 @@ mod tests {
                 .collect(),
             accel_fs_g: DEFAULT_QMI8660_ACCEL_FULL_SCALE_G,
             gyro_fs_dps: DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS,
+            output,
         }
     }
 
@@ -1748,7 +1825,31 @@ mod tests {
         );
         assert_eq!(
             format_i16_le_fifo_decode(10, &decoded, &decoder),
-            "decoded(i16_le gyro_rad_s acc_m_s2): [10] gyro=(gx=0.002,gy=-0.002,gz=10.167) acc=(ax=-156.906,ay=156.902,az=0.000)"
+            "decoded(i16_le physical_f32 gyro_rad_s acc_m_s2): [10] gyro=(gx=0.002,gy=-0.002,gz=10.167) acc=(ax=-156.906,ay=156.902,az=0.000)"
+        );
+    }
+
+    #[test]
+    fn test_i16_le_decoder_raw_i16_output_formats_raw_counts() {
+        let decoder = test_decoder_with_output(
+            &["gx", "gy", "gz", "ax", "ay", "az"],
+            &["gx", "gy", "gz"],
+            &["ax", "ay", "az"],
+            ReportOutputMode::RawI16,
+        );
+        let bytes = [
+            0x01, 0x00, // gx = 1
+            0xff, 0xff, // gy = -1
+            0x34, 0x12, // gz = 0x1234
+            0x00, 0x80, // ax = -32768
+            0xff, 0x7f, // ay = 32767
+            0x00, 0x00, // az = 0
+        ];
+        let decoded = decode_i16_le_fifo_samples(&bytes, &decoder);
+
+        assert_eq!(
+            format_i16_le_fifo_decode(0, &decoded, &decoder),
+            "decoded(i16_le raw_i16): [0] raw=(gx=1,gy=-1,gz=4660,ax=-32768,ay=32767,az=0)"
         );
     }
 
@@ -1771,13 +1872,13 @@ mod tests {
 
         assert_eq!(
             format_i16_le_fifo_decode(0, &decoded, &decoder),
-            "decoded(i16_le gyro_rad_s acc_m_s2): [0] gyro=(gx=0.002,gy=0.004,gz=0.007) acc=(ax=9.807,ay=0.000,az=0.000)"
+            "decoded(i16_le physical_f32 gyro_rad_s acc_m_s2): [0] gyro=(gx=0.002,gy=0.004,gz=0.007) acc=(ax=9.807,ay=0.000,az=0.000)"
         );
     }
 
     #[test]
     fn test_report_decoder_registry_comes_from_explicit_report_format_stmt() {
-        let source = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });";
+        let source = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096, output: physical_f32 });";
         let program = rseq::parse(source).unwrap();
         let parsed = ParsedSource {
             name: "test.rseq".to_string(),
@@ -1824,6 +1925,7 @@ mod tests {
                 accel_fields: ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
                 accel_fs_g: 16.0,
                 gyro_fs_dps: 4096.0,
+                output: DEFAULT_REPORT_OUTPUT_MODE,
             }))
         );
     }

@@ -40,6 +40,16 @@ pub fn report_kind_name(kind: u32) -> Option<&'static str> {
     }
 }
 
+pub fn report_kind_value(name: &str) -> Option<u32> {
+    match name {
+        "FIFO_RAW" => Some(REPORT_KIND_FIFO_RAW),
+        "AMD" => Some(REPORT_KIND_AMD),
+        "SMD" => Some(REPORT_KIND_SMD),
+        "DRDY" => Some(REPORT_KIND_DRDY),
+        _ => None,
+    }
+}
+
 #[derive(Logos, Clone, PartialEq, Debug)]
 enum Token<'a> {
     Error,
@@ -69,6 +79,8 @@ enum Token<'a> {
     RepeatMacro,
     #[token("print!")]
     PrintMacro,
+    #[token("report_format!")]
+    ReportFormatMacro,
     #[token("report!")]
     ReportMacro,
     #[token("wait!")]
@@ -188,6 +200,7 @@ impl fmt::Display for Token<'_> {
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
             Self::PrintMacro => write!(f, "print!"),
+            Self::ReportFormatMacro => write!(f, "report_format!"),
             Self::ReportMacro => write!(f, "report!"),
             Self::WaitMacro => write!(f, "wait!"),
             Self::If => write!(f, "if"),
@@ -234,6 +247,30 @@ pub enum Value {
     Number(u32),
     Array(Vec<Value>),
     FieldMap(Vec<(String, u32)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportOptionValue {
+    Number(u32),
+    IdentArray(Vec<String>),
+}
+
+impl fmt::Display for ReportOptionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Number(value) => write!(f, "{value}"),
+            Self::IdentArray(values) => {
+                write!(f, "[")?;
+                for (idx, value) in values.iter().enumerate() {
+                    if idx != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -295,6 +332,13 @@ pub enum Stmt {
     Report {
         kind: Value,
         values: Vec<Expr>,
+    },
+    /// `report_format!(kind, decoder, { option: value, ... })`：主机侧上报解码元数据。
+    /// 该语句不生成 VM 字节码，只供 CLI/watch 解释 `report!` 回传的 raw bytes。
+    ReportFormat {
+        kind: Value,
+        decoder: String,
+        options: Vec<(String, ReportOptionValue)>,
     },
     /// `wait!(pin[, timeout_ms])`：阻塞至该中断引脚发生边沿（或超时），
     /// 紧随其后的内联派发序列读中断状态快照、按 `irq!(pin)` 各 arm 的
@@ -490,6 +534,29 @@ where
         .allow_trailing()
         .collect::<Vec<_>>()
         .map(Value::FieldMap)
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
+}
+
+fn report_option_map<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Vec<(String, ReportOptionValue)>, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    let ident_array = select! { Token::Ident(s) => s.to_string() }
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .map(ReportOptionValue::IdentArray)
+        .delimited_by(just(Token::LBracket), just(Token::RBracket));
+
+    let option_value = select! { Token::Number(n) => ReportOptionValue::Number(n) }.or(ident_array);
+
+    select! { Token::Ident(s) => s.to_string() }
+        .then_ignore(just(Token::Colon))
+        .then(option_value)
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
 }
 
@@ -723,6 +790,25 @@ where
         .then_ignore(just(Token::Semicolon).or_not())
         .map(|(msg, vars)| Stmt::Print { msg, vars });
 
+    let report_format_stmt = just(Token::ReportFormatMacro)
+        .ignore_then(
+            select! {
+                Token::Number(n) => Value::Number(n),
+                Token::Ident(s) => Value::Ident(s.to_string()),
+            }
+            .then(just(Token::Comma).ignore_then(select! {
+                Token::Ident(s) => s.to_string(),
+            }))
+            .then(just(Token::Comma).ignore_then(report_option_map()).or_not())
+            .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|((kind, decoder), options)| Stmt::ReportFormat {
+            kind,
+            decoder,
+            options: options.unwrap_or_default(),
+        });
+
     let report_stmt = just(Token::ReportMacro)
         .ignore_then(
             select! {
@@ -766,6 +852,7 @@ where
         .or(write_stmt)
         .or(read_stmt)
         .or(print_stmt)
+        .or(report_format_stmt)
         .or(report_stmt)
         .or(wait_stmt)
 }
@@ -1558,6 +1645,9 @@ fn compile_stmt(
                 bytecode.extend(bytes);
             }
         }
+        Stmt::ReportFormat { .. } => {
+            // Host-side decode metadata only. It intentionally emits no VM bytecode.
+        }
         Stmt::Report { kind, values } => {
             if values.len() > 8 {
                 return Err(CompileError::ReportTooManyValues(values.len()));
@@ -1888,13 +1978,9 @@ fn require_reg(vars: &HashMap<String, VarBinding>, name: &str) -> Result<u8, Com
 fn resolve_report_kind(kind: &Value) -> Result<u32, CompileError> {
     match kind {
         Value::Number(n) => Ok(*n),
-        Value::Ident(name) => match name.as_str() {
-            "FIFO_RAW" => Ok(REPORT_KIND_FIFO_RAW),
-            "AMD" => Ok(REPORT_KIND_AMD),
-            "SMD" => Ok(REPORT_KIND_SMD),
-            "DRDY" => Ok(REPORT_KIND_DRDY),
-            _ => Err(CompileError::UnknownReportKind(name.clone())),
-        },
+        Value::Ident(name) => {
+            report_kind_value(name).ok_or_else(|| CompileError::UnknownReportKind(name.clone()))
+        }
         _ => Err(CompileError::UnsupportedValue),
     }
 }
@@ -3865,6 +3951,71 @@ mod tests {
             }
             _ => panic!("expected Report"),
         }
+    }
+
+    #[test]
+    fn test_parse_report_format_fifo_raw() {
+        let src = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });";
+        let program = parse(src).unwrap();
+        match &program.stmts[0] {
+            Stmt::ReportFormat {
+                kind,
+                decoder,
+                options,
+            } => {
+                assert_eq!(kind, &Value::Ident("FIFO_RAW".to_string()));
+                assert_eq!(decoder, "i16_le");
+                assert_eq!(
+                    options,
+                    &vec![
+                        (
+                            "fields".to_string(),
+                            ReportOptionValue::IdentArray(vec![
+                                "gx".to_string(),
+                                "gy".to_string(),
+                                "gz".to_string(),
+                                "ax".to_string(),
+                                "ay".to_string(),
+                                "az".to_string(),
+                            ]),
+                        ),
+                        (
+                            "gyro_fields".to_string(),
+                            ReportOptionValue::IdentArray(vec![
+                                "gx".to_string(),
+                                "gy".to_string(),
+                                "gz".to_string(),
+                            ]),
+                        ),
+                        (
+                            "accel_fields".to_string(),
+                            ReportOptionValue::IdentArray(vec![
+                                "ax".to_string(),
+                                "ay".to_string(),
+                                "az".to_string(),
+                            ]),
+                        ),
+                        ("accel_fs_g".to_string(), ReportOptionValue::Number(16)),
+                        ("gyro_fs_dps".to_string(), ReportOptionValue::Number(4096)),
+                    ]
+                );
+            }
+            _ => panic!("expected ReportFormat"),
+        }
+    }
+
+    #[test]
+    fn test_report_format_is_compile_time_metadata_only() {
+        let empty = compile(&parse("").unwrap()).unwrap();
+        let with_format = compile(
+            &parse(
+                "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(with_format, empty);
     }
 
     #[test]

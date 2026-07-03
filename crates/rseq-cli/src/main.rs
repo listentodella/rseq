@@ -49,7 +49,7 @@ struct Cli {
     #[arg(long)]
     serial: Option<String>,
 
-    /// 只监听已运行 MCU 主动回传的 Trace/Report,不解析脚本,不发送 LOAD/EXEC/PING。
+    /// 只监听已运行 MCU 主动回传的 Trace/Report,可选解析 -f/--manifest 里的 report_format!,不发送 LOAD/EXEC/PING。
     #[arg(long, alias = "observe-only", alias = "rx-only")]
     watch: bool,
 
@@ -69,12 +69,13 @@ fn main() {
 
         #[cfg(feature = "serial")]
         {
-            if watch_ignores_source_options(&cli) {
+            if watch_ignores_control_options(&cli) {
                 println!(
-                    "Watch mode: skipping source parsing/compilation and sending no control frames."
+                    "Watch mode: ignoring compile/execute control options and sending no control frames."
                 );
             }
-            run_watch(path, cli.baud);
+            let report_decoders = load_watch_report_decoders(&cli);
+            run_watch(path, cli.baud, report_decoders);
             return;
         }
         #[cfg(not(feature = "serial"))]
@@ -149,6 +150,10 @@ fn main() {
                 }
             }
         }
+        let report_decoders = report_decoders_from_sources(&parsed_sources).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
 
         println!("\nCompiling to bytecode...");
         let program_units = parsed_sources
@@ -371,6 +376,29 @@ fn main() {
                             println!("    Action: Report event kind={kind} args({args})");
                         }
                     }
+                    rseq::Stmt::ReportFormat {
+                        kind,
+                        decoder,
+                        options,
+                    } => {
+                        let kind = match kind {
+                            rseq::Value::Number(n) => format!("0x{n:x}"),
+                            rseq::Value::Ident(name) => name.clone(),
+                            _ => "unknown".to_string(),
+                        };
+                        let opts = options
+                            .iter()
+                            .map(|(name, value)| format!("{name}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if opts.is_empty() {
+                            println!("    Action: Report format kind={kind} decoder={decoder}");
+                        } else {
+                            println!(
+                                "    Action: Report format kind={kind} decoder={decoder} options({opts})"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -416,7 +444,7 @@ fn main() {
 
         if let Some(path) = &cli.serial {
             #[cfg(feature = "serial")]
-            run_over_serial(path, cli.baud, &bytecode, &irq_bytecodes);
+            run_over_serial(path, cli.baud, &bytecode, &irq_bytecodes, report_decoders);
             #[cfg(not(feature = "serial"))]
             {
                 eprintln!(
@@ -436,6 +464,7 @@ fn run_over_serial(
     baud: u32,
     bytecode: &[u8],
     irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
+    report_decoders: ReportDecoderRegistry,
 ) {
     use rseq::link::HostLink;
     use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
@@ -476,15 +505,21 @@ fn run_over_serial(
 
     if !irq_bytecodes.is_empty() {
         println!("\nObserving report events. Press Ctrl-C to stop.");
-        observe_reports_forever(&mut host);
+        observe_reports_forever(&mut host, &report_decoders);
     }
 }
 
 #[cfg(feature = "serial")]
-fn run_watch(path: &str, baud: u32) {
+fn run_watch(path: &str, baud: u32, report_decoders: ReportDecoderRegistry) {
     use rseq::link::HostLink;
 
     println!("\nWatching MCU reports over serial ({path} @ {baud} baud)...");
+    if !report_decoders.is_empty() {
+        println!(
+            "Loaded {} report decoder(s) from local DSL metadata.",
+            report_decoders.len()
+        );
+    }
     println!("No LOAD/EXEC/PING frames will be sent. Press Ctrl-C to stop.");
 
     let transport = match rseq_link::SerialTransport::open(path, baud) {
@@ -495,16 +530,19 @@ fn run_watch(path: &str, baud: u32) {
         }
     };
     let mut host = HostLink::new(transport);
-    observe_reports_forever(&mut host);
+    observe_reports_forever(&mut host, &report_decoders);
 }
 
 #[cfg(feature = "serial")]
-fn observe_reports_forever<T: rseq_link::Transport>(host: &mut rseq::link::HostLink<T>) {
+fn observe_reports_forever<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
+    report_decoders: &ReportDecoderRegistry,
+) {
     let mut state = ReportObserveState::default();
     loop {
         match host.observe_next_trace(std::time::Duration::from_secs(1)) {
             Ok(Some(op)) => {
-                print_observed_report(&op, &mut state);
+                print_observed_report(&op, &mut state, report_decoders);
             }
             Ok(None) => {}
             Err(e) => {
@@ -586,11 +624,15 @@ impl ReportObserveState {
 }
 
 #[cfg(feature = "serial")]
-fn print_observed_report(op: &rseq::trace::BusOp, state: &mut ReportObserveState) {
+fn print_observed_report(
+    op: &rseq::trace::BusOp,
+    state: &mut ReportObserveState,
+    report_decoders: &ReportDecoderRegistry,
+) {
     if let rseq::trace::BusOp::Report { meta, kind, args } = op {
         let info = state.next(*meta);
         if *kind == rseq::REPORT_KIND_FIFO_RAW {
-            print_fifo_raw_report(&info, args, state);
+            print_fifo_raw_report(&info, args, state, report_decoders.get(*kind));
         } else {
             print_named_report(&info, *kind, args);
         }
@@ -602,6 +644,7 @@ fn print_fifo_raw_report(
     info: &ReportObserveInfo,
     args: &[rseq::trace::ReportArg],
     state: &mut ReportObserveState,
+    decoder: Option<&ReportDecoder>,
 ) {
     let fifo_len = args.iter().find_map(|arg| match arg {
         rseq::trace::ReportArg::U32(v) => Some(*v),
@@ -619,30 +662,48 @@ fn print_fifo_raw_report(
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let decoded = decode_qmi8660_fifo_samples(bytes);
-            let sample_base = state.reserve_fifo_samples(decoded.samples.len());
-            let decode_summary = format_qmi8660_fifo_decode(sample_base, &decoded);
-            let health = format_fifo_raw_health(fifo_len, bytes.len(), &decoded);
-            match fifo_len {
-                Some(len) => println!(
-                    "FIFO_RAW #{}{}: fifo_len={len} data_len={} samples={}{} data=[{hex}]",
-                    info.seq,
-                    format_report_watch_meta(info),
-                    bytes.len(),
-                    decoded.samples.len(),
-                    health
-                ),
-                None => println!(
-                    "FIFO_RAW #{}{}: data_len={} samples={}{} data=[{hex}]",
-                    info.seq,
-                    format_report_watch_meta(info),
-                    bytes.len(),
-                    decoded.samples.len(),
-                    health
-                ),
-            }
-            if !decode_summary.is_empty() {
-                println!("  {decode_summary}");
+            match decoder {
+                Some(ReportDecoder::I16Le(decoder)) => {
+                    let decoded = decode_i16_le_fifo_samples(bytes, decoder);
+                    let sample_base = state.reserve_fifo_samples(decoded.samples.len());
+                    let decode_summary = format_i16_le_fifo_decode(sample_base, &decoded, decoder);
+                    let health = format_fifo_raw_health(fifo_len, bytes.len(), &decoded);
+                    match fifo_len {
+                        Some(len) => println!(
+                            "FIFO_RAW #{}{}: fifo_len={len} data_len={} samples={}{} data=[{hex}]",
+                            info.seq,
+                            format_report_watch_meta(info),
+                            bytes.len(),
+                            decoded.samples.len(),
+                            health
+                        ),
+                        None => println!(
+                            "FIFO_RAW #{}{}: data_len={} samples={}{} data=[{hex}]",
+                            info.seq,
+                            format_report_watch_meta(info),
+                            bytes.len(),
+                            decoded.samples.len(),
+                            health
+                        ),
+                    }
+                    if !decode_summary.is_empty() {
+                        println!("  {decode_summary}");
+                    }
+                }
+                None => match fifo_len {
+                    Some(len) => println!(
+                        "FIFO_RAW #{}{}: fifo_len={len} data_len={} data=[{hex}]",
+                        info.seq,
+                        format_report_watch_meta(info),
+                        bytes.len()
+                    ),
+                    None => println!(
+                        "FIFO_RAW #{}{}: data_len={} data=[{hex}]",
+                        info.seq,
+                        format_report_watch_meta(info),
+                        bytes.len()
+                    ),
+                },
             }
         }
         None => {
@@ -655,78 +716,205 @@ fn print_fifo_raw_report(
     }
 }
 
-const QMI8660_FIFO_SAMPLE_BYTES: usize = 12;
 const FIFO_DECODE_PREVIEW_SAMPLES: usize = 8;
-const QMI8660_ACCEL_FULL_SCALE_G: f64 = 16.0;
-const QMI8660_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
+const DEFAULT_QMI8660_ACCEL_FULL_SCALE_G: f64 = 16.0;
+const DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
 const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 
+#[derive(Debug, Clone, PartialEq)]
+enum ReportDecoder {
+    I16Le(I16LeReportDecoder),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct I16LeReportDecoder {
+    label: String,
+    fields: Vec<String>,
+    accel_fields: Vec<String>,
+    gyro_fields: Vec<String>,
+    accel_fs_g: f64,
+    gyro_fs_dps: f64,
+}
+
+impl I16LeReportDecoder {
+    fn sample_bytes(&self) -> usize {
+        self.fields.len() * 2
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.fields.is_empty() {
+            return Err("i16_le report decoder requires non-empty fields".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for field in &self.fields {
+            if !seen.insert(field) {
+                return Err(format!("duplicate report field '{field}'"));
+            }
+        }
+        for field in self.gyro_fields.iter().chain(self.accel_fields.iter()) {
+            if !seen.contains(field) {
+                return Err(format!(
+                    "scaled report field '{field}' is not present in fields"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ReportDecoder {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::I16Le(decoder) => decoder.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReportDecoderRegistry {
+    by_kind: std::collections::HashMap<u32, ReportDecoder>,
+}
+
+impl ReportDecoderRegistry {
+    fn insert(&mut self, kind: u32, decoder: ReportDecoder) {
+        self.by_kind.insert(kind, decoder);
+    }
+
+    fn get(&self, kind: u32) -> Option<&ReportDecoder> {
+        self.by_kind.get(&kind)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_kind.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.by_kind.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Qmi8660FifoSample {
-    gx: i16,
-    gy: i16,
-    gz: i16,
-    ax: i16,
-    ay: i16,
-    az: i16,
-}
-
-impl Qmi8660FifoSample {
-    fn gyro_rad_s(self) -> (f64, f64, f64) {
-        (
-            qmi8660_gyro_raw_to_rad_s(self.gx),
-            qmi8660_gyro_raw_to_rad_s(self.gy),
-            qmi8660_gyro_raw_to_rad_s(self.gz),
-        )
-    }
-
-    fn accel_m_s2(self) -> (f64, f64, f64) {
-        (
-            qmi8660_accel_raw_to_m_s2(self.ax),
-            qmi8660_accel_raw_to_m_s2(self.ay),
-            qmi8660_accel_raw_to_m_s2(self.az),
-        )
-    }
-}
-
-fn qmi8660_accel_raw_to_m_s2(raw: i16) -> f64 {
-    raw as f64 * QMI8660_ACCEL_FULL_SCALE_G * STANDARD_GRAVITY_MPS2 / I16_FULL_SCALE_COUNTS
-}
-
-fn qmi8660_gyro_raw_to_rad_s(raw: i16) -> f64 {
-    raw as f64 * QMI8660_GYRO_FULL_SCALE_DPS / I16_FULL_SCALE_COUNTS * std::f64::consts::PI / 180.0
+struct I16LeFieldValue {
+    field_index: usize,
+    value: i16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Qmi8660FifoDecode {
-    samples: Vec<Qmi8660FifoSample>,
+struct I16LeFifoSample {
+    values: Vec<I16LeFieldValue>,
+}
+
+impl I16LeFifoSample {
+    fn value_by_name(&self, decoder: &I16LeReportDecoder, name: &str) -> Option<i16> {
+        self.values
+            .iter()
+            .find(|value| decoder.fields[value.field_index] == name)
+            .map(|value| value.value)
+    }
+}
+
+fn accel_raw_to_m_s2(raw: i16, full_scale_g: f64) -> f64 {
+    raw as f64 * full_scale_g * STANDARD_GRAVITY_MPS2 / I16_FULL_SCALE_COUNTS
+}
+
+fn gyro_raw_to_rad_s(raw: i16, full_scale_dps: f64) -> f64 {
+    raw as f64 * full_scale_dps / I16_FULL_SCALE_COUNTS * std::f64::consts::PI / 180.0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct I16LeFifoDecode {
+    samples: Vec<I16LeFifoSample>,
     trailing_bytes: usize,
 }
 
-fn decode_qmi8660_fifo_samples(data: &[u8]) -> Qmi8660FifoDecode {
-    let mut samples = Vec::with_capacity(data.len() / QMI8660_FIFO_SAMPLE_BYTES);
-    for chunk in data.chunks_exact(QMI8660_FIFO_SAMPLE_BYTES) {
-        samples.push(Qmi8660FifoSample {
-            gx: i16::from_le_bytes([chunk[0], chunk[1]]),
-            gy: i16::from_le_bytes([chunk[2], chunk[3]]),
-            gz: i16::from_le_bytes([chunk[4], chunk[5]]),
-            ax: i16::from_le_bytes([chunk[6], chunk[7]]),
-            ay: i16::from_le_bytes([chunk[8], chunk[9]]),
-            az: i16::from_le_bytes([chunk[10], chunk[11]]),
-        });
+fn decode_i16_le_fifo_samples(data: &[u8], decoder: &I16LeReportDecoder) -> I16LeFifoDecode {
+    let sample_bytes = decoder.sample_bytes();
+    if sample_bytes == 0 {
+        return I16LeFifoDecode {
+            samples: Vec::new(),
+            trailing_bytes: data.len(),
+        };
     }
 
-    Qmi8660FifoDecode {
-        samples,
-        trailing_bytes: data.len() % QMI8660_FIFO_SAMPLE_BYTES,
+    let mut samples = Vec::with_capacity(data.len() / sample_bytes);
+    for chunk in data.chunks_exact(sample_bytes) {
+        let values = chunk
+            .chunks_exact(2)
+            .enumerate()
+            .map(|(field_index, bytes)| I16LeFieldValue {
+                field_index,
+                value: i16::from_le_bytes([bytes[0], bytes[1]]),
+            })
+            .collect();
+        samples.push(I16LeFifoSample { values });
     }
+
+    I16LeFifoDecode {
+        samples,
+        trailing_bytes: data.len() % sample_bytes,
+    }
+}
+
+fn format_scaled_fields(
+    sample: &I16LeFifoSample,
+    decoder: &I16LeReportDecoder,
+    fields: &[String],
+    convert: impl Fn(i16) -> f64,
+) -> String {
+    let mut out = String::new();
+    for (idx, field) in fields.iter().enumerate() {
+        if idx != 0 {
+            out.push(',');
+        }
+        match sample.value_by_name(decoder, field) {
+            Some(raw) => {
+                let value = convert(raw);
+                let _ = write!(out, "{field}={value:.3}");
+            }
+            None => {
+                let _ = write!(out, "{field}=missing");
+            }
+        }
+    }
+    out
+}
+
+fn format_raw_fields(
+    sample: &I16LeFifoSample,
+    decoder: &I16LeReportDecoder,
+    excluded_fields: &[String],
+) -> String {
+    let mut out = String::new();
+    let mut wrote = false;
+    for value in &sample.values {
+        let field = &decoder.fields[value.field_index];
+        if excluded_fields.iter().any(|excluded| excluded == field) {
+            continue;
+        }
+        if wrote {
+            out.push(',');
+        }
+        wrote = true;
+        let _ = write!(out, "{field}={}", value.value);
+    }
+    out
+}
+
+fn scaled_field_names(decoder: &I16LeReportDecoder) -> Vec<String> {
+    let mut fields = decoder.gyro_fields.clone();
+    for field in &decoder.accel_fields {
+        if !fields.iter().any(|existing| existing == field) {
+            fields.push(field.clone());
+        }
+    }
+    fields
 }
 
 fn format_fifo_raw_health(
     fifo_len: Option<u32>,
     data_len: usize,
-    decoded: &Qmi8660FifoDecode,
+    decoded: &I16LeFifoDecode,
 ) -> String {
     let mut out = String::new();
     if let Some(fifo_len) = fifo_len {
@@ -740,12 +928,25 @@ fn format_fifo_raw_health(
     out
 }
 
-fn format_qmi8660_fifo_decode(sample_base: u64, decoded: &Qmi8660FifoDecode) -> String {
+fn format_i16_le_fifo_decode(
+    sample_base: u64,
+    decoded: &I16LeFifoDecode,
+    decoder: &I16LeReportDecoder,
+) -> String {
     if decoded.samples.is_empty() {
         return String::new();
     }
 
-    let mut out = String::from("decoded(qmi8660 gyro_rad_s acc_m_s2): ");
+    let mut out = format!("decoded({}", decoder.label);
+    if !decoder.gyro_fields.is_empty() {
+        out.push_str(" gyro_rad_s");
+    }
+    if !decoder.accel_fields.is_empty() {
+        out.push_str(" acc_m_s2");
+    }
+    out.push_str("): ");
+    let scaled_fields = scaled_field_names(decoder);
+
     for (idx, sample) in decoded
         .samples
         .iter()
@@ -756,12 +957,23 @@ fn format_qmi8660_fifo_decode(sample_base: u64, decoded: &Qmi8660FifoDecode) -> 
             out.push_str("; ");
         }
         let sample_index = sample_base + idx as u64;
-        let (gx, gy, gz) = sample.gyro_rad_s();
-        let (ax, ay, az) = sample.accel_m_s2();
-        let _ = write!(
-            out,
-            "[{sample_index}] gyro=({gx:.3},{gy:.3},{gz:.3}) acc=({ax:.3},{ay:.3},{az:.3})",
-        );
+        let _ = write!(out, "[{sample_index}]");
+        if !decoder.gyro_fields.is_empty() {
+            let gyro = format_scaled_fields(sample, decoder, &decoder.gyro_fields, |raw| {
+                gyro_raw_to_rad_s(raw, decoder.gyro_fs_dps)
+            });
+            let _ = write!(out, " gyro=({gyro})");
+        }
+        if !decoder.accel_fields.is_empty() {
+            let accel = format_scaled_fields(sample, decoder, &decoder.accel_fields, |raw| {
+                accel_raw_to_m_s2(raw, decoder.accel_fs_g)
+            });
+            let _ = write!(out, " acc=({accel})");
+        }
+        let raw = format_raw_fields(sample, decoder, &scaled_fields);
+        if !raw.is_empty() {
+            let _ = write!(out, " raw=({raw})");
+        }
     }
     if decoded.samples.len() > FIFO_DECODE_PREVIEW_SAMPLES {
         let _ = write!(
@@ -927,15 +1139,283 @@ fn parse_u32_arg(text: &str) -> Result<u32, std::num::ParseIntError> {
     }
 }
 
-fn watch_ignores_source_options(cli: &Cli) -> bool {
+fn watch_ignores_control_options(cli: &Cli) -> bool {
     cli.decompile
         || cli.execute
         || !cli.fire.is_empty()
-        || !cli.file.is_empty()
         || cli.hex.is_some()
-        || cli.manifest.is_some()
         || cli.output.is_some()
-        || !cli.run.is_empty()
+}
+
+fn load_watch_report_decoders(cli: &Cli) -> ReportDecoderRegistry {
+    let sources = load_watch_sources(cli).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
+    if sources.is_empty() {
+        return ReportDecoderRegistry::default();
+    }
+
+    let parsed_sources = parse_sources_for_report_metadata(sources).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
+
+    report_decoders_from_sources(&parsed_sources).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    })
+}
+
+fn load_watch_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, String> {
+    if let Some(manifest_path) = &cli.manifest {
+        if !cli.file.is_empty() {
+            return Err("--manifest cannot be combined with --file".to_string());
+        }
+
+        let manifest_source = std::fs::read_to_string(manifest_path)
+            .map_err(|e| format!("Failed to read manifest {manifest_path}: {e}"))?;
+        let manifest = Manifest::parse(&manifest_source)
+            .map_err(|e| format!("Failed to parse manifest {manifest_path}: {e}"))?;
+        let manifest_base = Path::new(manifest_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let selected = manifest
+            .selected_sequences(&cli.run)
+            .map_err(|e| format!("Invalid manifest selection: {e}"))?;
+        let mut sources = Vec::new();
+
+        if let Some(chip) = &manifest.chip {
+            let source = format!("chip!(\"{}\");\n", escape_rseq_string(chip));
+            sources.push((
+                format!("{manifest_path}#chip"),
+                source,
+                Some(manifest_base.clone()),
+            ));
+        }
+
+        for sequence in selected {
+            let path = manifest_base.join(&sequence.file);
+            let display_name = sequence
+                .name
+                .as_deref()
+                .map(|name| format!("{} ({name})", sequence.id))
+                .unwrap_or_else(|| sequence.id.clone());
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read sequence {display_name}: {e}"))?;
+            let base = path.parent().map(Path::to_path_buf);
+            sources.push((path.display().to_string(), content, base));
+        }
+
+        return Ok(sources);
+    }
+
+    if !cli.run.is_empty() {
+        return Err("--run requires --manifest".to_string());
+    }
+
+    let mut sources = Vec::new();
+    for file in &cli.file {
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| format!("Failed to read rseq file {file}: {e}"))?;
+        let base = Path::new(file).parent().map(Path::to_path_buf);
+        sources.push((file.clone(), content, base));
+    }
+    Ok(sources)
+}
+
+fn parse_sources_for_report_metadata(
+    sources: Vec<(String, String, Option<PathBuf>)>,
+) -> Result<Vec<ParsedSource>, String> {
+    let mut parsed_sources = Vec::with_capacity(sources.len());
+    for (name, source, base_dir) in sources {
+        let program = parse_detailed(&source).map_err(|errors| {
+            let error = errors
+                .into_iter()
+                .next()
+                .expect("parse_detailed returned at least one diagnostic");
+            format!(
+                "could not parse report metadata in {name}: {} at bytes {}..{}",
+                error.message, error.span.start, error.span.end
+            )
+        })?;
+        parsed_sources.push(ParsedSource {
+            name,
+            source,
+            base_dir,
+            program,
+        });
+    }
+    Ok(parsed_sources)
+}
+
+fn report_decoders_from_sources(sources: &[ParsedSource]) -> Result<ReportDecoderRegistry, String> {
+    let mut registry = ReportDecoderRegistry::default();
+    for source in sources {
+        collect_report_decoders(&source.program.stmts, &mut registry)
+            .map_err(|err| format!("{}: {err}", source.name))?;
+    }
+    Ok(registry)
+}
+
+fn collect_report_decoders(
+    stmts: &[rseq::Stmt],
+    registry: &mut ReportDecoderRegistry,
+) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            rseq::Stmt::ReportFormat {
+                kind,
+                decoder,
+                options,
+            } => {
+                let kind = report_kind_from_value(kind)?;
+                let decoder = build_report_decoder(decoder, options)?;
+                registry.insert(kind, decoder);
+            }
+            rseq::Stmt::Irq { arms, .. } => {
+                for arm in arms {
+                    collect_report_decoders(&arm.body, registry)?;
+                }
+            }
+            rseq::Stmt::Repeat { body, .. } => collect_report_decoders(body, registry)?,
+            rseq::Stmt::If { then, else_, .. } => {
+                collect_report_decoders(then, registry)?;
+                collect_report_decoders(else_, registry)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn report_kind_from_value(kind: &rseq::Value) -> Result<u32, String> {
+    match kind {
+        rseq::Value::Number(n) => Ok(*n),
+        rseq::Value::Ident(name) => {
+            rseq::report_kind_value(name).ok_or_else(|| format!("unknown report kind '{name}'"))
+        }
+        _ => Err("report_format! kind must be a number or built-in report kind name".to_string()),
+    }
+}
+
+fn report_option_number(
+    decoder: &str,
+    option: &str,
+    value: &rseq::ReportOptionValue,
+) -> Result<f64, String> {
+    match value {
+        rseq::ReportOptionValue::Number(value) => Ok(*value as f64),
+        _ => Err(format!("{decoder} option '{option}' must be a number")),
+    }
+}
+
+fn report_option_ident_array(
+    decoder: &str,
+    option: &str,
+    value: &rseq::ReportOptionValue,
+) -> Result<Vec<String>, String> {
+    match value {
+        rseq::ReportOptionValue::IdentArray(values) => Ok(values.clone()),
+        _ => Err(format!(
+            "{decoder} option '{option}' must be an identifier array"
+        )),
+    }
+}
+
+fn validated_report_decoder(decoder: ReportDecoder) -> Result<ReportDecoder, String> {
+    decoder.validate()?;
+    Ok(decoder)
+}
+
+fn make_i16_le_decoder(
+    label: &str,
+    fields: Vec<String>,
+    gyro_fields: Vec<String>,
+    accel_fields: Vec<String>,
+    accel_fs_g: f64,
+    gyro_fs_dps: f64,
+) -> Result<ReportDecoder, String> {
+    validated_report_decoder(ReportDecoder::I16Le(I16LeReportDecoder {
+        label: label.to_string(),
+        fields,
+        gyro_fields,
+        accel_fields,
+        accel_fs_g,
+        gyro_fs_dps,
+    }))
+}
+
+fn build_report_decoder(
+    decoder: &str,
+    options: &[(String, rseq::ReportOptionValue)],
+) -> Result<ReportDecoder, String> {
+    match decoder {
+        "i16_le" => {
+            let mut fields = None;
+            let mut accel_fields = Vec::new();
+            let mut gyro_fields = Vec::new();
+            let mut accel_fs_g = DEFAULT_QMI8660_ACCEL_FULL_SCALE_G;
+            let mut gyro_fs_dps = DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS;
+            for (name, value) in options {
+                match name.as_str() {
+                    "fields" => fields = Some(report_option_ident_array(decoder, name, value)?),
+                    "accel_fields" => {
+                        accel_fields = report_option_ident_array(decoder, name, value)?
+                    }
+                    "gyro_fields" => gyro_fields = report_option_ident_array(decoder, name, value)?,
+                    "accel_fs_g" => accel_fs_g = report_option_number(decoder, name, value)?,
+                    "gyro_fs_dps" => gyro_fs_dps = report_option_number(decoder, name, value)?,
+                    _ => {
+                        return Err(format!(
+                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, accel_fs_g, or gyro_fs_dps"
+                        ));
+                    }
+                }
+            }
+            let fields =
+                fields.ok_or_else(|| "i16_le report decoder requires fields: [...]".to_string())?;
+            make_i16_le_decoder(
+                "i16_le",
+                fields,
+                gyro_fields,
+                accel_fields,
+                accel_fs_g,
+                gyro_fs_dps,
+            )
+        }
+        "qmi8660_fifo6" => {
+            let mut accel_fs_g = DEFAULT_QMI8660_ACCEL_FULL_SCALE_G;
+            let mut gyro_fs_dps = DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS;
+            for (name, value) in options {
+                match name.as_str() {
+                    "accel_fs_g" => accel_fs_g = report_option_number(decoder, name, value)?,
+                    "gyro_fs_dps" => gyro_fs_dps = report_option_number(decoder, name, value)?,
+                    _ => {
+                        return Err(format!(
+                            "unknown qmi8660_fifo6 option '{name}', expected accel_fs_g or gyro_fs_dps"
+                        ));
+                    }
+                }
+            }
+            make_i16_le_decoder(
+                "qmi8660_fifo6",
+                ["gx", "gy", "gz", "ax", "ay", "az"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
+                ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                accel_fs_g,
+                gyro_fs_dps,
+            )
+        }
+        _ => Err(format!(
+            "unknown report decoder '{decoder}', expected i16_le or qmi8660_fifo6"
+        )),
+    }
 }
 
 fn load_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, String> {
@@ -1196,8 +1676,34 @@ mod tests {
         assert_eq!(snippet, "update!(UI.WHOAMI.value, 0x08);");
     }
 
+    fn test_decoder(
+        fields: &[&str],
+        gyro_fields: &[&str],
+        accel_fields: &[&str],
+    ) -> I16LeReportDecoder {
+        I16LeReportDecoder {
+            label: "i16_le".to_string(),
+            fields: fields.iter().map(|field| (*field).to_string()).collect(),
+            gyro_fields: gyro_fields
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect(),
+            accel_fields: accel_fields
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect(),
+            accel_fs_g: DEFAULT_QMI8660_ACCEL_FULL_SCALE_G,
+            gyro_fs_dps: DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS,
+        }
+    }
+
     #[test]
-    fn test_decode_qmi8660_fifo_samples_physical_units() {
+    fn test_decode_i16_le_fifo_samples_physical_units() {
+        let decoder = test_decoder(
+            &["gx", "gy", "gz", "ax", "ay", "az"],
+            &["gx", "gy", "gz"],
+            &["ax", "ay", "az"],
+        );
         let bytes = [
             0x01, 0x00, // gx = 1
             0xff, 0xff, // gy = -1
@@ -1206,50 +1712,130 @@ mod tests {
             0xff, 0x7f, // ay = 32767
             0x00, 0x00, // az = 0
         ];
-        let decoded = decode_qmi8660_fifo_samples(&bytes);
+        let decoded = decode_i16_le_fifo_samples(&bytes, &decoder);
 
         assert_eq!(decoded.trailing_bytes, 0);
         assert_eq!(
             decoded.samples,
-            vec![Qmi8660FifoSample {
-                gx: 1,
-                gy: -1,
-                gz: 0x1234,
-                ax: -32768,
-                ay: 32767,
-                az: 0,
+            vec![I16LeFifoSample {
+                values: vec![
+                    I16LeFieldValue {
+                        field_index: 0,
+                        value: 1,
+                    },
+                    I16LeFieldValue {
+                        field_index: 1,
+                        value: -1,
+                    },
+                    I16LeFieldValue {
+                        field_index: 2,
+                        value: 0x1234,
+                    },
+                    I16LeFieldValue {
+                        field_index: 3,
+                        value: -32768,
+                    },
+                    I16LeFieldValue {
+                        field_index: 4,
+                        value: 32767,
+                    },
+                    I16LeFieldValue {
+                        field_index: 5,
+                        value: 0,
+                    },
+                ],
             }]
         );
         assert_eq!(
-            format_qmi8660_fifo_decode(10, &decoded),
-            "decoded(qmi8660 gyro_rad_s acc_m_s2): [10] gyro=(0.002,-0.002,10.167) acc=(-156.906,156.902,0.000)"
+            format_i16_le_fifo_decode(10, &decoded, &decoder),
+            "decoded(i16_le gyro_rad_s acc_m_s2): [10] gyro=(gx=0.002,gy=-0.002,gz=10.167) acc=(ax=-156.906,ay=156.902,az=0.000)"
         );
     }
 
     #[test]
-    fn test_qmi8660_accel_one_g_formats_near_earth_gravity() {
-        let sample = Qmi8660FifoSample {
-            gx: 0,
-            gy: 0,
-            gz: 0,
-            ax: 0,
-            ay: 0,
-            az: 2048,
-        };
-        let decoded = Qmi8660FifoDecode {
-            samples: vec![sample],
-            trailing_bytes: 0,
-        };
+    fn test_i16_le_decoder_uses_declared_field_order() {
+        let decoder = test_decoder(
+            &["ax", "ay", "az", "gx", "gy", "gz"],
+            &["gx", "gy", "gz"],
+            &["ax", "ay", "az"],
+        );
+        let bytes = [
+            0x00, 0x08, // ax = 2048
+            0x00, 0x00, // ay = 0
+            0x00, 0x00, // az = 0
+            0x01, 0x00, // gx = 1
+            0x02, 0x00, // gy = 2
+            0x03, 0x00, // gz = 3
+        ];
+        let decoded = decode_i16_le_fifo_samples(&bytes, &decoder);
 
         assert_eq!(
-            format_qmi8660_fifo_decode(0, &decoded),
-            "decoded(qmi8660 gyro_rad_s acc_m_s2): [0] gyro=(0.000,0.000,0.000) acc=(0.000,0.000,9.807)"
+            format_i16_le_fifo_decode(0, &decoded, &decoder),
+            "decoded(i16_le gyro_rad_s acc_m_s2): [0] gyro=(gx=0.002,gy=0.004,gz=0.007) acc=(ax=9.807,ay=0.000,az=0.000)"
+        );
+    }
+
+    #[test]
+    fn test_report_decoder_registry_comes_from_explicit_report_format_stmt() {
+        let source = "report_format!(FIFO_RAW, i16_le, { fields: [gx, gy, gz, ax, ay, az], gyro_fields: [gx, gy, gz], accel_fields: [ax, ay, az], accel_fs_g: 16, gyro_fs_dps: 4096 });";
+        let program = rseq::parse(source).unwrap();
+        let parsed = ParsedSource {
+            name: "test.rseq".to_string(),
+            source: source.to_string(),
+            base_dir: None,
+            program,
+        };
+
+        let decoders = report_decoders_from_sources(&[parsed]).unwrap();
+
+        assert_eq!(
+            decoders.get(rseq::REPORT_KIND_FIFO_RAW),
+            Some(&ReportDecoder::I16Le(test_decoder(
+                &["gx", "gy", "gz", "ax", "ay", "az"],
+                &["gx", "gy", "gz"],
+                &["ax", "ay", "az"],
+            )))
+        );
+    }
+
+    #[test]
+    fn test_legacy_qmi8660_report_decoder_still_maps_to_i16_le() {
+        let source =
+            "report_format!(FIFO_RAW, qmi8660_fifo6, { accel_fs_g: 16, gyro_fs_dps: 4096 });";
+        let program = rseq::parse(source).unwrap();
+        let parsed = ParsedSource {
+            name: "test.rseq".to_string(),
+            source: source.to_string(),
+            base_dir: None,
+            program,
+        };
+
+        let decoders = report_decoders_from_sources(&[parsed]).unwrap();
+
+        assert_eq!(
+            decoders.get(rseq::REPORT_KIND_FIFO_RAW),
+            Some(&ReportDecoder::I16Le(I16LeReportDecoder {
+                label: "qmi8660_fifo6".to_string(),
+                fields: ["gx", "gy", "gz", "ax", "ay", "az"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                gyro_fields: ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
+                accel_fields: ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                accel_fs_g: 16.0,
+                gyro_fs_dps: 4096.0,
+            }))
         );
     }
 
     #[test]
     fn test_fifo_raw_health_reports_mismatch_and_partial_bytes() {
-        let decoded = decode_qmi8660_fifo_samples(&[0; 13]);
+        let decoder = test_decoder(
+            &["gx", "gy", "gz", "ax", "ay", "az"],
+            &["gx", "gy", "gz"],
+            &["ax", "ay", "az"],
+        );
+        let decoded = decode_i16_le_fifo_samples(&[0; 13], &decoder);
 
         assert_eq!(decoded.samples.len(), 1);
         assert_eq!(decoded.trailing_bytes, 1);

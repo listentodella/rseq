@@ -10,8 +10,9 @@ use rseq_vm::{Bus, BusError, ReportArg};
 use crate::error::LinkError;
 use crate::frame::MAX_TRACE_FRAME;
 use crate::wire::{
-    MAX_REPORT_ARGS, REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta, encode_trace_delay,
-    encode_trace_irq, encode_trace_log, encode_trace_report_v2, encode_trace_rw,
+    MAX_REPORT_ARGS, REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta,
+    encode_trace_bus_select, encode_trace_delay, encode_trace_irq, encode_trace_log,
+    encode_trace_report_v2, encode_trace_rw,
 };
 
 static NEXT_REPORT_FRAME_ID: AtomicU32 = AtomicU32::new(1);
@@ -125,6 +126,13 @@ impl<B, L: LinkTx, const BUF: usize> TracingBus<B, L, BUF> {
 }
 
 impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
+    fn set_bus_kind(&mut self, kind: rseq_vm::BusKind, arg: u32) -> Result<(), BusError> {
+        self.inner.set_bus_kind(kind, arg)?;
+        let n = encode_trace_bus_select(&mut self.buf, kind, arg);
+        self.send(n);
+        Ok(())
+    }
+
     fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
         self.inner.read(addr, data)?;
         // VM 限制 read len ≤ 4096,故 data.len() ≤ MAX_TRACE_PAYLOAD 的 data 部分。
@@ -156,7 +164,7 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
         Ok(())
     }
 
-    /// `wait!(pin)`：先让真总线阻塞等待边沿（真机=`ImuSpiBus` 在 PB8 上
+    /// `wait!(pin)`：先让真总线阻塞等待边沿（真机 IMU 总线在 PB8 上
     /// `k_sem_take`），命中后再回传一条 Irq trace 给主机，标记此处发生过
     /// 一次中断。inner 超时返回 `Timeout` 时直接传播，不发 trace。
     fn wait_irq(&mut self, pin: u8, timeout_ms: u32) -> Result<(), BusError> {
@@ -210,6 +218,10 @@ mod tests {
     /// 恒返回 0 的总线,便于断言读出的 data。
     struct ZeroBus;
     impl Bus for ZeroBus {
+        fn set_bus_kind(&mut self, _kind: rseq_vm::BusKind, _arg: u32) -> Result<(), BusError> {
+            Ok(())
+        }
+
         fn read(&mut self, _addr: u32, data: &mut [u8]) -> Result<(), BusError> {
             data.fill(0);
             Ok(())
@@ -225,6 +237,10 @@ mod tests {
     /// 解码后的 Trace 的 owned 镜像——数据从帧缓冲拷出,避免借用逃逸出闭包。
     #[derive(Debug, PartialEq, Eq)]
     enum OwnedTrace {
+        BusSelect {
+            kind: rseq_vm::BusKind,
+            arg: u32,
+        },
         Read {
             addr: u32,
             data: Vec<u8>,
@@ -272,6 +288,9 @@ mod tests {
                     crate::wire::TraceRef::Delay { us } => OwnedTrace::Delay { us },
                     crate::wire::TraceRef::Log { msg } => OwnedTrace::Log { msg: msg.to_vec() },
                     crate::wire::TraceRef::Irq { pin } => OwnedTrace::Irq { pin },
+                    crate::wire::TraceRef::BusSelect { kind, arg } => {
+                        OwnedTrace::BusSelect { kind, arg }
+                    }
                     crate::wire::TraceRef::Report { meta, kind, args } => OwnedTrace::Report {
                         meta,
                         kind,
@@ -342,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn tracing_bus_set_bus_emits_bus_trace() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = TracingBus::new(ZeroBus, CaptureTx(cap.clone()));
+        bus.set_bus_kind(rseq_vm::BusKind::I2c, 0x6a).unwrap();
+
+        let captured = cap.lock().unwrap().clone();
+        let traces = decoded_traces(&captured);
+        assert_eq!(
+            traces,
+            vec![OwnedTrace::BusSelect {
+                kind: rseq_vm::BusKind::I2c,
+                arg: 0x6a
+            }]
+        );
+    }
+
+    #[test]
     fn tracing_bus_wait_emits_irq_trace() {
         // ZeroBus.wait_irq 用默认 no-op（立即 Ok），TracingBus 应在其后
         // 回传一条 Irq trace（pin=0）。
@@ -384,5 +420,6 @@ mod tests {
     fn report_op_constant_matches_wire_decode() {
         assert_eq!(TRACE_OP_REPORT, 0x06);
         assert_eq!(TRACE_OP_REPORT_V2, 0x07);
+        assert_eq!(crate::wire::TRACE_OP_BUS_SELECT, 0x08);
     }
 }

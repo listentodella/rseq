@@ -29,7 +29,7 @@ pub enum Opcode {
     JumpIfZero = 0x25,
     Jump = 0x26,
     /// `print!("msg")`：读 len(u32) + utf8 字节，调 `Bus::log`。不涉总线时序，
-    /// 由 `TracingBus` 回传 Log trace、`ImuSpiBus` 走 printk。
+    /// 由 `TracingBus` 回传 Log trace、MCU IMU 总线走 printk。
     Log = 0x27,
     /// `print!("fmt", v1, v2, ...)`：读 n_vars + 各寄存器索引 + fmt 字符串，
     /// 调 `Bus::log_vars`（默认实现就地格式化 `{}`/`{x}` 后委托 `log`）。
@@ -42,6 +42,9 @@ pub enum Opcode {
     /// `report!(kind, ...)`：读 `kind:u32` + typed args，调 `Bus::report`
     /// 上报一条二进制事件。用于 MCU→Host 的结构化数据出口。
     Report = 0x2A,
+    /// `bus!(spi|i2c|i3c[, arg])`：读 `kind:u8` + `arg:u32`，调
+    /// `Bus::set_bus_kind` 选择后续寄存器读写的物理总线。
+    SetBus = 0x2B,
     Read = 0x01,
     Write = 0x02,
     Update = 0x03,
@@ -93,6 +96,7 @@ impl Opcode {
             0x28 => Some(Self::LogVar),
             0x29 => Some(Self::WaitIrq),
             0x2A => Some(Self::Report),
+            0x2B => Some(Self::SetBus),
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
             0x03 => Some(Self::Update),

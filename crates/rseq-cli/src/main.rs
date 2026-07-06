@@ -235,6 +235,14 @@ fn main() {
                     rseq::Stmt::Chip { path } => {
                         println!("    Action: Load chip dictionary from {path}");
                     }
+                    rseq::Stmt::Bus { kind, arg } => match arg {
+                        Some(arg) => {
+                            println!("    Action: Select {kind} bus arg=0x{arg:x}");
+                        }
+                        None => {
+                            println!("    Action: Select {kind} bus");
+                        }
+                    },
                     rseq::Stmt::Let { name, expr } => {
                         println!("    Action: Bind {} = {}", name, format_expr(expr));
                         if let rseq::Expr::Read {
@@ -1061,6 +1069,17 @@ fn print_bus_ops(ops: &[rseq::trace::BusOp]) {
     println!("Bus operations (in execution order):");
     for (step, op) in ops.iter().enumerate() {
         match op {
+            rseq::trace::BusOp::BusSelect { kind, arg } => {
+                if *arg == 0 {
+                    println!("  Step {}: Select {} bus", step + 1, kind.as_str());
+                } else {
+                    println!(
+                        "  Step {}: Select {} bus arg=0x{arg:x}",
+                        step + 1,
+                        kind.as_str()
+                    );
+                }
+            }
             rseq::trace::BusOp::Write { addr, data } => {
                 let bytes: String = data
                     .iter()
@@ -1294,6 +1313,7 @@ fn collect_report_decoders(
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
+            rseq::Stmt::Bus { .. } => {}
             rseq::Stmt::ReportFormat {
                 kind,
                 decoder,

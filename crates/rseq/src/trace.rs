@@ -35,6 +35,11 @@ impl ReportMeta {
 /// - `Delay` 的 `us` 为延时微秒数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusOp {
+    /// `bus!(...)` 选择后续读写所使用的物理总线。
+    BusSelect {
+        kind: rseq_vm::BusKind,
+        arg: u32,
+    },
     Read {
         addr: u32,
         data: Vec<u8>,

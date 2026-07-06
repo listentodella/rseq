@@ -45,6 +45,7 @@ impl From<TraceRef<'_>> for BusOp {
                 msg: String::from_utf8_lossy(msg).into_owned(),
             },
             TraceRef::Irq { pin } => BusOp::Irq { pin },
+            TraceRef::BusSelect { kind, arg } => BusOp::BusSelect { kind, arg },
             TraceRef::Report { meta, kind, args } => BusOp::Report {
                 meta: meta.map(|meta| ReportMeta {
                     flags: meta.flags,

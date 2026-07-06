@@ -38,6 +38,21 @@ cargo run --package rseq-cli -- --manifest examples/qmi8660_manifest.toml --run 
 
 除了在主机端用 `--execute` 跑 `MockBus` 回放, 也可以把字节码编译出来后通过串口下发到真实 MCU 执行, MCU 边执行边把每次总线操作流式回传给主机.
 
+## 总线选择
+
+DSL 可用 `bus!` 配置后续寄存器读写走 SPI 或 I2C。不写时保持默认 SPI, 兼容已有脚本。
+
+```rseq
+chip!("qmi8660.yaml");
+
+bus!(spi);          // 使用默认 SPI 后端
+bus!(i2c);          // 自动探测 I2C 地址 0x6a/0x6b
+bus!(i2c, 0x6a);    // 使用指定 7-bit I2C 地址
+bus!(i3c);          // 预留接口，F429 当前返回 unsupported
+```
+
+`bus!` 会编译成 VM 字节码并下发到 MCU; 在 F429ZI 固件中, `bus!(i2c)` 会读取 WHOAMI 并在 `0x6a` / `0x6b` 之间自动选择。CLI/Trace 会显示 `Select spi bus` 或 `Select i2c bus arg=...`, 便于确认脚本实际切换过总线。
+
 ### 帧协议
 
 主机 ↔ MCU 之间走一条带校验的二进制帧协议, 帧布局(小端):

@@ -38,6 +38,11 @@ impl Default for MockBus {
 }
 
 impl Bus for MockBus {
+    fn set_bus_kind(&mut self, kind: rseq_vm::BusKind, arg: u32) -> Result<(), BusError> {
+        self.ops.push(BusOp::BusSelect { kind, arg });
+        Ok(())
+    }
+
     fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
         for i in 0..data.len() {
             data[i] = self.memory.get(&(addr + i as u32)).copied().unwrap_or(0);

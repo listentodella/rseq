@@ -1,4 +1,4 @@
-use crate::bus::{Bus, BusError, ReportArg};
+use crate::bus::{Bus, BusError, BusKind, ReportArg};
 use crate::opcode::{Opcode, REPORT_ARG_BYTES, REPORT_ARG_U32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +93,13 @@ impl<'a, B: Bus> Vm<'a, B> {
         self.pc += 1;
 
         match Opcode::from_u8(opcode_byte) {
+            Some(Opcode::SetBus) => {
+                let kind = BusKind::from_u8(self.read_u8()?).ok_or(VmError::InvalidOpcode)?;
+                let arg = self.read_u32()?;
+                self.bus
+                    .set_bus_kind(kind, arg)
+                    .map_err(VmError::BusError)?;
+            }
             Some(Opcode::Read) => {
                 let addr = self.read_u32()?;
                 let len = self.read_len()?;
@@ -519,15 +526,24 @@ mod tests {
     /// 简易 mock bus，仅用于 VM 单元测试。
     struct TestBus {
         mem: [u8; 256],
+        selected_bus: Option<(BusKind, u32)>,
     }
 
     impl TestBus {
         fn new() -> Self {
-            Self { mem: [0; 256] }
+            Self {
+                mem: [0; 256],
+                selected_bus: None,
+            }
         }
     }
 
     impl Bus for TestBus {
+        fn set_bus_kind(&mut self, kind: BusKind, arg: u32) -> Result<(), BusError> {
+            self.selected_bus = Some((kind, arg));
+            Ok(())
+        }
+
         fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
             for (i, slot) in data.iter_mut().enumerate() {
                 *slot = self.mem[(addr as usize + i) % 256];
@@ -600,6 +616,23 @@ mod tests {
         let mut vm = Vm::new(&mut bus, &program);
         vm.run().unwrap();
         assert_eq!(vm.regs[2], 30);
+    }
+
+    #[test]
+    fn set_bus_opcode_selects_bus_kind() {
+        let program = [
+            Opcode::SetBus as u8,
+            BusKind::I2c as u8,
+            0x6a,
+            0x00,
+            0x00,
+            0x00,
+            Opcode::Return as u8,
+        ];
+        let mut bus = TestBus::new();
+        let mut vm = Vm::new(&mut bus, &program);
+        vm.run().unwrap();
+        assert_eq!(bus.selected_bus, Some((BusKind::I2c, 0x6a)));
     }
 
     #[test]

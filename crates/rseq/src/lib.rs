@@ -73,6 +73,8 @@ enum Token<'a> {
     UpdateMacro,
     #[token("chip!")]
     ChipMacro,
+    #[token("bus!")]
+    BusMacro,
     #[token("irq!")]
     IrqMacro,
     #[token("repeat!")]
@@ -197,6 +199,7 @@ impl fmt::Display for Token<'_> {
             Self::WriteMacro => write!(f, "write!"),
             Self::UpdateMacro => write!(f, "update!"),
             Self::ChipMacro => write!(f, "chip!"),
+            Self::BusMacro => write!(f, "bus!"),
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
             Self::PrintMacro => write!(f, "print!"),
@@ -279,6 +282,13 @@ impl fmt::Display for ReportOptionValue {
 pub enum Stmt {
     Chip {
         path: String,
+    },
+    /// `bus!(spi)` / `bus!(i2c[, addr])` / `bus!(i3c)`：选择后续寄存器
+    /// 读写使用的物理总线。`arg` 预留给总线特定参数；当前 I2C 使用它
+    /// 作为 7-bit slave address。
+    Bus {
+        kind: String,
+        arg: Option<u32>,
     },
     Let {
         name: String,
@@ -710,6 +720,19 @@ where
         .then_ignore(just(Token::Semicolon).or_not())
         .map(|path| Stmt::Chip { path });
 
+    let bus_stmt = just(Token::BusMacro)
+        .ignore_then(
+            select! { Token::Ident(s) => s.to_string() }
+                .then(
+                    just(Token::Comma)
+                        .ignore_then(select! { Token::Number(n) => n })
+                        .or_not(),
+                )
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(kind, arg)| Stmt::Bus { kind, arg });
+
     let let_stmt = just(Token::Let)
         .ignore_then(select! { Token::Ident(s) => s.to_string() })
         .then(just(Token::Assign).ignore_then(expr()))
@@ -853,6 +876,7 @@ where
         .map(|(pin, timeout_ms)| Stmt::Wait { pin, timeout_ms });
 
     chip_stmt
+        .or(bus_stmt)
         .or(let_stmt)
         .or(update_stmt)
         .or(write_stmt)
@@ -1067,6 +1091,8 @@ pub enum CompileError {
     BufferOverflow,
     /// 未知的 `report!` 类型名。
     UnknownReportKind(String),
+    /// 未知的 `bus!` 总线类型。
+    UnknownBusKind(String),
 }
 
 impl fmt::Display for CompileError {
@@ -1113,6 +1139,9 @@ impl fmt::Display for CompileError {
             }
             Self::UnknownReportKind(name) => {
                 write!(f, "unknown report kind '{name}'")
+            }
+            Self::UnknownBusKind(name) => {
+                write!(f, "unknown bus kind '{name}', expected spi, i2c, or i3c")
             }
         }
     }
@@ -1411,6 +1440,12 @@ fn compile_stmt(
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Chip { .. } => {}
+        Stmt::Bus { kind, arg } => {
+            let kind = resolve_bus_kind(kind)?;
+            bytecode.push(rseq_vm::Opcode::SetBus as u8);
+            bytecode.push(kind as u8);
+            bytecode.extend_from_slice(&arg.unwrap_or(0).to_le_bytes());
+        }
         Stmt::Irq { pin, arms } => {
             let pin_id = irqs.len() as u8;
             let tmpl = compile_irq(pin, pin_id, arms, registry)?;
@@ -2185,7 +2220,19 @@ fn compile_help(error: &CompileError) -> Option<String> {
         CompileError::NoInterruptStatus => Some(
             "declare an interrupt status register (role interrupt_status) and ideally an interrupt_status_snapshot view in the chip YAML so irq! events can be dispatched in a single read".to_string(),
         ),
+        CompileError::UnknownBusKind(_) => Some(
+            "use bus!(spi), bus!(i2c), bus!(i2c, 0x6a), or bus!(i3c) before the reads/writes that should use that physical bus".to_string(),
+        ),
         _ => None,
+    }
+}
+
+fn resolve_bus_kind(kind: &str) -> Result<rseq_vm::BusKind, CompileError> {
+    match kind {
+        "spi" | "SPI" => Ok(rseq_vm::BusKind::Spi),
+        "i2c" | "I2C" => Ok(rseq_vm::BusKind::I2c),
+        "i3c" | "I3C" => Ok(rseq_vm::BusKind::I3c),
+        _ => Err(CompileError::UnknownBusKind(kind.to_string())),
     }
 }
 
@@ -2227,6 +2274,21 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
 
     while pc < bytecode.len() {
         match rseq_vm::Opcode::from_u8(bytecode[pc]) {
+            Some(rseq_vm::Opcode::SetBus) => {
+                pc += 1;
+                if pc + 5 > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let kind =
+                    rseq_vm::BusKind::from_u8(bytecode[pc]).ok_or(DecompileError::InvalidOpcode)?;
+                pc += 1;
+                let arg = read_u32(bytecode, &mut pc)?;
+                if arg == 0 {
+                    output.push_str(&format!("bus!({});\n", kind.as_str()));
+                } else {
+                    output.push_str(&format!("bus!({}, 0x{arg:x});\n", kind.as_str()));
+                }
+            }
             Some(rseq_vm::Opcode::Read) => {
                 pc += 1;
                 let addr = read_u32(bytecode, &mut pc)?;
@@ -2984,6 +3046,49 @@ mod tests {
         let program = parse(src).unwrap();
         assert_eq!(program.stmts.len(), 2);
         assert!(matches!(&program.stmts[0], Stmt::Chip { path } if path == "qmi8660.yaml"));
+    }
+
+    #[test]
+    fn test_parse_bus_select() {
+        let program = parse("bus!(i2c, 0x6a); bus!(spi); bus!(i3c);").unwrap();
+        assert_eq!(program.stmts.len(), 3);
+        assert!(matches!(
+            &program.stmts[0],
+            Stmt::Bus { kind, arg } if kind == "i2c" && *arg == Some(0x6a)
+        ));
+        assert!(matches!(
+            &program.stmts[1],
+            Stmt::Bus { kind, arg } if kind == "spi" && arg.is_none()
+        ));
+        assert!(matches!(
+            &program.stmts[2],
+            Stmt::Bus { kind, arg } if kind == "i3c" && arg.is_none()
+        ));
+    }
+
+    #[test]
+    fn test_compile_bus_select_emits_set_bus() {
+        let bytecode = compile(&parse("bus!(i2c, 0x6a);").unwrap()).unwrap();
+        assert_eq!(bytecode[0], rseq_vm::Opcode::SetBus as u8);
+        assert_eq!(bytecode[1], rseq_vm::BusKind::I2c as u8);
+        assert_eq!(u32::from_le_bytes(bytecode[2..6].try_into().unwrap()), 0x6a);
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_decompile_bus_select() {
+        let bytecode = compile(&parse("bus!(i2c, 0x6a); bus!(spi); bus!(i3c);").unwrap()).unwrap();
+        let decompiled = decompile(&bytecode).unwrap();
+        assert!(decompiled.contains("bus!(i2c, 0x6a);"));
+        assert!(decompiled.contains("bus!(spi);"));
+        assert!(decompiled.contains("bus!(i3c);"));
+    }
+
+    #[test]
+    fn test_unknown_bus_kind_errors() {
+        let program = parse("bus!(can);").unwrap();
+        let err = compile(&program).unwrap_err();
+        assert!(matches!(err, CompileError::UnknownBusKind(ref kind) if kind == "can"));
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub const TRACE_OP_IRQ: u8 = 0x05;
 pub const TRACE_OP_REPORT: u8 = 0x06;
 /// Trace op:结构化上报 v2，自动携带 frame_id 与 timestamp。
 pub const TRACE_OP_REPORT_V2: u8 = 0x07;
+/// Trace op:总线选择（`bus!`）。
+pub const TRACE_OP_BUS_SELECT: u8 = 0x08;
 
 /// Trace 载荷最大长度。R/W 为 4103；`report!` v2 可携带元信息、1 个
 /// 4096B raw buffer 与最多 7 个 u32 参数，因此上限为 4153。
@@ -52,6 +54,11 @@ pub enum TraceRef<'a> {
         meta: Option<ReportMeta>,
         kind: u32,
         args: ReportArgs<'a>,
+    },
+    /// `bus!(...)` 总线选择，`arg` 为总线特定参数。
+    BusSelect {
+        kind: rseq_vm::BusKind,
+        arg: u32,
     },
 }
 
@@ -199,6 +206,25 @@ pub fn encode_trace_irq(out: &mut [u8], pin: u8) -> usize {
     out[4] = (PAYLOAD_LEN >> 8) as u8;
     out[5] = TRACE_OP_IRQ;
     out[6] = pin;
+    let crc = crate::crc32::crc32(&out[2..5 + PAYLOAD_LEN]);
+    out[5 + PAYLOAD_LEN..5 + PAYLOAD_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+    total
+}
+
+/// 在 `out` 中构造一条 BusSelect Trace 帧（`bus!`），返回总字节数。
+/// 载荷 = `op + kind:u8 + arg:u32`。
+pub fn encode_trace_bus_select(out: &mut [u8], kind: rseq_vm::BusKind, arg: u32) -> usize {
+    const PAYLOAD_LEN: usize = 1 + 1 + 4;
+    let total = OVERHEAD + PAYLOAD_LEN;
+    assert!(out.len() >= total, "trace bus buffer too small");
+    out[0] = 0x55;
+    out[1] = 0xAA;
+    out[2] = FrameType::Trace as u8;
+    out[3] = (PAYLOAD_LEN & 0xFF) as u8;
+    out[4] = (PAYLOAD_LEN >> 8) as u8;
+    out[5] = TRACE_OP_BUS_SELECT;
+    out[6] = kind as u8;
+    out[7..11].copy_from_slice(&arg.to_le_bytes());
     let crc = crate::crc32::crc32(&out[2..5 + PAYLOAD_LEN]);
     out[5 + PAYLOAD_LEN..5 + PAYLOAD_LEN + 4].copy_from_slice(&crc.to_le_bytes());
     total
@@ -440,6 +466,14 @@ pub fn decode_trace(payload: &[u8]) -> Option<TraceRef<'_>> {
                 args: decode_report_args(payload, 19, count)?,
             })
         }
+        TRACE_OP_BUS_SELECT => {
+            if payload.len() < 1 + 1 + 4 {
+                return None;
+            }
+            let kind = rseq_vm::BusKind::from_u8(payload[1])?;
+            let arg = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+            Some(TraceRef::BusSelect { kind, arg })
+        }
         _ => None,
     }
 }
@@ -666,6 +700,26 @@ mod tests {
         let (ty, p) = payload.expect("frame decoded");
         assert_eq!(ty, FrameType::Trace);
         assert_eq!(decode_trace(&p), Some(TraceRef::Irq { pin: 2 }));
+    }
+
+    #[test]
+    fn trace_bus_select_round_trip() {
+        let mut buf = vec![0u8; 32];
+        let n = encode_trace_bus_select(&mut buf, rseq_vm::BusKind::I2c, 0x6a);
+        let mut dec = crate::frame::FrameDecoder::<{ crate::frame::HOST_FRAME_BUF }>::new();
+        let mut payload = None;
+        dec.feed(&buf[..n], |ty, p| {
+            payload = Some((ty, p.to_vec()));
+        });
+        let (ty, p) = payload.expect("frame decoded");
+        assert_eq!(ty, FrameType::Trace);
+        assert_eq!(
+            decode_trace(&p),
+            Some(TraceRef::BusSelect {
+                kind: rseq_vm::BusKind::I2c,
+                arg: 0x6a
+            })
+        );
     }
 
     #[test]

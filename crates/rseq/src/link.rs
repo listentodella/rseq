@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
 use rseq_link::wire::{
-    CONTROL_MAX_READ_LEN, ControlResultRef, ControlStatus, ExecStatus, TraceRef,
-    decode_control_result, decode_trace, encode_control_bus_read_into, encode_load_main_into,
-    encode_load_segments_into,
+    CONTROL_MAX_READ_LEN, CONTROL_MAX_WRITE_LEN, ControlResultRef, ControlStatus, ExecStatus,
+    TraceRef, decode_control_result, decode_trace, encode_control_bus_read_into,
+    encode_control_bus_write_into, encode_load_main_into, encode_load_segments_into,
 };
 use rseq_link::{LinkError, Transport};
 
@@ -36,6 +36,14 @@ pub struct ControlReadResult {
     pub request_id: u16,
     pub addr: u32,
     pub data: Vec<u8>,
+}
+
+/// 直接控制写的结果。它走 Control/ControlResult 帧，不会替换 MCU 当前加载的 rseq 程序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlWriteResult {
+    pub request_id: u16,
+    pub addr: u32,
+    pub len: u16,
 }
 
 /// 把解码出的 Trace 记录转成主机侧共享的 [`BusOp`](数据拷贝出帧缓冲)。
@@ -334,6 +342,78 @@ impl<T: Transport> HostLink<T> {
         }
     }
 
+    /// 直接写入 MCU 当前物理总线上的一段寄存器。
+    ///
+    /// 这条路径使用 Control/ControlResult 帧，不会 LOAD/EXEC 临时脚本，也不会清除
+    /// 已注册的 IRQ handler。等待响应期间收到的 Trace 会被丢弃；UI 类调用方若想
+    /// 保留 Trace 流，应使用 [`HostLink::control_write_observing`]。
+    pub fn control_write(
+        &mut self,
+        addr: u32,
+        data: &[u8],
+    ) -> Result<ControlWriteResult, LinkError> {
+        self.control_write_observing(addr, data, DEFAULT_TIMEOUT, |_| {})
+    }
+
+    /// 直接写入寄存器，并在等待 ControlResult 时把穿插到来的 Trace 交给回调。
+    pub fn control_write_observing<F>(
+        &mut self,
+        addr: u32,
+        data: &[u8],
+        timeout: Duration,
+        mut on_trace: F,
+    ) -> Result<ControlWriteResult, LinkError>
+    where
+        F: FnMut(BusOp),
+    {
+        if data.is_empty() || data.len() > CONTROL_MAX_WRITE_LEN {
+            return Err(LinkError::Nak(ControlStatus::AccessSizeMismatch as u8));
+        }
+
+        let request_id = self.alloc_control_id();
+        let mut payload = vec![0u8; 1 + 2 + 4 + 2 + data.len()];
+        let n = encode_control_bus_write_into(&mut payload, request_id, addr, data);
+        self.send_frame(FrameType::Control, &payload[..n])?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (ty, p) = self.next_frame(deadline)?.ok_or(LinkError::Timeout)?;
+            match ty {
+                FrameType::ControlResult => {
+                    let Some(ControlResultRef::BusWrite {
+                        request_id: got_id,
+                        status,
+                        addr: got_addr,
+                        len,
+                    }) = decode_control_result(&p)
+                    else {
+                        return Err(LinkError::UnknownType);
+                    };
+                    if got_id != request_id {
+                        continue;
+                    }
+                    if status != ControlStatus::Ok {
+                        return Err(LinkError::Nak(status as u8));
+                    }
+                    return Ok(ControlWriteResult {
+                        request_id: got_id,
+                        addr: got_addr,
+                        len,
+                    });
+                }
+                FrameType::Trace => {
+                    if let Some(r) = decode_trace(&p) {
+                        on_trace(BusOp::from(r));
+                    }
+                }
+                FrameType::Result => {
+                    // A stale EXEC result can be left in a long-running report stream; ignore it.
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 复位 MCU 程序区;收到 ACK 即返回。
     pub fn reset(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Reset, &[])?;
@@ -363,8 +443,8 @@ mod tests {
     use rseq_link::wire::{
         REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta as WireReportMeta, TRACE_OP_READ,
         TRACE_OP_WRITE, decode_control_request, encode_control_bus_read_result_into,
-        encode_trace_delay, encode_trace_log, encode_trace_report, encode_trace_report_v2,
-        encode_trace_rw,
+        encode_control_bus_write_result_into, encode_trace_delay, encode_trace_log,
+        encode_trace_report, encode_trace_report_v2, encode_trace_rw,
     };
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
@@ -602,6 +682,46 @@ mod tests {
                 addr: 0x10,
                 data: vec![0x01]
             }]
+        );
+    }
+
+    #[test]
+    fn control_write_writes_control_frame_and_reads_result() {
+        let mut result_payload = vec![0u8; 16];
+        let n = encode_control_bus_write_result_into(
+            &mut result_payload,
+            1,
+            ControlStatus::Ok,
+            0x20,
+            2,
+        );
+        let rx = frame(FrameType::ControlResult, &result_payload[..n]);
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let res = link.control_write(0x20, &[0xaa, 0x55]).unwrap();
+
+        assert_eq!(
+            res,
+            ControlWriteResult {
+                request_id: 1,
+                addr: 0x20,
+                len: 2
+            }
+        );
+        let w = &link.transport_mut().writes;
+        assert_eq!(w[2], FrameType::Control as u8);
+        let payload_len = u16::from_le_bytes([w[3], w[4]]) as usize;
+        assert_eq!(
+            decode_control_request(&w[5..5 + payload_len]),
+            Some(rseq_link::wire::ControlRequestRef::BusWrite {
+                request_id: 1,
+                addr: 0x20,
+                data: &[0xaa, 0x55]
+            })
         );
     }
 

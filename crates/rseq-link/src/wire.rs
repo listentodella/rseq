@@ -30,9 +30,13 @@ pub const MAX_TRACE_PAYLOAD: usize = 1 + 1 + 4 + 8 + 4 + 1 + 7 * (1 + 4) + (1 + 
 // ── Control 载荷 ─────────────────────────────────────────────
 /// Control op:直接读取当前 MCU 总线上的寄存器。
 pub const CONTROL_OP_BUS_READ: u8 = 0x01;
+/// Control op:直接写入当前 MCU 总线上的寄存器。
+pub const CONTROL_OP_BUS_WRITE: u8 = 0x02;
 /// 单次直接控制读的最大长度。寄存器 dump 通常为 1..4 字节，64B 足够覆盖
 /// 小块调试读取，同时避免在持续 report 流中制造过大的控制响应。
 pub const CONTROL_MAX_READ_LEN: usize = 64;
+/// 单次直接控制写的最大长度。保持与读路径一致，避免长控制帧干扰 report 流。
+pub const CONTROL_MAX_WRITE_LEN: usize = 64;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,11 +75,16 @@ impl ControlStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlRequestRef {
+pub enum ControlRequestRef<'a> {
     BusRead {
         request_id: u16,
         addr: u32,
         len: u16,
+    },
+    BusWrite {
+        request_id: u16,
+        addr: u32,
+        data: &'a [u8],
     },
 }
 
@@ -86,6 +95,12 @@ pub enum ControlResultRef<'a> {
         status: ControlStatus,
         addr: u32,
         data: &'a [u8],
+    },
+    BusWrite {
+        request_id: u16,
+        status: ControlStatus,
+        addr: u32,
+        len: u16,
     },
 }
 
@@ -308,8 +323,35 @@ pub fn encode_control_bus_read_into(out: &mut [u8], request_id: u16, addr: u32, 
     PAYLOAD_LEN
 }
 
+/// 构造 Control/BusWrite 请求载荷，返回 payload 字节数。
+///
+/// 布局：`[op=0x02][request_id u16 LE][addr u32 LE][dlen u16 LE][data]`。
+pub fn encode_control_bus_write_into(
+    out: &mut [u8],
+    request_id: u16,
+    addr: u32,
+    data: &[u8],
+) -> usize {
+    assert!(
+        data.len() <= CONTROL_MAX_WRITE_LEN,
+        "control write payload exceeds CONTROL_MAX_WRITE_LEN"
+    );
+    let payload_len = 1 + 2 + 4 + 2 + data.len();
+    assert!(
+        out.len() >= payload_len,
+        "control write payload buffer too small"
+    );
+    out[0] = CONTROL_OP_BUS_WRITE;
+    out[1..3].copy_from_slice(&request_id.to_le_bytes());
+    out[3..7].copy_from_slice(&addr.to_le_bytes());
+    let dlen = data.len() as u16;
+    out[7..9].copy_from_slice(&dlen.to_le_bytes());
+    out[9..9 + data.len()].copy_from_slice(data);
+    payload_len
+}
+
 /// 解码 Control 请求载荷。
-pub fn decode_control_request(payload: &[u8]) -> Option<ControlRequestRef> {
+pub fn decode_control_request(payload: &[u8]) -> Option<ControlRequestRef<'_>> {
     if payload.is_empty() {
         return None;
     }
@@ -322,6 +364,20 @@ pub fn decode_control_request(payload: &[u8]) -> Option<ControlRequestRef> {
                 request_id: u16::from_le_bytes([payload[1], payload[2]]),
                 addr: u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]),
                 len: u16::from_le_bytes([payload[7], payload[8]]),
+            })
+        }
+        CONTROL_OP_BUS_WRITE => {
+            if payload.len() < 1 + 2 + 4 + 2 {
+                return None;
+            }
+            let dlen = u16::from_le_bytes([payload[7], payload[8]]) as usize;
+            if dlen > CONTROL_MAX_WRITE_LEN || payload.len() != 9 + dlen {
+                return None;
+            }
+            Some(ControlRequestRef::BusWrite {
+                request_id: u16::from_le_bytes([payload[1], payload[2]]),
+                addr: u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]),
+                data: &payload[9..9 + dlen],
             })
         }
         _ => None,
@@ -357,6 +413,29 @@ pub fn encode_control_bus_read_result_into(
     payload_len
 }
 
+/// 构造 ControlResult/BusWrite 响应载荷，返回 payload 字节数。
+///
+/// 布局：`[op=0x02][request_id u16 LE][status u8][addr u32 LE][dlen u16 LE]`。
+pub fn encode_control_bus_write_result_into(
+    out: &mut [u8],
+    request_id: u16,
+    status: ControlStatus,
+    addr: u32,
+    len: u16,
+) -> usize {
+    const PAYLOAD_LEN: usize = 1 + 2 + 1 + 4 + 2;
+    assert!(
+        out.len() >= PAYLOAD_LEN,
+        "control write result payload buffer too small"
+    );
+    out[0] = CONTROL_OP_BUS_WRITE;
+    out[1..3].copy_from_slice(&request_id.to_le_bytes());
+    out[3] = status as u8;
+    out[4..8].copy_from_slice(&addr.to_le_bytes());
+    out[8..10].copy_from_slice(&len.to_le_bytes());
+    PAYLOAD_LEN
+}
+
 /// 解码 ControlResult 载荷。
 pub fn decode_control_result(payload: &[u8]) -> Option<ControlResultRef<'_>> {
     if payload.is_empty() {
@@ -379,6 +458,17 @@ pub fn decode_control_result(payload: &[u8]) -> Option<ControlResultRef<'_>> {
                 status,
                 addr,
                 data: &payload[10..10 + dlen],
+            })
+        }
+        CONTROL_OP_BUS_WRITE => {
+            if payload.len() != 1 + 2 + 1 + 4 + 2 {
+                return None;
+            }
+            Some(ControlResultRef::BusWrite {
+                request_id: u16::from_le_bytes([payload[1], payload[2]]),
+                status: ControlStatus::from_u8(payload[3])?,
+                addr: u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                len: u16::from_le_bytes([payload[8], payload[9]]),
             })
         }
         _ => None,
@@ -900,6 +990,33 @@ mod tests {
                 status: ControlStatus::Ok,
                 addr: 0x2e,
                 data: &data
+            })
+        );
+    }
+
+    #[test]
+    fn control_bus_write_round_trip() {
+        let data = [0xaa, 0x55];
+        let mut req = vec![0u8; 32];
+        let n = encode_control_bus_write_into(&mut req, 9, 0x20, &data);
+        assert_eq!(
+            decode_control_request(&req[..n]),
+            Some(ControlRequestRef::BusWrite {
+                request_id: 9,
+                addr: 0x20,
+                data: &data
+            })
+        );
+
+        let mut res = vec![0u8; 16];
+        let n = encode_control_bus_write_result_into(&mut res, 9, ControlStatus::Ok, 0x20, 2);
+        assert_eq!(
+            decode_control_result(&res[..n]),
+            Some(ControlResultRef::BusWrite {
+                request_id: 9,
+                status: ControlStatus::Ok,
+                addr: 0x20,
+                len: 2
             })
         );
     }

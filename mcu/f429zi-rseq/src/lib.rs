@@ -20,9 +20,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use rseq_link::frame::{encode_into, FrameDecoder, FrameType, OVERHEAD};
 use rseq_link::wire::{
-    decode_control_request, encode_control_bus_read_result_into, load_segments,
-    ControlRequestRef, ControlStatus, ExecStatus, CONTROL_MAX_READ_LEN, SEG_KIND_IRQ_INT1,
-    SEG_KIND_MAIN,
+    decode_control_request, encode_control_bus_read_result_into,
+    encode_control_bus_write_result_into, load_segments, ControlRequestRef, ControlStatus,
+    ExecStatus, CONTROL_MAX_READ_LEN, CONTROL_MAX_WRITE_LEN, SEG_KIND_IRQ_INT1, SEG_KIND_MAIN,
 };
 use rseq_link::{LinkError, TracingBus, Transport};
 use rseq_vm::{Bus, BusError, BusKind, Vm};
@@ -499,6 +499,18 @@ fn send_control_read_result<T: Transport>(
     send_frame(transport, FrameType::ControlResult, &payload[..n])
 }
 
+fn send_control_write_result<T: Transport>(
+    transport: &mut T,
+    request_id: u16,
+    status: ControlStatus,
+    addr: u32,
+    len: u16,
+) -> Result<(), LinkError> {
+    let mut payload = alloc::vec![0u8; 1 + 2 + 1 + 4 + 2];
+    let n = encode_control_bus_write_result_into(&mut payload, request_id, status, addr, len);
+    send_frame(transport, FrameType::ControlResult, &payload[..n])
+}
+
 fn handle_control_frame<B: Bus, T: Transport>(
     payload: &[u8],
     bus: &mut B,
@@ -535,6 +547,38 @@ fn handle_control_frame<B: Bus, T: Transport>(
                     ControlStatus::from_bus_error(error),
                     addr,
                     &[],
+                ),
+            }
+        }
+        Some(ControlRequestRef::BusWrite {
+            request_id,
+            addr,
+            data,
+        }) => {
+            if data.is_empty() || data.len() > CONTROL_MAX_WRITE_LEN {
+                return send_control_write_result(
+                    transport,
+                    request_id,
+                    ControlStatus::AccessSizeMismatch,
+                    addr,
+                    data.len() as u16,
+                );
+            }
+
+            match bus.write(addr, data) {
+                Ok(()) => send_control_write_result(
+                    transport,
+                    request_id,
+                    ControlStatus::Ok,
+                    addr,
+                    data.len() as u16,
+                ),
+                Err(error) => send_control_write_result(
+                    transport,
+                    request_id,
+                    ControlStatus::from_bus_error(error),
+                    addr,
+                    0,
                 ),
             }
         }

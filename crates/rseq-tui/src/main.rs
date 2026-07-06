@@ -312,7 +312,16 @@ enum AppEvent {
 
 #[derive(Debug, Clone)]
 enum SourceCommand {
-    ReadRegister { addr: u32, len: u16, label: String },
+    ReadRegister {
+        addr: u32,
+        len: u16,
+        label: String,
+    },
+    WriteRegister {
+        addr: u32,
+        data: Vec<u8>,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +329,20 @@ struct RegisterReadTarget {
     addr: u32,
     len: u16,
     label: String,
+}
+
+#[derive(Debug, Clone)]
+struct RegisterWriteTarget {
+    addr: u32,
+    width: Option<usize>,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct RegisterWriteDialog {
+    target: RegisterWriteTarget,
+    input: String,
+    error: Option<String>,
 }
 
 struct App {
@@ -333,6 +356,7 @@ struct App {
     registers: BTreeMap<u32, RegisterValue>,
     selected_register_addr: u32,
     register_detail_open: bool,
+    register_write_dialog: Option<RegisterWriteDialog>,
     reports: VecDeque<String>,
     logs: VecDeque<String>,
     sample_counter: u64,
@@ -359,6 +383,7 @@ impl App {
             registers: BTreeMap::new(),
             selected_register_addr: 0,
             register_detail_open: false,
+            register_write_dialog: None,
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
             sample_counter: 0,
@@ -373,6 +398,10 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
+        if self.handle_register_write_dialog_key(code) {
+            return;
+        }
+
         if self.selected_tab() == Tab::Registers && self.handle_register_key(code) {
             return;
         }
@@ -391,9 +420,48 @@ impl App {
         }
     }
 
+    fn handle_register_write_dialog_key(&mut self, code: KeyCode) -> bool {
+        if self.register_write_dialog.is_none() {
+            return false;
+        }
+
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.register_write_dialog = None;
+                true
+            }
+            KeyCode::Enter => {
+                self.submit_register_write_dialog();
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.register_write_dialog {
+                    dialog.input.pop();
+                    dialog.error = None;
+                }
+                true
+            }
+            KeyCode::Delete => {
+                if let Some(dialog) = &mut self.register_write_dialog {
+                    dialog.input.clear();
+                    dialog.error = None;
+                }
+                true
+            }
+            KeyCode::Char(ch) if is_register_write_input_char(ch) => {
+                if let Some(dialog) = &mut self.register_write_dialog {
+                    dialog.input.push(ch);
+                    dialog.error = None;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn handle_register_key(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Esc if self.register_detail_open => {
+            KeyCode::Esc | KeyCode::Char('q') if self.register_detail_open => {
                 self.register_detail_open = false;
                 true
             }
@@ -403,6 +471,10 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.request_selected_register_dump();
+                true
+            }
+            KeyCode::Char('w') => {
+                self.open_selected_register_write_dialog();
                 true
             }
             KeyCode::Left => {
@@ -494,6 +566,86 @@ impl App {
         }
     }
 
+    fn open_selected_register_write_dialog(&mut self) {
+        let target = match self.selected_register_write_target() {
+            Ok(target) => target,
+            Err(reason) => {
+                push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                return;
+            }
+        };
+
+        let input = self
+            .registers
+            .get(&target.addr)
+            .map(|value| hex_bytes(&value.data))
+            .unwrap_or_default();
+        self.register_write_dialog = Some(RegisterWriteDialog {
+            target,
+            input,
+            error: None,
+        });
+    }
+
+    fn submit_register_write_dialog(&mut self) {
+        let Some(dialog) = &mut self.register_write_dialog else {
+            return;
+        };
+
+        let data = match parse_register_write_bytes(&dialog.input) {
+            Ok(data) => data,
+            Err(err) => {
+                dialog.error = Some(err);
+                return;
+            }
+        };
+
+        if let Some(width) = dialog.target.width {
+            if data.len() != width {
+                dialog.error = Some(format!("expected {width} byte(s), got {}", data.len()));
+                return;
+            }
+        }
+
+        if data.len() > rseq_link::wire::CONTROL_MAX_WRITE_LEN {
+            dialog.error = Some(format!(
+                "write length {} exceeds limit {}",
+                data.len(),
+                rseq_link::wire::CONTROL_MAX_WRITE_LEN
+            ));
+            return;
+        }
+
+        let target = dialog.target.clone();
+        let Some(tx) = &self.source_commands else {
+            dialog.error = Some("write unavailable: no active source command channel".to_string());
+            return;
+        };
+
+        match tx.send(SourceCommand::WriteRegister {
+            addr: target.addr,
+            data: data.clone(),
+            label: target.label.clone(),
+        }) {
+            Ok(()) => {
+                push_bounded(
+                    &mut self.logs,
+                    format!(
+                        "write request {} @ 0x{:02x}: [{}]",
+                        target.label,
+                        target.addr,
+                        hex_bytes(&data)
+                    ),
+                    MAX_TEXT_LINES,
+                );
+                self.register_write_dialog = None;
+            }
+            Err(_) => {
+                dialog.error = Some("write failed: source thread is not running".to_string());
+            }
+        }
+    }
+
     fn selected_register_read_target(&self) -> Result<RegisterReadTarget, String> {
         let addr = self.selected_register_addr;
         if self.register_dump.is_no_dump(addr) {
@@ -515,6 +667,32 @@ impl App {
         Ok(RegisterReadTarget {
             addr,
             len: 1,
+            label: format!("0x{addr:02x}"),
+        })
+    }
+
+    fn selected_register_write_target(&self) -> Result<RegisterWriteTarget, String> {
+        let addr = self.selected_register_addr;
+        let regs = self.register_dump.registers_for_addr(addr);
+        let exact = regs
+            .iter()
+            .copied()
+            .find(|reg| register_is_writable(&reg.access) && reg.addr == addr);
+        let covering = regs
+            .iter()
+            .copied()
+            .find(|reg| register_is_writable(&reg.access));
+        if let Some(reg) = exact.or(covering) {
+            return register_write_target_from_info(reg);
+        }
+
+        if regs.iter().any(|reg| !register_is_writable(&reg.access)) {
+            return Err(format!("0x{addr:02x} is read-only; write skipped"));
+        }
+
+        Ok(RegisterWriteTarget {
+            addr,
+            width: Some(1),
             label: format!("0x{addr:02x}"),
         })
     }
@@ -600,6 +778,36 @@ fn register_read_target_from_info(reg: &RegisterInfo) -> Result<RegisterReadTarg
     })
 }
 
+fn register_write_target_from_info(reg: &RegisterInfo) -> Result<RegisterWriteTarget, String> {
+    if !register_is_writable(&reg.access) {
+        return Err(format!(
+            "{}.{} is read-only; write skipped",
+            reg.page, reg.name
+        ));
+    }
+
+    let width = reg.width.max(1);
+    if width as usize > rseq_link::wire::CONTROL_MAX_WRITE_LEN {
+        return Err(format!(
+            "{}.{} width {} exceeds control write limit {}",
+            reg.page,
+            reg.name,
+            width,
+            rseq_link::wire::CONTROL_MAX_WRITE_LEN
+        ));
+    }
+
+    Ok(RegisterWriteTarget {
+        addr: reg.addr,
+        width: Some(width as usize),
+        label: format!("{}.{}", reg.page, reg.name),
+    })
+}
+
+fn register_is_writable(access: &str) -> bool {
+    access.chars().any(|ch| ch == 'w' || ch == 'W')
+}
+
 fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, cap: usize) {
     if cap == 0 {
         return;
@@ -617,6 +825,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -627,7 +836,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Tab::Registers => render_registers(frame, root[1], app),
         Tab::Logs => render_logs(frame, root[1], app),
     }
-    render_status(frame, root[2], app);
+    render_help(frame, root[2], app);
+    render_status(frame, root[3], app);
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -807,6 +1017,9 @@ fn render_registers(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.register_detail_open {
         render_register_detail(frame, centered_rect(area, 74, 70), app);
     }
+    if let Some(dialog) = &app.register_write_dialog {
+        render_register_write_dialog(frame, centered_rect(area, 62, 28), dialog);
+    }
 }
 
 fn register_grid_max_addr(app: &App) -> u32 {
@@ -937,6 +1150,45 @@ fn render_register_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_register_write_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &RegisterWriteDialog) {
+    frame.render_widget(Clear, area);
+    let mut lines = Vec::new();
+    let width = dialog
+        .target
+        .width
+        .map(|width| width.to_string())
+        .unwrap_or_else(|| "any".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("reg ", Style::default().fg(Color::DarkGray)),
+        Span::raw(dialog.target.label.clone()),
+        Span::styled(" addr ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("0x{:02x}", dialog.target.addr)),
+        Span::styled(" bytes ", Style::default().fg(Color::DarkGray)),
+        Span::raw(width),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Yellow)),
+        Span::raw(dialog.input.clone()),
+    ]));
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("write register: Enter send | Esc/q cancel"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -963,6 +1215,68 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("logs"))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let hints = help_spans(app);
+    frame.render_widget(Paragraph::new(Line::from(hints)), area);
+}
+
+fn help_spans(app: &App) -> Vec<Span<'static>> {
+    if app.register_write_dialog.is_some() {
+        return key_hint_spans(&[
+            ("Enter", "write"),
+            ("Esc/q", "cancel"),
+            ("Backspace", "edit"),
+            ("Del", "clear"),
+        ]);
+    }
+
+    if app.selected_tab() == Tab::Registers && app.register_detail_open {
+        return key_hint_spans(&[
+            ("q/Esc", "close detail"),
+            ("r", "dump"),
+            ("w", "write"),
+            ("arrows", "select"),
+            ("Tab", "switch"),
+        ]);
+    }
+
+    if app.selected_tab() == Tab::Registers {
+        return key_hint_spans(&[
+            ("arrows", "select"),
+            ("r", "dump"),
+            ("w", "write"),
+            ("Enter/i", "detail"),
+            ("Tab", "switch"),
+            ("q", "quit"),
+        ]);
+    }
+
+    key_hint_spans(&[
+        ("Tab/Shift+Tab", "switch"),
+        ("1-4", "jump"),
+        ("q/Esc", "quit"),
+    ])
+}
+
+fn key_hint_spans(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(hints.len() * 4);
+    spans.push(Span::styled("keys ", Style::default().fg(Color::DarkGray)));
+    for (idx, (key, action)) in hints.iter().enumerate() {
+        if idx != 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw(*action));
+    }
+    spans
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1035,6 +1349,17 @@ fn spawn_demo_source(tx: Sender<AppEvent>, cmd_rx: Receiver<SourceCommand>, stop
                         });
                         let _ = tx.send(AppEvent::Log(format!(
                             "demo dump {label} @ 0x{addr:02x} len={len}: [{}]",
+                            hex_bytes(&data)
+                        )));
+                    }
+                    SourceCommand::WriteRegister { addr, data, label } => {
+                        let _ = tx.send(AppEvent::Register {
+                            addr,
+                            access: AccessKind::Write,
+                            data: data.clone(),
+                        });
+                        let _ = tx.send(AppEvent::Log(format!(
+                            "demo write {label} @ 0x{addr:02x}: [{}]",
                             hex_bytes(&data)
                         )));
                     }
@@ -1256,6 +1581,33 @@ fn handle_source_command(
                 }
             }
         }
+        SourceCommand::WriteRegister { addr, data, label } => {
+            let result = host.control_write_observing(addr, &data, Duration::from_secs(2), |op| {
+                handle_bus_op(op, report_decoders, tx)
+            });
+            match result {
+                Ok(result) => {
+                    let _ = tx.send(AppEvent::Register {
+                        addr: result.addr,
+                        access: AccessKind::Write,
+                        data: data.clone(),
+                    });
+                    let _ = tx.send(AppEvent::Log(format!(
+                        "write {} @ 0x{:02x} len={}: [{}]",
+                        label,
+                        result.addr,
+                        result.len,
+                        hex_bytes(&data)
+                    )));
+                }
+                Err(err) => {
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "write {label} @ 0x{addr:02x} data=[{}] failed: {err}",
+                        hex_bytes(&data)
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -1410,6 +1762,77 @@ fn hex_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn is_register_write_input_char(ch: char) -> bool {
+    ch.is_ascii_hexdigit()
+        || matches!(
+            ch,
+            'x' | 'X' | ' ' | '\t' | ',' | ';' | '_' | '[' | ']' | '{' | '}'
+        )
+}
+
+fn parse_register_write_bytes(input: &str) -> Result<Vec<u8>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("enter at least one byte".to_string());
+    }
+
+    let normalized = trimmed
+        .chars()
+        .map(|ch| match ch {
+            ',' | ';' | '[' | ']' | '{' | '}' => ' ',
+            _ => ch,
+        })
+        .collect::<String>();
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() == 1 {
+        return parse_register_write_token(tokens[0]);
+    }
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let bytes = parse_register_write_token(token)?;
+        if bytes.len() != 1 {
+            return Err(format!("token '{token}' expands to more than one byte"));
+        }
+        out.extend(bytes);
+    }
+    Ok(out)
+}
+
+fn parse_register_write_token(token: &str) -> Result<Vec<u8>, String> {
+    let mut hex = token.trim();
+    if hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(stripped) = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")) {
+        hex = stripped;
+    }
+    let compact = hex.replace('_', "");
+    if compact.is_empty() || !compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("invalid hex byte '{token}'"));
+    }
+
+    if compact.len() <= 2 {
+        let value =
+            u8::from_str_radix(&compact, 16).map_err(|_| format!("invalid hex byte '{token}'"))?;
+        return Ok(vec![value]);
+    }
+
+    let padded = if compact.len() % 2 == 0 {
+        compact
+    } else {
+        format!("0{compact}")
+    };
+    let mut out = Vec::with_capacity(padded.len() / 2);
+    for idx in (0..padded.len()).step_by(2) {
+        let byte = u8::from_str_radix(&padded[idx..idx + 2], 16)
+            .map_err(|_| format!("invalid hex byte '{token}'"))?;
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2090,5 +2513,83 @@ mod tests {
         app.selected_register_addr = 0x57;
 
         assert!(app.selected_register_read_target().is_err());
+    }
+
+    #[test]
+    fn parses_register_write_hex_bytes() {
+        assert_eq!(
+            parse_register_write_bytes("12 0x34,56").unwrap(),
+            vec![0x12, 0x34, 0x56]
+        );
+        assert_eq!(
+            parse_register_write_bytes("0x1234").unwrap(),
+            vec![0x12, 0x34]
+        );
+        assert_eq!(parse_register_write_bytes("abc").unwrap(), vec![0x0a, 0xbc]);
+    }
+
+    #[test]
+    fn selected_register_write_rejects_read_only_yaml_register() {
+        let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
+        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        app.selected_register_addr = 0x00;
+
+        assert!(app.selected_register_write_target().is_err());
+    }
+
+    #[test]
+    fn selected_register_write_uses_yaml_width_for_rw_register() {
+        let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
+        let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
+        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        app.selected_register_addr = 0x0b;
+
+        let target = app
+            .selected_register_write_target()
+            .expect("COMM_CTL is writable");
+        assert_eq!(target.addr, 0x0b);
+        assert_eq!(target.width, Some(1));
+    }
+
+    #[test]
+    fn q_closes_register_write_dialog_without_quitting() {
+        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        app.register_write_dialog = Some(RegisterWriteDialog {
+            target: RegisterWriteTarget {
+                addr: 0x0b,
+                width: Some(1),
+                label: "UI.COMM_CTL".to_string(),
+            },
+            input: "00".to_string(),
+            error: None,
+        });
+
+        app.handle_key(KeyCode::Char('q'));
+
+        assert!(app.running);
+        assert!(app.register_write_dialog.is_none());
+    }
+
+    #[test]
+    fn q_closes_register_detail_without_quitting() {
+        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        app.tab = 2;
+        app.register_detail_open = true;
+
+        app.handle_key(KeyCode::Char('q'));
+
+        assert!(app.running);
+        assert!(!app.register_detail_open);
+    }
+
+    #[test]
+    fn q_quits_when_no_register_overlay_is_open() {
+        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        app.tab = 2;
+
+        app.handle_key(KeyCode::Char('q'));
+
+        assert!(!app.running);
     }
 }

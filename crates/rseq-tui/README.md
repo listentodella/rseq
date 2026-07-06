@@ -47,4 +47,10 @@ details for the selected register.
 In the Registers tab, move the selected cell with the arrow keys and press `r` to actively dump the
 selected register. This sends a `Control` BusRead frame to the MCU, so it does not replace the
 currently loaded rseq program or clear background IRQ/report handlers. Registers marked `no_dump` in
-the YAML are never actively read and remain `??`.
+the YAML are never actively read and remain `??`. Press `Enter` or `i` to view register metadata,
+then press `q` or `Esc` to close the detail view.
+
+Press `w` on a writable register to open the write dialog. Enter hex bytes such as `12`, `0x12`,
+`12 34`, or `0x1234`, then press Enter to send a `Control` BusWrite frame. Press `q` or `Esc` to
+cancel the dialog without exiting the TUI. Registers marked read-only in YAML are rejected by the TUI
+before a control frame is sent.

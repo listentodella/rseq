@@ -2,7 +2,7 @@
  * rseq MCU — USB CDC + UART FFI for Rust.
  *
  *  - rust_usb_enable(): bring up Zephyr's "new" USB device stack (one CDC-ACM
- *    port) so the host sees "rseq F429ZI CDC". Each step is printk'd for
+ *    port) so the host sees "rseq MCU CDC". Each step is printk'd for
  *    bring-up diagnostics (logs go to USART3 / ST-Link VCP).
  *  - rust_uart_init/read/write: the CDC-ACM UART (RX irq→K_MSGQ, blocking;
  *    TX uart_poll_out under a mutex) used as the rseq-link Transport.
@@ -36,7 +36,7 @@ USBD_DEVICE_DEFINE(udev,
 
 USBD_DESC_LANG_DEFINE(udev_lang);
 USBD_DESC_MANUFACTURER_DEFINE(udev_mfr, "rseq");
-USBD_DESC_PRODUCT_DEFINE(udev_product, "rseq F429ZI CDC");
+USBD_DESC_PRODUCT_DEFINE(udev_product, "rseq MCU CDC");
 USBD_DESC_SERIAL_NUMBER_DEFINE(udev_sn); /* from hwinfo (chip UID) */
 USBD_DESC_CONFIG_DEFINE(udev_cfg_desc, "CDC");
 

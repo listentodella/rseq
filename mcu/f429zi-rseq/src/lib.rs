@@ -1,9 +1,10 @@
-//! rseq MCU firmware (Nucleo F429ZI).
+//! rseq MCU firmware (Nucleo boards).
 //!
 //! Speaks the rseq-link frame protocol ([0x55 0xAA] sync + CRC32) over the USB
 //! CDC-ACM port: receives Load/Exec/Reset/Ping, sends Ack/Trace/Result/Pong.
-//! On Exec, the rseq VM runs the loaded bytecode against [`ImuSpiBus`] (a real
-//! QMI8660 IMU over SPI), and a [`TracingBus`] emits a Trace frame per bus op.
+//! On Exec, the rseq VM runs the loaded bytecode against [`PhysicalBus`]
+//! (real SPI/I2C/I3C bridge FFI), and a [`TracingBus`] emits a Trace frame per
+//! bus op.
 //!
 //! no_std + alloc; the `zephyr` crate supplies the global allocator, panic
 //! handler, and log backend (logs go to USART3 / ST-Link VCP).
@@ -20,7 +21,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use rseq_link::frame::{encode_into, FrameDecoder, FrameType, OVERHEAD};
 use rseq_link::wire::{load_segments, ExecStatus, SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
 use rseq_link::{LinkError, TracingBus, Transport};
-use rseq_vm::{Bus, BusError, Vm};
+use rseq_vm::{Bus, BusError, BusKind, Vm};
 
 // ── IRQ 处理器存储 ────────────────────────────────────────────
 /// 最多支持 2 个中断引脚（INT1/INT2）
@@ -59,6 +60,26 @@ mod ffi {
         pub fn rust_spi_cs_init() -> i32;
         pub fn rust_spi_cs_set_low() -> i32;
         pub fn rust_spi_cs_set_high() -> i32;
+        pub fn rust_i2c_bus_is_ready() -> i32;
+        pub fn rust_i2c_bus_write(addr: u16, data: *const u8, len: usize) -> i32;
+        pub fn rust_i2c_bus_write_read(
+            addr: u16,
+            write_data: *const u8,
+            write_len: usize,
+            read_data: *mut u8,
+            read_len: usize,
+        ) -> i32;
+        pub fn rust_i3c_bus_is_ready() -> i32;
+        #[allow(dead_code)]
+        pub fn rust_i3c_bus_write(addr: u16, data: *const u8, len: usize) -> i32;
+        #[allow(dead_code)]
+        pub fn rust_i3c_bus_write_read(
+            addr: u16,
+            write_data: *const u8,
+            write_len: usize,
+            read_data: *mut u8,
+            read_len: usize,
+        ) -> i32;
         pub fn rust_irq_init() -> i32;
         pub fn rust_irq_wait(pin: u8, timeout_ms: u32) -> i32;
     }
@@ -109,30 +130,28 @@ impl Transport for CdcTransport {
 }
 
 // ============================================================================
-// Bus: rseq-vm Bus over the QMI8660 SPI FFI
+// Bus: rseq-vm Bus over the generic SPI/I2C/I3C FFI
 // ============================================================================
 
-/// Scratch for SPI frames: 1 header byte + payload. QMI8660 reads are <=4 and
-/// writes are small, so 64 is ample; oversized ops fail with AccessSizeMismatch.
+/// Scratch for SPI frames: 1 register/header byte + payload.
 const SPI_SCRATCH: usize = 64;
 const SPI_MAX_PAYLOAD: usize = SPI_SCRATCH - 1;
-const QMI8660_FIFO_DATA_REG: u8 = 0x57;
+const I2C_SCRATCH: usize = 64;
+const I2C_MAX_WRITE_PAYLOAD: usize = I2C_SCRATCH - 1;
 
-/// rseq [`Bus`] over the IMU's SPI. The rseq DSL encodes a plain 8-bit register
-/// number as the `u32` address, so `addr & 0xff` is the register. QMI8660 SPI
-/// convention: read header = `reg | 0x80`, write header = `reg & 0x7f`, and the
-/// first received byte (response to the header) is a dummy that must be stripped.
-struct ImuSpiBus;
+/// rseq [`Bus`] over board-provided physical buses. The rseq DSL encodes a
+/// plain 8-bit register number as the `u32` address, so `addr & 0xff` is the
+/// register. `bus!(spi)` uses the
+/// common 8-bit register SPI convention (`reg|0x80` read, `reg&0x7f` write);
+/// `bus!(i2c, addr)` uses I2C write-read with the register byte as sub-address.
+struct PhysicalBus {
+    active: BusKind,
+    i2c_addr: u16,
+}
 
-impl ImuSpiBus {
+impl PhysicalBus {
     fn new() -> Result<Self, i32> {
-        printk("rseq: ImuSpiBus::new start\n");
-
-        check(unsafe { ffi::rust_spi_bus_is_ready() })?;
-        printk("rseq: spi ready\n");
-
-        check(unsafe { ffi::rust_spi_cs_init() })?;
-        printk("rseq: cs init ok\n");
+        printk("rseq: PhysicalBus::new start\n");
 
         let ret = unsafe { ffi::rust_irq_init() };
         if ret == 0 {
@@ -142,7 +161,43 @@ impl ImuSpiBus {
         }
         check(ret)?;
 
-        Ok(Self)
+        Self::default_bus().map_err(|_| -1)
+    }
+
+    fn default_bus() -> Result<Self, BusError> {
+        if unsafe { ffi::rust_spi_bus_is_ready() } == 0 {
+            check(unsafe { ffi::rust_spi_cs_init() }).map_err(|_| BusError::HardwareFailure)?;
+            printk("rseq: default bus -> spi\n");
+            return Ok(Self {
+                active: BusKind::Spi,
+                i2c_addr: 0,
+            });
+        }
+
+        if unsafe { ffi::rust_i2c_bus_is_ready() } == 0 {
+            printk("rseq: default bus -> i2c (address unset)\n");
+            return Ok(Self {
+                active: BusKind::I2c,
+                i2c_addr: 0,
+            });
+        }
+
+        if unsafe { ffi::rust_i3c_bus_is_ready() } == 0 {
+            printk("rseq: default bus -> i3c\n");
+            return Ok(Self {
+                active: BusKind::I3c,
+                i2c_addr: 0,
+            });
+        }
+
+        printk("rseq: no physical bus ready\n");
+        Err(BusError::HardwareFailure)
+    }
+
+    fn ensure_spi_ready(&self) -> Result<(), BusError> {
+        check(unsafe { ffi::rust_spi_bus_is_ready() }).map_err(|_| BusError::HardwareFailure)?;
+        check(unsafe { ffi::rust_spi_cs_init() }).map_err(|_| BusError::HardwareFailure)?;
+        Ok(())
     }
 
     fn cs_low() -> Result<(), BusError> {
@@ -180,10 +235,21 @@ impl ImuSpiBus {
         data.copy_from_slice(&rx[1..1 + len]);
         Ok(())
     }
-}
 
-impl Bus for ImuSpiBus {
-    fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+    fn i2c_addr_from_arg(arg: u32) -> Result<u16, BusError> {
+        if arg == 0 || arg > 0x7f {
+            return Err(BusError::InvalidAddress);
+        }
+        Ok(arg as u16)
+    }
+
+    fn i2c_write_read_addr(addr: u16, reg: u8, data: &mut [u8]) -> Result<(), i32> {
+        check(unsafe {
+            ffi::rust_i2c_bus_write_read(addr, &reg as *const u8, 1, data.as_mut_ptr(), data.len())
+        })
+    }
+
+    fn read_spi(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
         let len = data.len();
         if len == 0 {
             return Err(BusError::AccessSizeMismatch);
@@ -195,17 +261,13 @@ impl Bus for ImuSpiBus {
             return Self::read_chunk(reg, data);
         }
 
-        if reg != QMI8660_FIFO_DATA_REG {
-            return Err(BusError::AccessSizeMismatch);
-        }
-
         for chunk in data.chunks_mut(SPI_MAX_PAYLOAD) {
             Self::read_chunk(reg, chunk)?;
         }
         Ok(())
     }
 
-    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+    fn write_spi(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
         let len = data.len();
         if len == 0 || len + 1 > SPI_SCRATCH {
             return Err(BusError::AccessSizeMismatch);
@@ -217,10 +279,6 @@ impl Bus for ImuSpiBus {
         tx[1..1 + len].copy_from_slice(data);
         let total = 1 + len;
 
-        // printk(&alloc::format!(
-        //     "rseq: spi write start reg=0x{reg:02x} len={len} first=0x{:02x}\n",
-        //     data[0]
-        // ));
         Self::cs_low()?;
         let ret =
             unsafe { ffi::rust_spi_bus_transceive(tx.as_ptr(), total, core::ptr::null_mut(), 0) };
@@ -231,8 +289,99 @@ impl Bus for ImuSpiBus {
             ));
             return Err(BusError::HardwareFailure);
         }
-        // printk(&alloc::format!("rseq: spi write ok reg=0x{reg:02x}\n"));
         Ok(())
+    }
+
+    fn read_i2c(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+        if data.is_empty() {
+            return Err(BusError::AccessSizeMismatch);
+        }
+        if self.i2c_addr == 0 {
+            printk("rseq: i2c read requested before bus!(i2c, addr)\n");
+            return Err(BusError::InvalidAddress);
+        }
+
+        let reg = (addr & 0xff) as u8;
+        if let Err(ret) = Self::i2c_write_read_addr(self.i2c_addr, reg, data) {
+            printk(&alloc::format!(
+                "rseq: i2c read fail dev=0x{:02x} reg=0x{reg:02x} ret={ret}\n",
+                self.i2c_addr
+            ));
+            return Err(BusError::HardwareFailure);
+        }
+        Ok(())
+    }
+
+    fn write_i2c(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+        let len = data.len();
+        if len == 0 || len > I2C_MAX_WRITE_PAYLOAD {
+            return Err(BusError::AccessSizeMismatch);
+        }
+        if self.i2c_addr == 0 {
+            printk("rseq: i2c write requested before bus!(i2c, addr)\n");
+            return Err(BusError::InvalidAddress);
+        }
+
+        let reg = (addr & 0xff) as u8;
+        let mut tx = [0u8; I2C_SCRATCH];
+        tx[0] = reg;
+        tx[1..1 + len].copy_from_slice(data);
+        let total = 1 + len;
+
+        let ret = unsafe { ffi::rust_i2c_bus_write(self.i2c_addr, tx.as_ptr(), total) };
+        if let Err(_e) = check(ret) {
+            printk(&alloc::format!(
+                "rseq: i2c write fail dev=0x{:02x} reg=0x{reg:02x} ret={ret}\n",
+                self.i2c_addr
+            ));
+            return Err(BusError::HardwareFailure);
+        }
+        Ok(())
+    }
+}
+
+impl Bus for PhysicalBus {
+    fn set_bus_kind(&mut self, kind: BusKind, arg: u32) -> Result<(), BusError> {
+        match kind {
+            BusKind::Spi => {
+                self.ensure_spi_ready()?;
+                self.active = BusKind::Spi;
+                printk("rseq: bus select spi\n");
+                Ok(())
+            }
+            BusKind::I2c => {
+                check(unsafe { ffi::rust_i2c_bus_is_ready() })
+                    .map_err(|_| BusError::HardwareFailure)?;
+                let addr = Self::i2c_addr_from_arg(arg)?;
+                self.active = BusKind::I2c;
+                self.i2c_addr = addr;
+                printk(&alloc::format!("rseq: bus select i2c addr=0x{addr:02x}\n"));
+                Ok(())
+            }
+            BusKind::I3c => {
+                let ret = unsafe { ffi::rust_i3c_bus_is_ready() };
+                printk(&alloc::format!(
+                    "rseq: bus select i3c unsupported ret={ret}\n"
+                ));
+                Err(BusError::HardwareFailure)
+            }
+        }
+    }
+
+    fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), BusError> {
+        match self.active {
+            BusKind::Spi => self.read_spi(addr, data),
+            BusKind::I2c => self.read_i2c(addr, data),
+            BusKind::I3c => Err(BusError::HardwareFailure),
+        }
+    }
+
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
+        match self.active {
+            BusKind::Spi => self.write_spi(addr, data),
+            BusKind::I2c => self.write_i2c(addr, data),
+            BusKind::I3c => Err(BusError::HardwareFailure),
+        }
     }
 
     fn delay_us(&mut self, us: u32) -> Result<(), BusError> {
@@ -273,8 +422,8 @@ pub extern "C" fn rust_irq_int1_triggered() {
 
 const READ_CHUNK: usize = 256;
 /// Smaller than HOST_FRAME_BUF (64K) to keep the decoder off the stack; a
-/// LOAD frame larger than this is dropped (auto-resync). QMI8660 programs are
-/// tiny, so 2 KiB is ample.
+/// LOAD frame larger than this is dropped (auto-resync). Current rseq programs
+/// are small, so 2 KiB is ample.
 const DEC_BUF: usize = 2048;
 
 fn send_frame<T: Transport>(t: &mut T, ty: FrameType, payload: &[u8]) -> Result<(), LinkError> {
@@ -463,13 +612,13 @@ pub extern "C" fn rust_main() {
         return;
     }
 
-    let bus = match ImuSpiBus::new() {
+    let bus = match PhysicalBus::new() {
         Ok(b) => {
-            printk("rseq: imu spi ready\n");
+            printk("rseq: physical bus ready\n");
             b
         }
         Err(e) => {
-            printk(&alloc::format!("rseq: imu spi fail={}\n", e));
+            printk(&alloc::format!("rseq: physical bus fail={}\n", e));
             return;
         }
     };

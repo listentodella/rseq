@@ -140,7 +140,8 @@ pub trait Bus {
     /// 选择后续寄存器读写使用的物理总线。
     ///
     /// `arg` 预留给总线特定参数:当前 MCU 实现中 I2C 使用它作为 7-bit slave
-    /// address；为 0 时使用固件默认地址。默认 no-op 让旧的 Mock/测试总线无需改动。
+    /// address；0 表示地址未设置，host 编译器会拒绝 `bus!(i2c)`。默认 no-op
+    /// 让旧的 Mock/测试总线无需改动。
     fn set_bus_kind(&mut self, _kind: BusKind, _arg: u32) -> Result<(), BusError> {
         Ok(())
     }

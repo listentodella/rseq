@@ -1091,6 +1091,10 @@ pub enum CompileError {
     BufferOverflow,
     /// 未知的 `report!` 类型名。
     UnknownReportKind(String),
+    /// I2C 总线选择缺少 7-bit 从机地址。
+    MissingI2cAddress,
+    /// I2C 从机地址不在 7-bit 有效范围内。
+    InvalidI2cAddress(u32),
     /// 未知的 `bus!` 总线类型。
     UnknownBusKind(String),
 }
@@ -1139,6 +1143,12 @@ impl fmt::Display for CompileError {
             }
             Self::UnknownReportKind(name) => {
                 write!(f, "unknown report kind '{name}'")
+            }
+            Self::MissingI2cAddress => {
+                write!(f, "bus!(i2c) requires an explicit 7-bit address")
+            }
+            Self::InvalidI2cAddress(addr) => {
+                write!(f, "invalid I2C address 0x{addr:x}; expected 0x01..0x7f")
             }
             Self::UnknownBusKind(name) => {
                 write!(f, "unknown bus kind '{name}', expected spi, i2c, or i3c")
@@ -1442,9 +1452,10 @@ fn compile_stmt(
         Stmt::Chip { .. } => {}
         Stmt::Bus { kind, arg } => {
             let kind = resolve_bus_kind(kind)?;
+            let arg = resolve_bus_arg(kind, *arg)?;
             bytecode.push(rseq_vm::Opcode::SetBus as u8);
             bytecode.push(kind as u8);
-            bytecode.extend_from_slice(&arg.unwrap_or(0).to_le_bytes());
+            bytecode.extend_from_slice(&arg.to_le_bytes());
         }
         Stmt::Irq { pin, arms } => {
             let pin_id = irqs.len() as u8;
@@ -2221,7 +2232,13 @@ fn compile_help(error: &CompileError) -> Option<String> {
             "declare an interrupt status register (role interrupt_status) and ideally an interrupt_status_snapshot view in the chip YAML so irq! events can be dispatched in a single read".to_string(),
         ),
         CompileError::UnknownBusKind(_) => Some(
-            "use bus!(spi), bus!(i2c), bus!(i2c, 0x6a), or bus!(i3c) before the reads/writes that should use that physical bus".to_string(),
+            "use bus!(spi), bus!(i2c, 0x6a), or bus!(i3c) before the reads/writes that should use that physical bus".to_string(),
+        ),
+        CompileError::MissingI2cAddress => Some(
+            "the MCU firmware is a generic bridge and does not know chip-specific candidate addresses; put the address in the DSL, for example bus!(i2c, 0x6a)".to_string(),
+        ),
+        CompileError::InvalidI2cAddress(_) => Some(
+            "use a 7-bit I2C slave address; 0 is reserved as 'unset' in the VM bus selector".to_string(),
         ),
         _ => None,
     }
@@ -2233,6 +2250,19 @@ fn resolve_bus_kind(kind: &str) -> Result<rseq_vm::BusKind, CompileError> {
         "i2c" | "I2C" => Ok(rseq_vm::BusKind::I2c),
         "i3c" | "I3C" => Ok(rseq_vm::BusKind::I3c),
         _ => Err(CompileError::UnknownBusKind(kind.to_string())),
+    }
+}
+
+fn resolve_bus_arg(kind: rseq_vm::BusKind, arg: Option<u32>) -> Result<u32, CompileError> {
+    match kind {
+        rseq_vm::BusKind::I2c => {
+            let addr = arg.ok_or(CompileError::MissingI2cAddress)?;
+            if addr == 0 || addr > 0x7f {
+                return Err(CompileError::InvalidI2cAddress(addr));
+            }
+            Ok(addr)
+        }
+        rseq_vm::BusKind::Spi | rseq_vm::BusKind::I3c => Ok(arg.unwrap_or(0)),
     }
 }
 
@@ -3073,6 +3103,18 @@ mod tests {
         assert_eq!(bytecode[1], rseq_vm::BusKind::I2c as u8);
         assert_eq!(u32::from_le_bytes(bytecode[2..6].try_into().unwrap()), 0x6a);
         assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_compile_i2c_bus_requires_address() {
+        let err = compile(&parse("bus!(i2c);").unwrap()).unwrap_err();
+        assert!(matches!(err, CompileError::MissingI2cAddress));
+    }
+
+    #[test]
+    fn test_compile_i2c_bus_rejects_zero_address() {
+        let err = compile(&parse("bus!(i2c, 0);").unwrap()).unwrap_err();
+        assert!(matches!(err, CompileError::InvalidI2cAddress(0)));
     }
 
     #[test]

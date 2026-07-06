@@ -1,0 +1,65 @@
+/*
+ * Copyright (c) 2026 rseq contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Nucleo F401RE board wiring for the rseq generic bus bridge firmware.
+ *
+ * Note: the application still needs a zephyr_udc0 USB device node for the CDC
+ * transport. This board overlay exposes the Arduino bus/INT wiring;
+ * USB availability is determined by the upstream board/SoC devicetree.
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+zephyr_udc0: &usbotg_fs {
+	pinctrl-0 = <&usb_otg_fs_dm_pa11 &usb_otg_fs_dp_pa12>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+#include "../app.overlay"
+
+/ {
+	aliases {
+		rseq-spi = &arduino_spi;
+		rseq-i2c = &arduino_i2c;
+		rseq-int1 = &rseq_int1;
+	};
+
+	rseq_inputs {
+		compatible = "gpio-keys";
+
+		/* Arduino D9 on Nucleo F401RE. */
+		rseq_int1: int1 {
+			gpios = <&gpioc 7 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&dma1 {
+	status = "okay";
+};
+
+&dma2 {
+	status = "okay";
+};
+
+&gpioc {
+	status = "okay";
+};
+
+&arduino_spi {
+	dmas = <&dma2 3 3 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>,
+	       <&dma2 2 3 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>;
+	dma-names = "tx", "rx";
+};
+
+&arduino_i2c {
+	dmas = <&dma1 6 1 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>,
+	       <&dma1 0 1 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>;
+	dma-names = "tx", "rx";
+};

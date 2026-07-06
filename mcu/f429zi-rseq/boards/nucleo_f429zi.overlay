@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2026 rseq contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Nucleo F429ZI board wiring for the rseq generic bus bridge firmware.
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include "../app.overlay"
+
+/ {
+	aliases {
+		rseq-spi = &arduino_spi;
+		rseq-i2c = &arduino_i2c;
+		rseq-int1 = &rseq_int1;
+	};
+
+	rseq_inputs {
+		compatible = "gpio-keys";
+
+		/* Arduino D9 on this board. Matches the existing tested wiring. */
+		rseq_int1: int1 {
+			gpios = <&gpiod 15 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+/* Enable DMA1 for I2C; the upstream board DTS already enables DMA2. */
+&dma1 {
+	status = "okay";
+};
+
+&gpiod {
+	status = "okay";
+};
+
+&arduino_spi {
+	dmas = <&dma2 3 3 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>,
+	       <&dma2 2 3 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>;
+	dma-names = "tx", "rx";
+};
+
+&arduino_i2c {
+	dmas = <&dma1 6 1 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>,
+	       <&dma1 0 1 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)
+		STM32_DMA_FIFO_FULL>;
+	dma-names = "tx", "rx";
+};

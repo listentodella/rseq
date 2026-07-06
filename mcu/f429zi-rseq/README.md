@@ -1,29 +1,29 @@
-# rseq ↔ MCU docking over USB CDC (Nucleo F429ZI)
+# rseq ↔ MCU docking over USB CDC (Nucleo boards)
 
 This Zephyr app (C + Rust) runs the **rseq-link frame protocol** over the
 board's USB CDC-ACM port, so the host-side `rseq-cli` can ship a compiled rseq
-program to the MCU, the MCU executes it against a **real QMI8660 IMU over SPI**,
-and the resulting bus operations are streamed back as Trace frames.
+program to the MCU, the MCU executes it against the board's **real SPI/I2C/I3C
+bridge**, and the resulting bus operations are streamed back as Trace frames.
+Chip-specific knowledge lives in the rseq script and chip YAML, not in this
+firmware.
 
 Verified end-to-end on hardware:
 
 ```
 $ rseq-cli -f examples/qmi8660_reset.rseq --serial /dev/cu.usbmodem314201 --baud 115200
 Dispatching to MCU over serial (/dev/cu.usbmodem314201 @ 115200 baud)...
-✓ Loaded 29 byte(s)
+✓ Loaded 35 byte(s)
 Exec status: Ok
 Bus operations (in execution order):
-  Step 1: Write [0x98] → 0x0000007b   # UI.RESET
-  Step 2: Delay 50000 μs
-  Step 3: Read 1 bytes from 0x00000002 → [0x00]   # UI.WHOAMI
-  Step 4: Delay 100 μs
+  Step 1: Select i2c bus arg=0x0000006a
+  Step 2: Write [0x98] → 0x0000007b   # UI.RESET
+  Step 3: Delay 50000 μs
+  Step 4: Read 1 bytes from 0x00000002 → [0x06]   # UI.WHOAMI
+  Step 5: Delay 100 μs
 ```
 
 The full rseq-link lockstep (Load→Ack, Exec→Ack→Trace*→Result, plus Reset/Ping)
-runs over the CDC port per the spec in `crates/rseq-link/README.md`. (The WHOAMI
-read returns `0x00` here because the IMU wasn't powered on the SPI header — the
-SPI transaction itself succeeds with no BusError; connect the QMI8660 to get
-`0x06`.)
+runs over the CDC port per the spec in `crates/rseq-link/README.md`.
 
 ## Architecture
 
@@ -34,29 +34,44 @@ custom protocol with the rseq-link stack, reusing the rseq crates directly:
   - `CdcTransport` — implements `rseq_link::Transport` over the CDC-UART FFI
     (`rust_uart_read` blocks for the first byte then drains; `rust_uart_write`
     poll-outs under a mutex).
-  - `ImuSpiBus` — implements `rseq_vm::Bus` over the SPI FFI. The rseq DSL
-    encodes a plain 8-bit register number as the `u32` address, so `addr & 0xff`
-    is the register; QMI8660 SPI convention `reg|0x80` (read) / `reg&0x7f`
-    (write) lives here, with CS managed around each transceive.
+  - `PhysicalBus` — implements `rseq_vm::Bus` over the SPI/I2C/I3C FFI. Startup
+    only checks which board buses are present; it does not probe any chip ID or
+    hard-code any device address. The DSL switches at runtime with `bus!(spi)`,
+    `bus!(i2c, addr)`, or `bus!(i3c)`.
+    The rseq DSL encodes a plain 8-bit register number as the `u32` address, so
+    `addr & 0xff` is the register. `bus!(spi)` uses the common 8-bit register
+    SPI convention `reg|0x80` (read) / `reg&0x7f` (write), with CS managed
+    around each transceive. `bus!(i2c, 0x6a)` sets the 7-bit device address for
+    subsequent I2C write-read/write operations. Bare `bus!(i2c)` is rejected by
+    the host compiler because the generic firmware cannot know a chip-specific
+    default address.
   - `mcu_loop` — no_std port of `rseq-mcu-sim`'s loop: `FrameDecoder` → dispatch
     Load/Exec/Reset/Ping → reply Ack/Trace(via `TracingBus`)/Result/Pong.
-  - `rust_main` — `rust_usb_enable` → `rust_uart_init` → `ImuSpiBus::new` →
+  - `rust_main` — `rust_usb_enable` → `rust_uart_init` → `PhysicalBus::new` →
     `mcu_loop(CdcTransport, bus, &STOP)`. The `zephyr` crate supplies the global
     allocator + panic handler; `rust_printk` (FFI) is used for console output.
 - `src/zephyr_cdc_ffi.c` (C) — new-stack USB CDC init (`rust_usb_enable`, one
   CDC port) + the CDC-UART FFI (RX irq→`K_MSGQ`→blocking read, TX `uart_poll_out`)
   + `rust_kernel_delay_us` + `rust_printk`.
 - `src/zephyr_bus_ffi.c` (C, from rseq-rs) — SPI transceive + CS + I2C FFI,
-  devicetree-bound to `arduino_spi` / `spi_probe_dev` / CS.
-- `app.overlay` — one `cdc_acm_uart0` node under `&zephyr_udc0` + the
-  `spi_probe_dev` child on `&arduino_spi`.
+  devicetree-bound through stable aliases:
+  `rseq-spi`, `rseq-i2c`, `rseq-int1`.
+- `app.overlay` — common transport only: one `cdc_acm_uart0` node under
+  `&zephyr_udc0`.
+- `boards/<board>.overlay` — board wiring: USB UDC label when needed, Arduino
+  SPI/I2C aliases, DMA wiring, and the `rseq-int1` GPIO.
 - `prj.conf` — `CONFIG_RUST`/`RUST_ALLOC`, new USB CDC stack, `SPI`/`I2C`/`GPIO`,
-  `HWINFO`, console+`printk` on USART3, `MAIN_STACK_SIZE=16384` (VM 4 KiB scratch
+  `HWINFO`, console+`printk` on board UART, `MAIN_STACK_SIZE=24576` (VM scratch
   + TracingBus ~4 kiB buf during EXEC).
 - `CMakeLists.txt` — `rust_cargo_application()` (the lang-rust module's `main.c`
   provides `main()`→`rust_main()`) + the two C FFI sources.
 
 ## Build
+
+Zephyr automatically picks `boards/<board>.overlay` when it matches `-b`.
+The firmware is built by board/hardware topology only. It does not need a
+bus/address overlay: the script chooses `bus!(spi)` or `bus!(i2c, addr)` at
+runtime.
 
 ```sh
 export ZEPHYR_BASE=/Volumes/tp7100s/work/zephyr/zephyrproject/zephyr
@@ -64,27 +79,53 @@ export ZEPHYR_SDK_INSTALL_DIR=/Volumes/tp7100s/work/zephyr/zephyr-sdk-1.0.1
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
 source /Volumes/tp7100s/work/zephyr/zephyrproject/.venv/bin/activate
 cd /Volumes/tp7100s/work/zephyr/zephyrproject
-west build -b nucleo_f429zi -s /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq \
-  -d /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq/build --pristine
 ```
 
-Artifacts: `build/zephyr/zephyr.{elf,bin,hex}` (FLASH ~97 KiB / 2 MiB, RAM ~34 KiB / 192 KiB).
+F429ZI:
+
+```sh
+west build -b nucleo_f429zi \
+  -s /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq \
+  -d /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq/build-f429zi \
+  --pristine
+```
+
+F401RE:
+
+```sh
+west build -b nucleo_f401re \
+  -s /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq \
+  -d /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq/build-f401re \
+  --pristine
+```
+
+Expected boot log:
+
+```text
+rseq: PhysicalBus::new start
+rseq: irq init ok
+rseq: default bus -> spi
+rseq: physical bus ready
+```
+
+Artifacts live under the selected build directory as
+`zephyr/zephyr.{elf,bin,hex}`.
 
 ## Flash + run
 
-Flash the ELF via J-Link (gdb), then the host enumerates `rseq F429ZI CDC`
+Flash the ELF via J-Link (gdb), then the host enumerates `rseq MCU CDC`
 (`0483:5740`) as a single CDC port:
 
 ```gdb
 target extended-remote <jlink-host>:3333
-load build/zephyr/zephyr.elf
+load <build-dir>/zephyr/zephyr.elf
 monitor reset
 monitor go
 detach
 ```
 
-Console/`printk` logs are on **USART3** (ST-Link VCP). The rseq-link transport
-is the **USB CDC** device (e.g. `/dev/cu.usbmodem*` on macOS).
+Console/`printk` logs are on the board UART console. The rseq-link transport is
+the **USB CDC** device (e.g. `/dev/cu.usbmodem*` on macOS).
 
 Then drive it from the host:
 
@@ -96,10 +137,11 @@ cargo run -p rseq-cli --features serial -- \
 
 ### IRQ smoke test
 
-`wait!(int1, timeout_ms)` maps to VM pin `0`, which this firmware wires to PB8.
+`wait!(int1, timeout_ms)` maps to VM pin `0`, which this firmware wires through
+the `rseq-int1` devicetree alias.
 The Zephyr GPIO ISR only gives a semaphore; the rseq VM resumes in normal
-thread context, emits an IRQ trace, reads the QMI8660 interrupt-status snapshot,
-and runs the matching `irq!(int1)` arm inline.
+thread context, emits an IRQ trace, reads the interrupt-status snapshot declared
+by the chip YAML, and runs the matching `irq!(int1)` arm inline.
 
 Host-only dispatch check:
 
@@ -109,7 +151,8 @@ cargo run -p rseq-cli -- \
   --execute --fire int1=0x41
 ```
 
-Hardware run after the QMI8660 INT1 line is connected to PB8 and the chip has
+Hardware run after the target device INT1 line is connected to the board's
+`rseq-int1` pin and the chip has
 been configured to assert INT1:
 
 ```sh
@@ -124,19 +167,22 @@ matching `on(...)` arm.
 
 ## Wiring
 
-- **USB CDC (transport)**: OTG-FS on PA11(D-)/PA12(D+), enabled by the board
-  DTS as `zephyr_udc0`. Self-powered via ST-Link USB (CN1).
-- **IMU (QMI8660)** on Arduino SPI: SCK/MOSI/MISO = PA7/PA6/PA5 (`arduino_spi`
-  = SPI1), CS = PD10 (`arduino_spi` cs-gpios[0]). Connect + power the IMU for
-  real register reads (e.g. WHOAMI = 0x06).
-- **IMU INT1**: connect the QMI8660 INT1 output to PB8. The overlay declares
-  `rseq_int1` as active-high and the firmware uses `GPIO_INT_EDGE_TO_ACTIVE`.
+- **F429ZI USB CDC (transport)**: OTG-FS on PA11(D-)/PA12(D+), enabled by the
+  upstream board DTS as `zephyr_udc0`.
+- **F401RE USB CDC (transport)**: the overlay enables `usbotg_fs` as
+  `zephyr_udc0` on PA11/PA12. Confirm your board/wiring exposes those pins to
+  the host USB connection; ST-Link VCP alone is not the CDC data channel.
+- **Arduino SPI**: SCK/MISO/MOSI = PA5/PA6/PA7. CS comes from the board DTS
+  `arduino_spi` `cs-gpios` entry: F429ZI uses PD14, F401RE uses PB6.
+- **Arduino I2C**: I2C1 SCL/SDA = PB8/PB9 on both currently supported boards.
+- **Target INT1**: `rseq-int1` is active-high edge-to-active. F429ZI uses PD15
+  (Arduino D9); F401RE uses PC7 (Arduino D9).
 
 ## Notes
 
 - One CDC port only — OTG-FS has 4 bidirectional endpoints and each CDC-ACM
   needs 2, so two CDC-ACM instances don't fit (see the prior single-CDC notes).
-  The rseq transport is the single CDC; logs go to USART3.
+  The rseq transport is the single CDC; logs go to the board UART console.
 - `mcu_loop` is a no_std port of `rseq-mcu-sim`'s loop (blocking-read contract,
   `&AtomicBool` stop); the protocol logic is identical and covered by the
   `rseq-mcu-sim --self-test` host test.

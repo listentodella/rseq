@@ -75,6 +75,8 @@ enum Token<'a> {
     ChipMacro,
     #[token("bus!")]
     BusMacro,
+    #[token("bus_probe!")]
+    BusProbeMacro,
     #[token("irq!")]
     IrqMacro,
     #[token("repeat!")]
@@ -200,6 +202,7 @@ impl fmt::Display for Token<'_> {
             Self::UpdateMacro => write!(f, "update!"),
             Self::ChipMacro => write!(f, "chip!"),
             Self::BusMacro => write!(f, "bus!"),
+            Self::BusProbeMacro => write!(f, "bus_probe!"),
             Self::IrqMacro => write!(f, "irq!"),
             Self::RepeatMacro => write!(f, "repeat!"),
             Self::PrintMacro => write!(f, "print!"),
@@ -289,6 +292,13 @@ pub enum Stmt {
     Bus {
         kind: String,
         arg: Option<u32>,
+    },
+    /// `bus_probe!(kind, { addrs: [...], read: REG, expect: VALUE, ... })`：
+    /// 通用总线探测。MCU 只尝试候选总线参数并读取寄存器匹配期望值；
+    /// 芯片型号、地址候选和 WHOAMI 等知识全部来自 DSL/host。
+    BusProbe {
+        kind: String,
+        options: Vec<(String, Value)>,
     },
     Let {
         name: String,
@@ -549,6 +559,20 @@ where
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
 }
 
+fn bus_probe_option_map<'tok, 'src: 'tok, I>()
+-> impl Parser<'tok, I, Vec<(String, Value)>, ParserExtra<'tok, 'src>> + Clone + 'tok
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+{
+    select! { Token::Ident(s) => s.to_string() }
+        .then_ignore(just(Token::Colon))
+        .then(value())
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
+}
+
 fn report_option_map<'tok, 'src: 'tok, I>()
 -> impl Parser<'tok, I, Vec<(String, ReportOptionValue)>, ParserExtra<'tok, 'src>> + Clone + 'tok
 where
@@ -733,6 +757,15 @@ where
         .then_ignore(just(Token::Semicolon).or_not())
         .map(|(kind, arg)| Stmt::Bus { kind, arg });
 
+    let bus_probe_stmt = just(Token::BusProbeMacro)
+        .ignore_then(
+            select! { Token::Ident(s) => s.to_string() }
+                .then(just(Token::Comma).ignore_then(bus_probe_option_map()))
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then_ignore(just(Token::Semicolon).or_not())
+        .map(|(kind, options)| Stmt::BusProbe { kind, options });
+
     let let_stmt = just(Token::Let)
         .ignore_then(select! { Token::Ident(s) => s.to_string() })
         .then(just(Token::Assign).ignore_then(expr()))
@@ -877,6 +910,7 @@ where
 
     chip_stmt
         .or(bus_stmt)
+        .or(bus_probe_stmt)
         .or(let_stmt)
         .or(update_stmt)
         .or(write_stmt)
@@ -1095,6 +1129,10 @@ pub enum CompileError {
     MissingI2cAddress,
     /// I2C 从机地址不在 7-bit 有效范围内。
     InvalidI2cAddress(u32),
+    /// `bus_probe!` 缺少必需选项。
+    MissingProbeOption(&'static str),
+    /// `bus_probe!` 选项值不合法。
+    InvalidProbeOption(String),
     /// 未知的 `bus!` 总线类型。
     UnknownBusKind(String),
 }
@@ -1149,6 +1187,12 @@ impl fmt::Display for CompileError {
             }
             Self::InvalidI2cAddress(addr) => {
                 write!(f, "invalid I2C address 0x{addr:x}; expected 0x01..0x7f")
+            }
+            Self::MissingProbeOption(name) => {
+                write!(f, "bus_probe! requires option '{name}'")
+            }
+            Self::InvalidProbeOption(msg) => {
+                write!(f, "invalid bus_probe! option: {msg}")
             }
             Self::UnknownBusKind(name) => {
                 write!(f, "unknown bus kind '{name}', expected spi, i2c, or i3c")
@@ -1456,6 +1500,20 @@ fn compile_stmt(
             bytecode.push(rseq_vm::Opcode::SetBus as u8);
             bytecode.push(kind as u8);
             bytecode.extend_from_slice(&arg.to_le_bytes());
+        }
+        Stmt::BusProbe { kind, options } => {
+            let probe = resolve_bus_probe(kind, options, registry)?;
+            bytecode.push(rseq_vm::Opcode::ProbeBus as u8);
+            bytecode.push(probe.kind as u8);
+            bytecode.push(probe.candidates.len() as u8);
+            for candidate in &probe.candidates {
+                bytecode.extend_from_slice(&candidate.to_le_bytes());
+            }
+            bytecode.extend_from_slice(&probe.read_addr.to_le_bytes());
+            bytecode.extend_from_slice(&probe.len.to_le_bytes());
+            bytecode.extend_from_slice(&probe.expect.to_le_bytes());
+            bytecode.extend_from_slice(&probe.mask.to_le_bytes());
+            bytecode.extend_from_slice(&probe.delay_us.to_le_bytes());
         }
         Stmt::Irq { pin, arms } => {
             let pin_id = irqs.len() as u8;
@@ -2240,8 +2298,133 @@ fn compile_help(error: &CompileError) -> Option<String> {
         CompileError::InvalidI2cAddress(_) => Some(
             "use a 7-bit I2C slave address; 0 is reserved as 'unset' in the VM bus selector".to_string(),
         ),
+        CompileError::MissingProbeOption(_) | CompileError::InvalidProbeOption(_) => Some(
+            "use bus_probe!(spi, { read: REG, expect: 0xNN }) or bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: REG, expect: 0xNN })".to_string(),
+        ),
         _ => None,
     }
+}
+
+struct BusProbeConfig {
+    kind: rseq_vm::BusKind,
+    candidates: Vec<u32>,
+    read_addr: u32,
+    len: u32,
+    expect: u32,
+    mask: u32,
+    delay_us: u32,
+}
+
+fn resolve_bus_probe(
+    kind: &str,
+    options: &[(String, Value)],
+    registry: &ChipRegistry,
+) -> Result<BusProbeConfig, CompileError> {
+    let kind = resolve_bus_kind(kind)?;
+    let mut addrs: Option<Vec<u32>> = None;
+    let mut read: Option<Value> = None;
+    let mut expect: Option<Value> = None;
+    let mut len: u32 = 1;
+    let mut mask: Option<u32> = None;
+    let mut delay_us: u32 = 0;
+
+    for (name, value) in options {
+        match name.as_str() {
+            "addrs" | "args" => addrs = Some(resolve_probe_candidates(value)?),
+            "read" | "reg" => read = Some(value.clone()),
+            "expect" => expect = Some(value.clone()),
+            "len" => {
+                len = resolve_probe_number(value, registry)?;
+            }
+            "mask" => {
+                mask = Some(resolve_probe_number(value, registry)?);
+            }
+            "delay_us" | "delay" => {
+                delay_us = resolve_probe_number(value, registry)?;
+            }
+            _ => {
+                return Err(CompileError::InvalidProbeOption(format!(
+                    "unknown option '{name}'"
+                )));
+            }
+        }
+    }
+
+    if len == 0 || len > 4 {
+        return Err(CompileError::InvalidProbeOption(format!(
+            "len must be 1..4, got {len}"
+        )));
+    }
+
+    let candidates = match kind {
+        rseq_vm::BusKind::I2c => {
+            let addrs = addrs.ok_or(CompileError::MissingProbeOption("addrs"))?;
+            if addrs.is_empty() {
+                return Err(CompileError::InvalidProbeOption(
+                    "addrs must not be empty".to_string(),
+                ));
+            }
+            addrs
+                .into_iter()
+                .map(|addr| resolve_bus_arg(kind, Some(addr)))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        rseq_vm::BusKind::Spi | rseq_vm::BusKind::I3c => addrs.unwrap_or_else(|| vec![0]),
+    };
+    if candidates.len() > rseq_vm::PROBE_MAX_CANDIDATES {
+        return Err(CompileError::InvalidProbeOption(format!(
+            "candidate count {} exceeds {}",
+            candidates.len(),
+            rseq_vm::PROBE_MAX_CANDIDATES
+        )));
+    }
+
+    let read = read.ok_or(CompileError::MissingProbeOption("read"))?;
+    let expect = expect.ok_or(CompileError::MissingProbeOption("expect"))?;
+    let read_addr = resolve_u32(&read, registry)?;
+    let expect = resolve_probe_number(&expect, registry)?;
+    let default_mask = if len >= 4 {
+        u32::MAX
+    } else {
+        (1u32 << (len * 8)) - 1
+    };
+
+    Ok(BusProbeConfig {
+        kind,
+        candidates,
+        read_addr,
+        len,
+        expect,
+        mask: mask.unwrap_or(default_mask),
+        delay_us,
+    })
+}
+
+fn resolve_probe_number(value: &Value, registry: &ChipRegistry) -> Result<u32, CompileError> {
+    match value {
+        Value::Number(n) => Ok(*n),
+        Value::Ident(_) => resolve_u32(value, registry),
+        _ => Err(CompileError::InvalidProbeOption(
+            "expected scalar number or register name".to_string(),
+        )),
+    }
+}
+
+fn resolve_probe_candidates(value: &Value) -> Result<Vec<u32>, CompileError> {
+    let Value::Array(values) = value else {
+        return Err(CompileError::InvalidProbeOption(
+            "addrs must be an array of numbers".to_string(),
+        ));
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Number(n) => Ok(*n),
+            _ => Err(CompileError::InvalidProbeOption(
+                "addrs must contain only numbers".to_string(),
+            )),
+        })
+        .collect()
 }
 
 fn resolve_bus_kind(kind: &str) -> Result<rseq_vm::BusKind, CompileError> {
@@ -2318,6 +2501,59 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
                 } else {
                     output.push_str(&format!("bus!({}, 0x{arg:x});\n", kind.as_str()));
                 }
+            }
+            Some(rseq_vm::Opcode::ProbeBus) => {
+                pc += 1;
+                if pc + 2 > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let kind =
+                    rseq_vm::BusKind::from_u8(bytecode[pc]).ok_or(DecompileError::InvalidOpcode)?;
+                pc += 1;
+                let count = bytecode[pc] as usize;
+                pc += 1;
+                if count == 0 || count > rseq_vm::PROBE_MAX_CANDIDATES {
+                    return Err(DecompileError::InvalidOpcode);
+                }
+                if pc + count * 4 + 20 > bytecode.len() {
+                    return Err(DecompileError::UnexpectedEnd);
+                }
+                let mut candidates = Vec::with_capacity(count);
+                for _ in 0..count {
+                    candidates.push(read_u32(bytecode, &mut pc)?);
+                }
+                let addr = read_u32(bytecode, &mut pc)?;
+                let len = read_u32(bytecode, &mut pc)?;
+                let expect = read_u32(bytecode, &mut pc)?;
+                let mask = read_u32(bytecode, &mut pc)?;
+                let delay = read_u32(bytecode, &mut pc)?;
+                output.push_str(&format!("bus_probe!({}, {{ ", kind.as_str()));
+                if kind == rseq_vm::BusKind::I2c {
+                    output.push_str("addrs: [");
+                    for (idx, candidate) in candidates.iter().enumerate() {
+                        if idx != 0 {
+                            output.push_str(", ");
+                        }
+                        output.push_str(&format!("0x{candidate:x}"));
+                    }
+                    output.push_str("], ");
+                }
+                output.push_str(&format!("read: 0x{addr:x}, expect: 0x{expect:x}"));
+                if len != 1 {
+                    output.push_str(&format!(", len: {len}"));
+                }
+                let default_mask = if len >= 4 {
+                    u32::MAX
+                } else {
+                    (1u32 << (len * 8)) - 1
+                };
+                if mask != default_mask {
+                    output.push_str(&format!(", mask: 0x{mask:x}"));
+                }
+                if delay > 0 {
+                    output.push_str(&format!(", delay_us: {delay}"));
+                }
+                output.push_str(" });\n");
             }
             Some(rseq_vm::Opcode::Read) => {
                 pc += 1;
@@ -3097,12 +3333,99 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bus_probe() {
+        let program =
+            parse("bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: 0x00, expect: 0x06 });").unwrap();
+        match &program.stmts[0] {
+            Stmt::BusProbe { kind, options } => {
+                assert_eq!(kind, "i2c");
+                assert_eq!(options.len(), 3);
+                assert!(matches!(
+                    &options[0],
+                    (name, Value::Array(values))
+                        if name == "addrs"
+                            && values == &vec![Value::Number(0x6a), Value::Number(0x6b)]
+                ));
+            }
+            _ => panic!("expected BusProbe"),
+        }
+    }
+
+    #[test]
     fn test_compile_bus_select_emits_set_bus() {
         let bytecode = compile(&parse("bus!(i2c, 0x6a);").unwrap()).unwrap();
         assert_eq!(bytecode[0], rseq_vm::Opcode::SetBus as u8);
         assert_eq!(bytecode[1], rseq_vm::BusKind::I2c as u8);
         assert_eq!(u32::from_le_bytes(bytecode[2..6].try_into().unwrap()), 0x6a);
         assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_compile_bus_probe_emits_probe_bus() {
+        let bytecode = compile(
+            &parse("bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: 0x00, expect: 0x06 });").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bytecode[0], rseq_vm::Opcode::ProbeBus as u8);
+        assert_eq!(bytecode[1], rseq_vm::BusKind::I2c as u8);
+        assert_eq!(bytecode[2], 2);
+        assert_eq!(u32::from_le_bytes(bytecode[3..7].try_into().unwrap()), 0x6a);
+        assert_eq!(
+            u32::from_le_bytes(bytecode[7..11].try_into().unwrap()),
+            0x6b
+        );
+        assert_eq!(bytecode.last(), Some(&(rseq_vm::Opcode::Return as u8)));
+    }
+
+    #[test]
+    fn test_bus_probe_vm_tries_candidates_until_match() {
+        struct ProbeBus {
+            active_arg: u32,
+            selects: Vec<(rseq_vm::BusKind, u32)>,
+        }
+
+        impl rseq_vm::Bus for ProbeBus {
+            fn set_bus_kind(
+                &mut self,
+                kind: rseq_vm::BusKind,
+                arg: u32,
+            ) -> Result<(), rseq_vm::BusError> {
+                self.active_arg = arg;
+                self.selects.push((kind, arg));
+                Ok(())
+            }
+
+            fn read(&mut self, _addr: u32, data: &mut [u8]) -> Result<(), rseq_vm::BusError> {
+                if self.active_arg != 0x6b {
+                    return Err(rseq_vm::BusError::HardwareFailure);
+                }
+                data[0] = 0x06;
+                Ok(())
+            }
+
+            fn write(&mut self, _addr: u32, _data: &[u8]) -> Result<(), rseq_vm::BusError> {
+                Ok(())
+            }
+
+            fn delay_us(&mut self, _us: u32) -> Result<(), rseq_vm::BusError> {
+                Ok(())
+            }
+        }
+
+        let bytecode = compile(
+            &parse("bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: 0x00, expect: 0x06 });").unwrap(),
+        )
+        .unwrap();
+        let mut bus = ProbeBus {
+            active_arg: 0,
+            selects: Vec::new(),
+        };
+        rseq_vm::Vm::new(&mut bus, &bytecode).run().unwrap();
+        assert_eq!(
+            bus.selects,
+            vec![(rseq_vm::BusKind::I2c, 0x6a), (rseq_vm::BusKind::I2c, 0x6b),]
+        );
+        assert_eq!(bus.active_arg, 0x6b);
     }
 
     #[test]

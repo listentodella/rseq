@@ -27,7 +27,7 @@ Register Sequence **传输层**:主机 ↔ MCU 之间的二进制帧协议与可
 
 - 帧头 5 字节(sync2 + type1 + len2),CRC 4 字节,固定开销 `OVERHEAD = 9`。
 - 接收端见到非 `0x55 0xAA` 的字节流时,逐字节重新寻找 sync(**自动重同步**);CRC 错或 type 未知的帧**静默丢弃**并继续寻找下一帧。
-- `len` 上限 65535。Trace 单帧最大载荷 `MAX_TRACE_PAYLOAD = 4103`(op1+addr4+dlen2+data≤4096),整帧最大 `MAX_TRACE_FRAME = 4112`(VM 的 read/write 已限 4096)。
+- `len` 上限 65535。Trace 单帧最大载荷覆盖 read/write、log、bus select 和 report v2；当前 `MAX_TRACE_PAYLOAD = 4153`,整帧最大 `MAX_TRACE_FRAME = 4162`。
 
 ### 1.2 CRC32
 
@@ -47,7 +47,8 @@ Register Sequence **传输层**:主机 ↔ MCU 之间的二进制帧协议与可
 | `0x02` | Exec | H→M | 空 | MCU 回 Ack,随后 Trace 流 + Result |
 | `0x03` | Reset | H→M | 空 | MCU 回 Ack |
 | `0x04` | Ping | H→M | 空 | MCU 回 Pong |
-| `0x81` | Ack | M→H | 空 | 确认收到 Load/Exec/Reset |
+| `0x05` | Stop | H→M | 空 | MCU 回 Ack,清后台 IRQ/report handler |
+| `0x81` | Ack | M→H | 空 | 确认收到 Load/Exec/Reset/Stop |
 | `0x82` | Trace | M→H | Trace 记录(见 2.2) | 尽力而为,不重传 |
 | `0x83` | Result | M→H | `[status u8]`(见 2.3) | Exec 终止状态 |
 | `0x84` | Pong | M→H | 空 | 响应 Ping |
@@ -142,6 +143,8 @@ Trace Write(addr=0x40, data=[01,02,03]):  payload = [0x02][0x40 LE][3 LE][01 02 
   │            ←──  Result  │  (终止状态)
   │  Reset                ──→│
   │            ←──  Ack     │
+  │  Stop                 ──→│
+  │            ←──  Ack     │
   │  Ping                 ──→│
   │            ←──  Pong    │
 ```
@@ -194,6 +197,7 @@ host.load(&bytecode)?;            // → Ack
 let res = host.exec()?;           // → Ack, 收 Trace 流, → Result
 // res.status: ExecStatus, res.traces: Vec<BusOp>
 host.ping()?;                     // → Pong
+host.stop_reports()?;             // → Ack, clear background report stream
 ```
 
 ### 6.2 MCU 端(经 `rseq-mcu-sim::mcu_loop`)

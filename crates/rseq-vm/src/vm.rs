@@ -24,6 +24,7 @@ pub const REG_COUNT: usize = 256;
 /// 4096 字节 slot，避免 MCU 栈/内存预算失控。
 pub const DATA_BUF_COUNT: usize = 1;
 pub const DATA_BUF_LEN: usize = 4096;
+pub const PROBE_MAX_CANDIDATES: usize = 16;
 
 pub struct Vm<'a, B: Bus> {
     bus: &'a mut B,
@@ -99,6 +100,53 @@ impl<'a, B: Bus> Vm<'a, B> {
                 self.bus
                     .set_bus_kind(kind, arg)
                     .map_err(VmError::BusError)?;
+            }
+            Some(Opcode::ProbeBus) => {
+                let kind = BusKind::from_u8(self.read_u8()?).ok_or(VmError::InvalidOpcode)?;
+                let count = self.read_u8()? as usize;
+                if count == 0 || count > PROBE_MAX_CANDIDATES {
+                    return Err(VmError::InvalidLength);
+                }
+                let mut candidates = [0u32; PROBE_MAX_CANDIDATES];
+                for slot in candidates.iter_mut().take(count) {
+                    *slot = self.read_u32()?;
+                }
+                let addr = self.read_u32()?;
+                let len = self.read_u32()?;
+                let expect = self.read_u32()?;
+                let mask = self.read_u32()?;
+                let delay = self.read_u32()?;
+                if len == 0 || len > 4 {
+                    return Err(VmError::InvalidLength);
+                }
+
+                let mut last_error = BusError::InvalidAddress;
+                for &arg in candidates.iter().take(count) {
+                    if let Err(error) = self.bus.set_bus_kind(kind, arg) {
+                        last_error = error;
+                        continue;
+                    }
+
+                    let mut buffer = [0u8; 4];
+                    let data = &mut buffer[..len as usize];
+                    if let Err(error) = self.bus.read(addr, data) {
+                        last_error = error;
+                        continue;
+                    }
+
+                    let mut value = 0u32;
+                    for (i, &b) in data.iter().enumerate() {
+                        value |= (b as u32) << (8 * i);
+                    }
+                    if (value & mask) == (expect & mask) {
+                        if delay > 0 {
+                            self.bus.delay_us(delay).map_err(VmError::BusError)?;
+                        }
+                        return Ok(Step::Continue);
+                    }
+                    last_error = BusError::InvalidAddress;
+                }
+                return Err(VmError::BusError(last_error));
             }
             Some(Opcode::Read) => {
                 let addr = self.read_u32()?;

@@ -71,6 +71,7 @@ MCU 侧主循环:读帧 → 处理 → 回复,直到 `stop` 被置位。
 | `Load` | 解析段,存主程序字节码(irq 段忽略)→ 回 `Ack` |
 | `Exec` | 回 `Ack` → 用 `TracingBus` 包裹 `bus` 跑 `Vm`(每次总线操作发 `Trace`)→ 回 `Result(status)` |
 | `Reset` | 清程序区 → 回 `Ack` |
+| `Stop` | 清后台流(模拟器无 IRQ handler, 仅确认协议) → 回 `Ack` |
 | `Ping` | 回 `Pong` |
 
 EXEC 时:`TracingBus::new(bus, &mut transport)` 借用 transport 作 `LinkTx`,跑完 `into_inner()` 回收总线并释放借用,随后继续读下一帧。

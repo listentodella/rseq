@@ -165,6 +165,30 @@ impl<T: Transport> HostLink<T> {
         }
     }
 
+    /// 等待一条控制响应，同时丢弃期间积压的 Trace/Result。
+    ///
+    /// 用于 `Stop`/`Reset` 这类“主机要夺回控制权”的命令：MCU 可能已经在
+    /// 连续上报 FIFO 数据，若把所有旧 Trace 都 deferred 到 inbox，ACK 还没到
+    /// 主机内存就会被历史数据拖住。这里保留非观测类帧，丢弃观测流。
+    fn expect_control_ack(&mut self, deadline: Instant) -> Result<(), LinkError> {
+        let mut deferred: Vec<(FrameType, Vec<u8>)> = Vec::new();
+        loop {
+            match self.next_frame(deadline)? {
+                None => return Err(LinkError::Timeout),
+                Some((FrameType::Ack, _)) => {
+                    for f in deferred.into_iter().rev() {
+                        self.inbox.push_front(f);
+                    }
+                    return Ok(());
+                }
+                Some((FrameType::Trace | FrameType::Result, _)) => {
+                    // Drop stale observations while waiting for control ACK.
+                }
+                Some(other) => deferred.push(other),
+            }
+        }
+    }
+
     // ── 高层协议 ────────────────────────────────────────────
 
     /// 下发主程序字节码;MCU 收到后回 ACK。bytecode 末尾应以 Return 结尾。
@@ -233,7 +257,15 @@ impl<T: Transport> HostLink<T> {
     /// 复位 MCU 程序区;收到 ACK 即返回。
     pub fn reset(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Reset, &[])?;
-        let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
+        self.expect_control_ack(Instant::now() + DEFAULT_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// 请求 MCU 停止后台 IRQ/report 流。MCU 会清除已注册的 IRQ handler 与
+    /// pending 标志，但不会擦除已加载的主程序字节码。
+    pub fn stop_reports(&mut self) -> Result<(), LinkError> {
+        self.send_frame(FrameType::Stop, &[])?;
+        self.expect_control_ack(Instant::now() + DEFAULT_TIMEOUT)?;
         Ok(())
     }
 
@@ -352,6 +384,25 @@ mod tests {
         link.ping().unwrap();
         let w = &link.transport_mut().writes;
         assert_eq!(w[2], FrameType::Ping as u8);
+    }
+
+    #[test]
+    fn stop_reports_drops_stale_traces_until_ack() {
+        let mut rx = Vec::new();
+        let mut stale = vec![0u8; 32];
+        let n = encode_trace_log(&mut stale, "stale");
+        rx.extend(&stale[..n]);
+        rx.extend(frame(FrameType::Ack, &[]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        link.stop_reports().unwrap();
+        let w = &link.transport_mut().writes;
+        assert_eq!(w[2], FrameType::Stop as u8);
+        assert!(link.inbox.is_empty());
     }
 
     #[test]

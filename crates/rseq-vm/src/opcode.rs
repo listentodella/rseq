@@ -45,6 +45,9 @@ pub enum Opcode {
     /// `bus!(spi|i2c|i3c[, arg])`：读 `kind:u8` + `arg:u32`，调
     /// `Bus::set_bus_kind` 选择后续寄存器读写的物理总线。
     SetBus = 0x2B,
+    /// `bus_probe!(kind, { ... })`：读候选 bus args 和一个寄存器期望值，
+    /// 逐个尝试 `set_bus_kind + read`，首个匹配者成为后续读写的 active bus。
+    ProbeBus = 0x2C,
     Read = 0x01,
     Write = 0x02,
     Update = 0x03,
@@ -97,6 +100,7 @@ impl Opcode {
             0x29 => Some(Self::WaitIrq),
             0x2A => Some(Self::Report),
             0x2B => Some(Self::SetBus),
+            0x2C => Some(Self::ProbeBus),
             0x01 => Some(Self::Read),
             0x02 => Some(Self::Write),
             0x03 => Some(Self::Update),

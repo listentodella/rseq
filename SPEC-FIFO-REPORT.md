@@ -26,6 +26,9 @@
 FIFO watermark 中断通常需要通过读取 FIFO 状态和 FIFO 数据来撤销条件, 而不是写寄存器清中断。推荐写法：
 
 ```rseq
+chip!("qmi8660.yaml");
+bus_probe!(spi, { read: UI.WHOAMI, expect: 0x06 });
+
 irq!(int1) {
     on(fifo_watermark) {
         let fifo_l = read!(UI.FIFO_STATUSL, 1);
@@ -42,6 +45,36 @@ irq!(int1) {
 - 第一个 `u32` 参数推荐放 FIFO 状态寄存器读出的长度, 便于 CLI 做一致性检查。
 - raw bytes 参数放实际从 `FIFO_DATA` 读出的数据。
 - CLI 会优先把第一个 `u32` 当作 `fifo_len`, 把第一个 bytes 参数当作 FIFO payload。
+
+## 总线选择与探测
+
+固件侧仍然只是通用 SPI/I2C/I3C 桥梁, 不包含任何芯片型号、WHOAMI 或地址候选知识。需要自动选择时, 在 DSL 里显式写出探测条件：
+
+```rseq
+bus_probe!(spi, {
+    read: UI.WHOAMI,
+    expect: 0x06,
+});
+
+bus_probe!(i2c, {
+    addrs: [0x6a, 0x6b],
+    read: UI.WHOAMI,
+    expect: 0x06,
+});
+```
+
+`bus_probe!` 会被编译成 VM 的通用 `ProbeBus` 指令：逐个候选执行 `set_bus_kind + read`, 首个满足 `(value & mask) == (expect & mask)` 的候选成为后续读写总线。
+
+可用选项：
+
+| 选项 | 类型 | 说明 |
+| --- | --- | --- |
+| `addrs` | number array | I2C 必填。7-bit 地址候选。SPI 可省略。 |
+| `read` | number/register | 必填。用于探测的寄存器地址。 |
+| `expect` | number | 必填。期望读值。 |
+| `len` | number | 可选。读取 1..4 字节, 默认 1。 |
+| `mask` | number | 可选。比较掩码, 默认按 `len` 覆盖全部位。 |
+| `delay_us` | number | 可选。探测匹配后延时。 |
 
 ## FIFO 解析格式
 
@@ -146,6 +179,43 @@ cargo run -q -p rseq-cli --features serial -- \
 
 `-f` 或 `--manifest` 在 watch 模式下只用于加载 `report_format!` 元数据。即使传入了 `--execute` 等控制选项, watch 模式也不会对 MCU 发控制命令。
 
+### 保存与回放
+
+watch 或普通下发后观察模式可以保存 report：
+
+```bash
+cargo run -q -p rseq-cli --features serial -- \
+  -f examples/qmi8660_fifo.rseq \
+  --watch \
+  --serial /dev/cu.usbmodem314201 \
+  --save fifo.csv
+
+cargo run -q -p rseq-cli --features serial -- \
+  -f examples/qmi8660_fifo.rseq \
+  --watch \
+  --serial /dev/cu.usbmodem314201 \
+  --save fifo.bin
+```
+
+- `.csv` 使用固定长表表头：一行一个解码字段, 包含 `seq/kind/frame_id/timestamp_us/dt_us/fifo_len/data_len/sample_index/field/raw_i16/value/unit` 等列。
+- `.bin` 保存完整 report 记录, 可离线回放：
+
+```bash
+cargo run -q -p rseq-cli -- \
+  -f examples/qmi8660_fifo.rseq \
+  --replay fifo.bin
+```
+
+如果需要抢回正在持续上报的 MCU, 使用 Stop 控制帧：
+
+```bash
+cargo run -q -p rseq-cli --features serial -- \
+  --serial /dev/cu.usbmodem314201 \
+  --stop
+```
+
+`--stop` 会清除 MCU 侧后台 IRQ handler 和 pending 标志, 等待 ACK 时会丢弃旧 Trace, 用于 FIFO report 很密集时恢复控制。`--reset-mcu` 则进一步清空已加载主程序。
+
 ## 连续性与健康检查
 
 每条 report Trace v2 都会携带链路元信息：
@@ -167,6 +237,14 @@ FIFO 解析还会打印数据健康提示：
 | `partial_bytes=N` | FIFO payload 不能被 sample 字节数整除, 剩余 `N` 字节无法组成完整 sample。 |
 
 如果持续看到 `frame_gap`, 说明上报链路或主机接收端跟不上。若持续看到 `partial_bytes` 或物理量明显不合理, 优先检查 `fields` 顺序、FIFO 配置和量程参数。
+
+CLI 默认每 100 条 report 打印一次累计健康摘要：
+
+```text
+report health: total=100 kinds=[FIFO_RAW=100] dropped=0 frame_resets=0 ts_rewinds=0 fifo_bytes=7200 fifo_samples=600 fifo_len_mismatch=0 fifo_partial_reports=0 fifo_partial_bytes=0
+```
+
+可以用 `--stats-every N` 调整周期, `--stats-every 0` 关闭周期摘要。
 
 ## 示例脚本
 

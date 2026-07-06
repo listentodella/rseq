@@ -1,6 +1,6 @@
 //! 模拟 MCU:在进程内运行 rseq 字节码,通过 `rseq-link` 帧协议与主机交互。
 //!
-//! - [`mcu_loop`] 是 MCU 侧主循环:解码帧 → 处理 LOAD/EXEC/RESET/PING → 回复 ACK/Trace/Result。
+//! - [`mcu_loop`] 是 MCU 侧主循环:解码帧 → 处理 LOAD/EXEC/RESET/PING/STOP → 回复 ACK/Trace/Result。
 //!   EXEC 时用 [`TracingBus`] 包裹 [`SimBus`],把每次总线操作流式回传为 Trace 帧。
 //! - [`run_self_test`] 用进程内回环管道(MockTransport)跑一遍"编译→下发→执行→比对轨迹",
 //!   供二进制 `--self-test` 与集成测试复用。
@@ -72,6 +72,7 @@ fn send_frame<T: Transport>(t: &mut T, ty: FrameType, payload: &[u8]) -> Result<
 /// - EXEC:回 ACK,用 `TracingBus` 包裹 `bus` 跑字节码(每次总线操作发 Trace),回 Result;
 /// - RESET:清程序区,回 ACK;
 /// - PING:回 Pong。
+/// - STOP:清后台流(模拟器无 IRQ handler, 仅回 ACK)。
 pub fn mcu_loop<B: Bus, T: Transport>(
     mut transport: T,
     mut bus: B,
@@ -142,6 +143,9 @@ pub fn mcu_loop<B: Bus, T: Transport>(
             }
             FrameType::Ping => {
                 send_frame(&mut transport, FrameType::Pong, &[])?;
+            }
+            FrameType::Stop => {
+                send_frame(&mut transport, FrameType::Ack, &[])?;
             }
             // MCU→Host 方向的帧在 MCU 侧忽略。
             _ => {}

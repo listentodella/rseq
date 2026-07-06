@@ -12,18 +12,20 @@ Verified end-to-end on hardware:
 ```
 $ rseq-cli -f examples/qmi8660_reset.rseq --serial /dev/cu.usbmodem314201 --baud 115200
 Dispatching to MCU over serial (/dev/cu.usbmodem314201 @ 115200 baud)...
-✓ Loaded 35 byte(s)
+✓ Loaded 56 byte(s)
 Exec status: Ok
 Bus operations (in execution order):
-  Step 1: Select i2c bus arg=0x0000006a
-  Step 2: Write [0x98] → 0x0000007b   # UI.RESET
-  Step 3: Delay 50000 μs
-  Step 4: Read 1 bytes from 0x00000002 → [0x06]   # UI.WHOAMI
-  Step 5: Delay 100 μs
+  Step 1: Select spi bus
+  Step 2: Read 1 bytes from 0x00000002 → [0x06]   # bus_probe WHOAMI
+  Step 3: Write [0x98] → 0x0000007b   # UI.RESET
+  Step 4: Delay 50000 μs
+  Step 5: Read 1 bytes from 0x00000002 → [0x06]   # UI.WHOAMI
+  Step 6: Delay 100 μs
 ```
 
-The full rseq-link lockstep (Load→Ack, Exec→Ack→Trace*→Result, plus Reset/Ping)
-runs over the CDC port per the spec in `crates/rseq-link/README.md`.
+The full rseq-link lockstep (Load→Ack, Exec→Ack→Trace*→Result, plus
+Reset/Ping/Stop) runs over the CDC port per the spec in
+`crates/rseq-link/README.md`.
 
 ## Architecture
 
@@ -37,7 +39,8 @@ custom protocol with the rseq-link stack, reusing the rseq crates directly:
   - `PhysicalBus` — implements `rseq_vm::Bus` over the SPI/I2C/I3C FFI. Startup
     only checks which board buses are present; it does not probe any chip ID or
     hard-code any device address. The DSL switches at runtime with `bus!(spi)`,
-    `bus!(i2c, addr)`, or `bus!(i3c)`.
+    `bus!(i2c, addr)`, `bus!(i3c)`, or the generic `bus_probe!(...)`
+    instruction that tries DSL-provided candidates.
     The rseq DSL encodes a plain 8-bit register number as the `u32` address, so
     `addr & 0xff` is the register. `bus!(spi)` uses the common 8-bit register
     SPI convention `reg|0x80` (read) / `reg&0x7f` (write), with CS managed
@@ -46,7 +49,7 @@ custom protocol with the rseq-link stack, reusing the rseq crates directly:
     the host compiler because the generic firmware cannot know a chip-specific
     default address.
   - `mcu_loop` — no_std port of `rseq-mcu-sim`'s loop: `FrameDecoder` → dispatch
-    Load/Exec/Reset/Ping → reply Ack/Trace(via `TracingBus`)/Result/Pong.
+    Load/Exec/Reset/Ping/Stop → reply Ack/Trace(via `TracingBus`)/Result/Pong.
   - `rust_main` — `rust_usb_enable` → `rust_uart_init` → `PhysicalBus::new` →
     `mcu_loop(CdcTransport, bus, &STOP)`. The `zephyr` crate supplies the global
     allocator + panic handler; `rust_printk` (FFI) is used for console output.
@@ -70,8 +73,8 @@ custom protocol with the rseq-link stack, reusing the rseq crates directly:
 
 Zephyr automatically picks `boards/<board>.overlay` when it matches `-b`.
 The firmware is built by board/hardware topology only. It does not need a
-bus/address overlay: the script chooses `bus!(spi)` or `bus!(i2c, addr)` at
-runtime.
+bus/address overlay: the script chooses `bus!(spi)`, `bus!(i2c, addr)`, or
+`bus_probe!(...)` at runtime.
 
 ```sh
 export ZEPHYR_BASE=/Volumes/tp7100s/work/zephyr/zephyrproject/zephyr
@@ -134,6 +137,18 @@ cargo run -p rseq-cli --features serial -- \
   -f examples/qmi8660_reset.rseq \
   --serial /dev/cu.usbmodem314201 --baud 115200
 ```
+
+If an IRQ script is already running and streaming reports, stop the background
+handler without reflashing:
+
+```sh
+cargo run -p rseq-cli --features serial -- \
+  --serial /dev/cu.usbmodem314201 --baud 115200 \
+  --stop
+```
+
+`Stop` clears registered IRQ handlers and pending flags. `Reset` clears those
+and the loaded main bytecode.
 
 ### IRQ smoke test
 

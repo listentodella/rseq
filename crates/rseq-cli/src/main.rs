@@ -4,6 +4,7 @@ use rseq::{
 };
 use rseq_vm::Vm;
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 pub mod mock;
@@ -53,6 +54,30 @@ struct Cli {
     #[arg(long, alias = "observe-only", alias = "rx-only")]
     watch: bool,
 
+    /// 向 MCU 发送 Stop 控制帧，清除后台 IRQ handler/report 流；不下发新字节码。
+    #[arg(long)]
+    stop: bool,
+
+    /// 通过已有 Reset 控制帧清空 MCU 已加载程序与 IRQ handler；不下发新字节码。
+    #[arg(long)]
+    reset_mcu: bool,
+
+    /// 向 MCU 发送 Ping 控制帧探活；不下发新字节码。
+    #[arg(long)]
+    ping: bool,
+
+    /// watch/replay 时保存收到的 report。扩展名 .csv 写解码样本，.bin 写可 replay 的二进制捕获。
+    #[arg(long)]
+    save: Option<PathBuf>,
+
+    /// 从 --save 生成的 .bin 文件离线回放 report，不访问 MCU。
+    #[arg(long)]
+    replay: Option<PathBuf>,
+
+    /// 每 N 条 report 打印一次累计健康统计；0 表示关闭。
+    #[arg(long, default_value_t = 100)]
+    stats_every: u64,
+
     /// 串口波特率(默认 115200)。
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
@@ -60,6 +85,37 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(path) = &cli.replay {
+        let report_decoders = load_watch_report_decoders(&cli);
+        let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
+        run_replay(path, report_decoders, &mut save, cli.stats_every);
+        return;
+    }
+
+    if cli.stop || cli.reset_mcu || cli.ping {
+        let Some(path) = cli.serial.as_deref() else {
+            eprintln!("--stop/--reset-mcu/--ping require --serial <port>");
+            std::process::exit(2);
+        };
+
+        #[cfg(feature = "serial")]
+        {
+            run_control(path, cli.baud, cli.stop, cli.reset_mcu, cli.ping);
+            return;
+        }
+        #[cfg(not(feature = "serial"))]
+        {
+            eprintln!(
+                "control commands over --serial {path} 需要以 `serial` feature 编译 \
+                 (cargo run -p rseq-cli --features serial -- ...)"
+            );
+            std::process::exit(2);
+        }
+    }
 
     if cli.watch {
         let Some(path) = cli.serial.as_deref() else {
@@ -75,7 +131,11 @@ fn main() {
                 );
             }
             let report_decoders = load_watch_report_decoders(&cli);
-            run_watch(path, cli.baud, report_decoders);
+            let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
+                eprintln!("{err}");
+                std::process::exit(1);
+            });
+            run_watch(path, cli.baud, report_decoders, &mut save, cli.stats_every);
             return;
         }
         #[cfg(not(feature = "serial"))]
@@ -243,6 +303,14 @@ fn main() {
                             println!("    Action: Select {kind} bus");
                         }
                     },
+                    rseq::Stmt::BusProbe { kind, options } => {
+                        let opts = options
+                            .iter()
+                            .map(|(name, value)| format!("{name}={}", format_value(value)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("    Action: Probe {kind} bus ({opts})");
+                    }
                     rseq::Stmt::Let { name, expr } => {
                         println!("    Action: Bind {} = {}", name, format_expr(expr));
                         if let rseq::Expr::Read {
@@ -452,7 +520,21 @@ fn main() {
 
         if let Some(path) = &cli.serial {
             #[cfg(feature = "serial")]
-            run_over_serial(path, cli.baud, &bytecode, &irq_bytecodes, report_decoders);
+            {
+                let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
+                    eprintln!("{err}");
+                    std::process::exit(1);
+                });
+                run_over_serial(
+                    path,
+                    cli.baud,
+                    &bytecode,
+                    &irq_bytecodes,
+                    report_decoders,
+                    &mut save,
+                    cli.stats_every,
+                );
+            }
             #[cfg(not(feature = "serial"))]
             {
                 eprintln!(
@@ -473,6 +555,8 @@ fn run_over_serial(
     bytecode: &[u8],
     irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
     report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
 ) {
     use rseq::link::HostLink;
     use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
@@ -513,12 +597,18 @@ fn run_over_serial(
 
     if !irq_bytecodes.is_empty() {
         println!("\nObserving report events. Press Ctrl-C to stop.");
-        observe_reports_forever(&mut host, &report_decoders);
+        observe_reports_forever(&mut host, &report_decoders, save, stats_every);
     }
 }
 
 #[cfg(feature = "serial")]
-fn run_watch(path: &str, baud: u32, report_decoders: ReportDecoderRegistry) {
+fn run_watch(
+    path: &str,
+    baud: u32,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
     use rseq::link::HostLink;
 
     println!("\nWatching MCU reports over serial ({path} @ {baud} baud)...");
@@ -538,19 +628,58 @@ fn run_watch(path: &str, baud: u32, report_decoders: ReportDecoderRegistry) {
         }
     };
     let mut host = HostLink::new(transport);
-    observe_reports_forever(&mut host, &report_decoders);
+    observe_reports_forever(&mut host, &report_decoders, save, stats_every);
+}
+
+#[cfg(feature = "serial")]
+fn run_control(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
+    use rseq::link::HostLink;
+
+    println!("\nSending control frame(s) over serial ({path} @ {baud} baud)...");
+    let transport = match rseq_link::SerialTransport::open(path, baud) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open serial {path} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut host = HostLink::new(transport);
+
+    if ping {
+        if let Err(e) = host.ping() {
+            eprintln!("PING failed: {e}");
+            std::process::exit(1);
+        }
+        println!("✓ PONG");
+    }
+    if stop {
+        if let Err(e) = host.stop_reports() {
+            eprintln!("STOP failed: {e}");
+            std::process::exit(1);
+        }
+        println!("✓ Stopped background IRQ/report stream");
+    }
+    if reset_mcu {
+        if let Err(e) = host.reset() {
+            eprintln!("RESET failed: {e}");
+            std::process::exit(1);
+        }
+        println!("✓ Reset MCU rseq program state");
+    }
 }
 
 #[cfg(feature = "serial")]
 fn observe_reports_forever<T: rseq_link::Transport>(
     host: &mut rseq::link::HostLink<T>,
     report_decoders: &ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
 ) {
     let mut state = ReportObserveState::default();
     loop {
         match host.observe_next_trace(std::time::Duration::from_secs(1)) {
             Ok(Some(op)) => {
-                print_observed_report(&op, &mut state, report_decoders);
+                print_observed_report(&op, &mut state, report_decoders, save, stats_every);
             }
             Ok(None) => {}
             Err(e) => {
@@ -561,16 +690,23 @@ fn observe_reports_forever<T: rseq_link::Transport>(
     }
 }
 
-#[cfg(feature = "serial")]
 #[derive(Default)]
 struct ReportObserveState {
     seq: u64,
     last_frame_id: Option<u32>,
     last_timestamp_us: Option<u64>,
     next_fifo_sample_index: u64,
+    frame_gap_total: u64,
+    frame_reset_count: u64,
+    timestamp_rewind_count: u64,
+    fifo_len_mismatch_count: u64,
+    fifo_partial_count: u64,
+    fifo_partial_bytes: u64,
+    fifo_data_bytes: u64,
+    fifo_sample_count: u64,
+    reports_by_kind: std::collections::HashMap<u32, u64>,
 }
 
-#[cfg(feature = "serial")]
 struct ReportObserveInfo {
     seq: u64,
     meta: Option<rseq::trace::ReportMeta>,
@@ -580,7 +716,6 @@ struct ReportObserveInfo {
     timestamp_rewind: Option<(u64, u64)>,
 }
 
-#[cfg(feature = "serial")]
 impl ReportObserveState {
     fn next(&mut self, meta: Option<rseq::trace::ReportMeta>) -> ReportObserveInfo {
         self.seq += 1;
@@ -596,8 +731,10 @@ impl ReportObserveState {
                     // expected path
                 } else if meta.frame_id > prev {
                     frame_gap = Some(meta.frame_id - prev - 1);
+                    self.frame_gap_total += u64::from(meta.frame_id - prev - 1);
                 } else {
                     frame_reset = Some((prev, meta.frame_id));
+                    self.frame_reset_count += 1;
                 }
             }
             self.last_frame_id = Some(meta.frame_id);
@@ -608,6 +745,7 @@ impl ReportObserveState {
                         dt_us = Some(meta.timestamp_us - prev);
                     } else {
                         timestamp_rewind = Some((prev, meta.timestamp_us));
+                        self.timestamp_rewind_count += 1;
                     }
                 }
                 self.last_timestamp_us = Some(meta.timestamp_us);
@@ -629,25 +767,82 @@ impl ReportObserveState {
         self.next_fifo_sample_index = self.next_fifo_sample_index.saturating_add(count as u64);
         base
     }
+
+    fn note_report_kind(&mut self, kind: u32) {
+        *self.reports_by_kind.entry(kind).or_insert(0) += 1;
+    }
+
+    fn note_fifo_health(
+        &mut self,
+        fifo_len: Option<u32>,
+        data_len: usize,
+        decoded: Option<&I16LeFifoDecode>,
+    ) {
+        self.fifo_data_bytes = self.fifo_data_bytes.saturating_add(data_len as u64);
+        if let Some(len) = fifo_len {
+            if len as usize != data_len {
+                self.fifo_len_mismatch_count += 1;
+            }
+        }
+        if let Some(decoded) = decoded {
+            self.fifo_sample_count = self
+                .fifo_sample_count
+                .saturating_add(decoded.samples.len() as u64);
+            if decoded.trailing_bytes != 0 {
+                self.fifo_partial_count += 1;
+                self.fifo_partial_bytes += decoded.trailing_bytes as u64;
+            }
+        }
+    }
+
+    fn maybe_print_summary(&self, every: u64) {
+        if every == 0 || self.seq == 0 || self.seq % every != 0 {
+            return;
+        }
+        let mut kinds = self
+            .reports_by_kind
+            .iter()
+            .map(|(kind, count)| format!("{}={count}", report_kind_label(*kind)))
+            .collect::<Vec<_>>();
+        kinds.sort();
+        println!(
+            "report health: total={} kinds=[{}] dropped={} frame_resets={} ts_rewinds={} fifo_bytes={} fifo_samples={} fifo_len_mismatch={} fifo_partial_reports={} fifo_partial_bytes={}",
+            self.seq,
+            kinds.join(", "),
+            self.frame_gap_total,
+            self.frame_reset_count,
+            self.timestamp_rewind_count,
+            self.fifo_data_bytes,
+            self.fifo_sample_count,
+            self.fifo_len_mismatch_count,
+            self.fifo_partial_count,
+            self.fifo_partial_bytes
+        );
+    }
 }
 
-#[cfg(feature = "serial")]
 fn print_observed_report(
     op: &rseq::trace::BusOp,
     state: &mut ReportObserveState,
     report_decoders: &ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
 ) {
     if let rseq::trace::BusOp::Report { meta, kind, args } = op {
         let info = state.next(*meta);
+        state.note_report_kind(*kind);
         if *kind == rseq::REPORT_KIND_FIFO_RAW {
             print_fifo_raw_report(&info, args, state, report_decoders.get(*kind));
         } else {
             print_named_report(&info, *kind, args);
         }
+        if let Err(err) = save.write_report(&info, *kind, args, report_decoders.get(*kind)) {
+            eprintln!("save failed: {err}");
+        }
+        state.maybe_print_summary(stats_every);
     }
 }
 
-#[cfg(feature = "serial")]
 fn print_fifo_raw_report(
     info: &ReportObserveInfo,
     args: &[rseq::trace::ReportArg],
@@ -673,6 +868,7 @@ fn print_fifo_raw_report(
             match decoder {
                 Some(ReportDecoder::I16Le(decoder)) => {
                     let decoded = decode_i16_le_fifo_samples(bytes, decoder);
+                    state.note_fifo_health(fifo_len, bytes.len(), Some(&decoded));
                     let sample_base = state.reserve_fifo_samples(decoded.samples.len());
                     let decode_summary = format_i16_le_fifo_decode(sample_base, &decoded, decoder);
                     let health = format_fifo_raw_health(fifo_len, bytes.len(), &decoded);
@@ -698,20 +894,23 @@ fn print_fifo_raw_report(
                         println!("  {decode_summary}");
                     }
                 }
-                None => match fifo_len {
-                    Some(len) => println!(
-                        "FIFO_RAW #{}{}: fifo_len={len} data_len={} data=[{hex}]",
-                        info.seq,
-                        format_report_watch_meta(info),
-                        bytes.len()
-                    ),
-                    None => println!(
-                        "FIFO_RAW #{}{}: data_len={} data=[{hex}]",
-                        info.seq,
-                        format_report_watch_meta(info),
-                        bytes.len()
-                    ),
-                },
+                None => {
+                    state.note_fifo_health(fifo_len, bytes.len(), None);
+                    match fifo_len {
+                        Some(len) => println!(
+                            "FIFO_RAW #{}{}: fifo_len={len} data_len={} data=[{hex}]",
+                            info.seq,
+                            format_report_watch_meta(info),
+                            bytes.len()
+                        ),
+                        None => println!(
+                            "FIFO_RAW #{}{}: data_len={} data=[{hex}]",
+                            info.seq,
+                            format_report_watch_meta(info),
+                            bytes.len()
+                        ),
+                    }
+                }
             }
         }
         None => {
@@ -1021,7 +1220,6 @@ fn format_i16_le_fifo_decode(
     out
 }
 
-#[cfg(feature = "serial")]
 fn print_named_report(info: &ReportObserveInfo, kind: u32, args: &[rseq::trace::ReportArg]) {
     let label = report_kind_label(kind);
     let vals = format_report_args(args);
@@ -1036,7 +1234,6 @@ fn print_named_report(info: &ReportObserveInfo, kind: u32, args: &[rseq::trace::
     }
 }
 
-#[cfg(feature = "serial")]
 fn format_report_watch_meta(info: &ReportObserveInfo) -> String {
     let mut out = String::new();
     if let Some(meta) = info.meta {
@@ -1058,6 +1255,427 @@ fn format_report_watch_meta(info: &ReportObserveInfo) -> String {
         let _ = write!(out, " ts_rewind={prev}->{current}");
     }
     out
+}
+
+const CAPTURE_MAGIC: &[u8] = b"RSEQCAP1\n";
+
+enum SaveSink {
+    None,
+    Csv(CsvSave),
+    Bin(BinSave),
+}
+
+impl SaveSink {
+    fn write_report(
+        &mut self,
+        info: &ReportObserveInfo,
+        kind: u32,
+        args: &[rseq::trace::ReportArg],
+        decoder: Option<&ReportDecoder>,
+    ) -> Result<(), String> {
+        match self {
+            Self::None => Ok(()),
+            Self::Csv(save) => save.write_report(info, kind, args, decoder),
+            Self::Bin(save) => save.write_report(info, kind, args),
+        }
+    }
+}
+
+fn open_save_sink(path: Option<&Path>) -> Result<SaveSink, String> {
+    let Some(path) = path else {
+        return Ok(SaveSink::None);
+    };
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("csv") => CsvSave::create(path).map(SaveSink::Csv),
+        Some("bin") => BinSave::create(path).map(SaveSink::Bin),
+        Some(ext) => Err(format!(
+            "--save {} has unsupported extension '.{ext}', expected .csv or .bin",
+            path.display()
+        )),
+        None => Err(format!(
+            "--save {} must end with .csv or .bin",
+            path.display()
+        )),
+    }
+}
+
+struct CsvSave {
+    file: std::fs::File,
+}
+
+impl CsvSave {
+    fn create(path: &Path) -> Result<Self, String> {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create CSV {}: {e}", path.display()))?;
+        writeln!(
+            file,
+            "seq,kind,frame_id,timestamp_us,dt_us,fifo_len,data_len,sample_index,field,raw_i16,value,unit,data_hex,args"
+        )
+        .map_err(|e| format!("failed to write CSV header {}: {e}", path.display()))?;
+        println!("Saving decoded reports to CSV {}", path.display());
+        Ok(Self { file })
+    }
+
+    fn write_report(
+        &mut self,
+        info: &ReportObserveInfo,
+        kind: u32,
+        args: &[rseq::trace::ReportArg],
+        decoder: Option<&ReportDecoder>,
+    ) -> Result<(), String> {
+        if kind == rseq::REPORT_KIND_FIFO_RAW {
+            if let (Some(bytes), Some(ReportDecoder::I16Le(decoder))) =
+                (first_report_bytes(args), decoder)
+            {
+                return self.write_i16_le_fifo(info, kind, args, bytes, decoder);
+            }
+        }
+        let data_hex = first_report_bytes(args).map(bytes_hex).unwrap_or_default();
+        let args_summary = format_report_args(args);
+        self.write_row(
+            info,
+            kind,
+            first_report_u32(args),
+            first_report_bytes(args).map_or(0, |bytes| bytes.len()),
+            None,
+            "",
+            "",
+            "",
+            "",
+            &data_hex,
+            &args_summary,
+        )
+    }
+
+    fn write_i16_le_fifo(
+        &mut self,
+        info: &ReportObserveInfo,
+        kind: u32,
+        args: &[rseq::trace::ReportArg],
+        bytes: &[u8],
+        decoder: &I16LeReportDecoder,
+    ) -> Result<(), String> {
+        let decoded = decode_i16_le_fifo_samples(bytes, decoder);
+        let fifo_len = first_report_u32(args);
+        if decoded.samples.is_empty() {
+            return self.write_row(
+                info,
+                kind,
+                fifo_len,
+                bytes.len(),
+                None,
+                "",
+                "",
+                "",
+                "",
+                &bytes_hex(bytes),
+                &format_report_args(args),
+            );
+        }
+
+        for (sample_index, sample) in decoded.samples.iter().enumerate() {
+            for value in &sample.values {
+                let field = &decoder.fields[value.field_index];
+                let (display, unit) = i16_field_display(value.value, field, decoder);
+                self.write_row(
+                    info,
+                    kind,
+                    fifo_len,
+                    bytes.len(),
+                    Some(sample_index as u64),
+                    field,
+                    &value.value.to_string(),
+                    &format!("{display:.9}"),
+                    unit,
+                    "",
+                    "",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_row(
+        &mut self,
+        info: &ReportObserveInfo,
+        kind: u32,
+        fifo_len: Option<u32>,
+        data_len: usize,
+        sample_index: Option<u64>,
+        field: &str,
+        raw_i16: &str,
+        value: &str,
+        unit: &str,
+        data_hex: &str,
+        args: &str,
+    ) -> Result<(), String> {
+        let (frame_id, timestamp_us) = match info.meta {
+            Some(meta) => (
+                meta.frame_id.to_string(),
+                if meta.timestamp_valid() {
+                    meta.timestamp_us.to_string()
+                } else {
+                    String::new()
+                },
+            ),
+            None => (String::new(), String::new()),
+        };
+        let dt_us = info.dt_us.map(|v| v.to_string()).unwrap_or_default();
+        let fifo_len = fifo_len.map(|v| v.to_string()).unwrap_or_default();
+        let sample_index = sample_index.map(|v| v.to_string()).unwrap_or_default();
+        let cells = [
+            info.seq.to_string(),
+            report_kind_label(kind),
+            frame_id,
+            timestamp_us,
+            dt_us,
+            fifo_len,
+            data_len.to_string(),
+            sample_index,
+            field.to_string(),
+            raw_i16.to_string(),
+            value.to_string(),
+            unit.to_string(),
+            data_hex.to_string(),
+            args.to_string(),
+        ];
+        writeln!(
+            self.file,
+            "{}",
+            cells
+                .iter()
+                .map(|cell| csv_escape(cell))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .map_err(|e| format!("failed to write CSV row: {e}"))
+    }
+}
+
+struct BinSave {
+    file: std::fs::File,
+}
+
+impl BinSave {
+    fn create(path: &Path) -> Result<Self, String> {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create capture {}: {e}", path.display()))?;
+        file.write_all(CAPTURE_MAGIC)
+            .map_err(|e| format!("failed to write capture header {}: {e}", path.display()))?;
+        println!("Saving binary report capture to {}", path.display());
+        Ok(Self { file })
+    }
+
+    fn write_report(
+        &mut self,
+        info: &ReportObserveInfo,
+        kind: u32,
+        args: &[rseq::trace::ReportArg],
+    ) -> Result<(), String> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&kind.to_le_bytes());
+        match info.meta {
+            Some(meta) => {
+                payload.push(1);
+                payload.push(meta.flags);
+                payload.extend_from_slice(&meta.frame_id.to_le_bytes());
+                payload.extend_from_slice(&meta.timestamp_us.to_le_bytes());
+            }
+            None => {
+                payload.push(0);
+                payload.push(0);
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        payload.push(args.len() as u8);
+        for arg in args {
+            match arg {
+                rseq::trace::ReportArg::U32(value) => {
+                    payload.push(rseq_link::wire::REPORT_ARG_U32);
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+                rseq::trace::ReportArg::Bytes(bytes) => {
+                    payload.push(rseq_link::wire::REPORT_ARG_BYTES);
+                    payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(bytes);
+                }
+            }
+        }
+        let len = payload.len() as u32;
+        self.file
+            .write_all(&len.to_le_bytes())
+            .and_then(|_| self.file.write_all(&payload))
+            .map_err(|e| format!("failed to write capture record: {e}"))
+    }
+}
+
+fn run_replay(
+    path: &Path,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
+    let reports = read_capture(path).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
+    println!(
+        "Replaying {} report(s) from {}",
+        reports.len(),
+        path.display()
+    );
+    let mut state = ReportObserveState::default();
+    for (meta, kind, args) in reports {
+        let op = rseq::trace::BusOp::Report { meta, kind, args };
+        print_observed_report(&op, &mut state, &report_decoders, save, stats_every);
+    }
+    state.maybe_print_summary(1);
+}
+
+fn read_capture(
+    path: &Path,
+) -> Result<
+    Vec<(
+        Option<rseq::trace::ReportMeta>,
+        u32,
+        Vec<rseq::trace::ReportArg>,
+    )>,
+    String,
+> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open capture {}: {e}", path.display()))?;
+    let mut magic = vec![0u8; CAPTURE_MAGIC.len()];
+    file.read_exact(&mut magic)
+        .map_err(|e| format!("failed to read capture header {}: {e}", path.display()))?;
+    if magic != CAPTURE_MAGIC {
+        return Err(format!("{} is not an rseq report capture", path.display()));
+    }
+
+    let mut reports = Vec::new();
+    loop {
+        let mut len_bytes = [0u8; 4];
+        match file.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("failed to read capture length: {e}")),
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let mut payload = vec![0u8; len];
+        file.read_exact(&mut payload)
+            .map_err(|e| format!("failed to read capture payload: {e}"))?;
+        reports.push(decode_capture_record(&payload)?);
+    }
+    Ok(reports)
+}
+
+fn decode_capture_record(
+    payload: &[u8],
+) -> Result<
+    (
+        Option<rseq::trace::ReportMeta>,
+        u32,
+        Vec<rseq::trace::ReportArg>,
+    ),
+    String,
+> {
+    let mut pos = 0usize;
+    let kind = take_u32(payload, &mut pos)?;
+    let meta_present = take_u8(payload, &mut pos)? != 0;
+    let flags = take_u8(payload, &mut pos)?;
+    let frame_id = take_u32(payload, &mut pos)?;
+    let timestamp_us = take_u64(payload, &mut pos)?;
+    let meta = meta_present.then_some(rseq::trace::ReportMeta {
+        flags,
+        frame_id,
+        timestamp_us,
+    });
+    let argc = take_u8(payload, &mut pos)? as usize;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        match take_u8(payload, &mut pos)? {
+            rseq_link::wire::REPORT_ARG_U32 => {
+                args.push(rseq::trace::ReportArg::U32(take_u32(payload, &mut pos)?));
+            }
+            rseq_link::wire::REPORT_ARG_BYTES => {
+                let len = take_u32(payload, &mut pos)? as usize;
+                let bytes = take_bytes(payload, &mut pos, len)?.to_vec();
+                args.push(rseq::trace::ReportArg::Bytes(bytes));
+            }
+            tag => return Err(format!("invalid capture arg tag 0x{tag:02x}")),
+        }
+    }
+    Ok((meta, kind, args))
+}
+
+fn take_u8(payload: &[u8], pos: &mut usize) -> Result<u8, String> {
+    let bytes = take_bytes(payload, pos, 1)?;
+    Ok(bytes[0])
+}
+
+fn take_u32(payload: &[u8], pos: &mut usize) -> Result<u32, String> {
+    let bytes = take_bytes(payload, pos, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn take_u64(payload: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let bytes = take_bytes(payload, pos, 8)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn take_bytes<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], String> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| "capture record length overflow".to_string())?;
+    if end > payload.len() {
+        return Err("truncated capture record".to_string());
+    }
+    let bytes = &payload[*pos..end];
+    *pos = end;
+    Ok(bytes)
+}
+
+fn first_report_u32(args: &[rseq::trace::ReportArg]) -> Option<u32> {
+    args.iter().find_map(|arg| match arg {
+        rseq::trace::ReportArg::U32(v) => Some(*v),
+        _ => None,
+    })
+}
+
+fn first_report_bytes(args: &[rseq::trace::ReportArg]) -> Option<&[u8]> {
+    args.iter().find_map(|arg| match arg {
+        rseq::trace::ReportArg::Bytes(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    })
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn i16_field_display(raw: i16, field: &str, decoder: &I16LeReportDecoder) -> (f64, &'static str) {
+    if decoder.output == ReportOutputMode::PhysicalF32 {
+        if decoder.gyro_fields.iter().any(|name| name == field) {
+            return (gyro_raw_to_rad_s(raw, decoder.gyro_fs_dps), "rad/s");
+        }
+        if decoder.accel_fields.iter().any(|name| name == field) {
+            return (accel_raw_to_m_s2(raw, decoder.accel_fs_g), "m/s^2");
+        }
+    }
+    (raw as f64, "count")
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 /// 按执行顺序打印总线操作(MockBus 回放与串口回传 Trace 共用)。
@@ -1313,7 +1931,7 @@ fn collect_report_decoders(
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
-            rseq::Stmt::Bus { .. } => {}
+            rseq::Stmt::Bus { .. } | rseq::Stmt::BusProbe { .. } => {}
             rseq::Stmt::ReportFormat {
                 kind,
                 decoder,
@@ -1576,6 +2194,29 @@ fn load_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, Str
 
 fn escape_rseq_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_value(value: &rseq::Value) -> String {
+    match value {
+        rseq::Value::Number(n) => format!("0x{n:x}"),
+        rseq::Value::Ident(name) => name.clone(),
+        rseq::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(format_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        rseq::Value::FieldMap(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(name, value)| format!("{name}: 0x{value:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn format_expr(expr: &rseq::Expr) -> String {
@@ -1965,5 +2606,101 @@ mod tests {
             format_fifo_raw_health(Some(12), 13, &decoded),
             " len_mismatch=status:12,data:13 partial_bytes=1"
         );
+    }
+
+    fn temp_capture_path(ext: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rseq-cli-test-{}-{unique}.{ext}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn test_binary_capture_round_trip() {
+        let path = temp_capture_path("bin");
+        let info = ReportObserveInfo {
+            seq: 1,
+            meta: Some(rseq::trace::ReportMeta {
+                flags: rseq_link::wire::REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 7,
+                timestamp_us: 1234,
+            }),
+            frame_gap: None,
+            frame_reset: None,
+            dt_us: None,
+            timestamp_rewind: None,
+        };
+        let args = vec![
+            rseq::trace::ReportArg::U32(2),
+            rseq::trace::ReportArg::Bytes(vec![0xaa, 0xbb]),
+        ];
+
+        {
+            let mut save = BinSave::create(&path).unwrap();
+            save.write_report(&info, rseq::REPORT_KIND_FIFO_RAW, &args)
+                .unwrap();
+        }
+
+        let reports = read_capture(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            reports,
+            vec![(
+                info.meta,
+                rseq::REPORT_KIND_FIFO_RAW,
+                vec![
+                    rseq::trace::ReportArg::U32(2),
+                    rseq::trace::ReportArg::Bytes(vec![0xaa, 0xbb]),
+                ],
+            )]
+        );
+    }
+
+    #[test]
+    fn test_csv_capture_writes_long_field_rows() {
+        let path = temp_capture_path("csv");
+        let decoder = ReportDecoder::I16Le(test_decoder_with_output(
+            &["gx", "ax"],
+            &["gx"],
+            &["ax"],
+            ReportOutputMode::PhysicalF32,
+        ));
+        let info = ReportObserveInfo {
+            seq: 3,
+            meta: Some(rseq::trace::ReportMeta {
+                flags: rseq_link::wire::REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 9,
+                timestamp_us: 10_000,
+            }),
+            frame_gap: None,
+            frame_reset: None,
+            dt_us: Some(1000),
+            timestamp_rewind: None,
+        };
+        let args = vec![
+            rseq::trace::ReportArg::U32(4),
+            rseq::trace::ReportArg::Bytes(vec![0x01, 0x00, 0x00, 0x08]),
+        ];
+
+        {
+            let mut save = CsvSave::create(&path).unwrap();
+            save.write_report(&info, rseq::REPORT_KIND_FIFO_RAW, &args, Some(&decoder))
+                .unwrap();
+        }
+
+        let csv = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(csv.starts_with("seq,kind,frame_id,timestamp_us,dt_us"));
+        assert!(csv.contains("FIFO_RAW"));
+        assert!(csv.contains(",gx,1,"));
+        assert!(csv.contains(",rad/s,"));
+        assert!(csv.contains(",ax,2048,"));
+        assert!(csv.contains(",m/s^2,"));
     }
 }

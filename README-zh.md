@@ -40,18 +40,27 @@ cargo run --package rseq-cli -- --manifest examples/qmi8660_manifest.toml --run 
 
 ## 总线选择
 
-DSL 可用 `bus!` 配置后续寄存器读写走 SPI 或 I2C。不写时保持默认 SPI, 兼容已有脚本。
+DSL 可用 `bus!` 配置后续寄存器读写走 SPI 或 I2C。MCU 固件是通用
+SPI/I2C/I3C 桥，不包含任何芯片型号、WHOAMI 或候选地址知识；芯片相关
+的地址和探测规则应写在 DSL/host 配置层。
 
 ```rseq
 chip!("qmi8660.yaml");
 
 bus!(spi);          // 使用默认 SPI 后端
-bus!(i2c);          // 自动探测 I2C 地址 0x6a/0x6b
 bus!(i2c, 0x6a);    // 使用指定 7-bit I2C 地址
 bus!(i3c);          // 预留接口，F429 当前返回 unsupported
+
+bus_probe!(spi, { read: UI.WHOAMI, expect: 0x06 });
+bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: UI.WHOAMI, expect: 0x06 });
 ```
 
-`bus!` 会编译成 VM 字节码并下发到 MCU; 在 F429ZI 固件中, `bus!(i2c)` 会读取 WHOAMI 并在 `0x6a` / `0x6b` 之间自动选择。CLI/Trace 会显示 `Select spi bus` 或 `Select i2c bus arg=...`, 便于确认脚本实际切换过总线。
+`bus!` 会编译成 VM 字节码并下发到 MCU。`bus!(i2c, 0x6a)` 编译为
+`SetBus(I2c, 0x6a)`；裸 `bus!(i2c)` 会在 host 编译阶段报错，因为通用
+固件无法知道某颗芯片的默认 I2C 地址。CLI/Trace 会显示 `Select spi bus`
+或 `Select i2c bus arg=...`, 便于确认脚本实际切换过总线。
+
+`bus_probe!` 也只是一条通用 VM 指令：DSL 明确给出候选地址、探测寄存器和期望值, MCU 逐个尝试 `set_bus_kind + read`，首个匹配者成为后续总线。固件仍不包含任何芯片型号逻辑。
 
 ### 帧协议
 
@@ -62,9 +71,9 @@ bus!(i3c);          // 预留接口，F429 当前返回 unsupported
 ```
 
 - CRC32(IEEE) 覆盖 `type || len || payload`, 不含 sync 与 crc 本身;
-- 主机 → MCU: `Load=0x01` / `Exec=0x02` / `Reset=0x03` / `Ping=0x04`;
+- 主机 → MCU: `Load=0x01` / `Exec=0x02` / `Reset=0x03` / `Ping=0x04` / `Stop=0x05`;
 - MCU → 主机: `Ack=0x81` / `Trace=0x82` / `Result=0x83` / `Pong=0x84`;
-- `Load`/`Exec`/`Reset` 由 MCU 回 `Ack` 确认; `Exec` 期间 MCU 逐条发 `Trace`, 结束后发一条 `Result`(含状态码). `Trace`/`Result` 为尽力而为, 不重传.
+- `Load`/`Exec`/`Reset`/`Stop` 由 MCU 回 `Ack` 确认; `Exec` 期间 MCU 逐条发 `Trace`, 结束后发一条 `Result`(含状态码). `Trace`/`Result` 为尽力而为, 不重传.
 
 `Trace` 载荷: 读/写为 `[op u8][addr u32 LE][dlen u16 LE][data]`(`op`: Read=0x01 / Write=0x02), 延时为 `[0x03][us u32 LE]`.
 
@@ -148,6 +157,28 @@ cargo run -q -p rseq-cli --features serial -- \
   --watch \
   --serial /dev/cu.usbmodem314201 \
   --baud 115200
+```
+
+保存 CSV 或可回放二进制捕获:
+
+```bash
+cargo run -q -p rseq-cli --features serial -- \
+  -f examples/qmi8660_fifo.rseq \
+  --watch \
+  --serial /dev/cu.usbmodem314201 \
+  --save fifo.csv
+
+cargo run -q -p rseq-cli -- \
+  -f examples/qmi8660_fifo.rseq \
+  --replay fifo.bin
+```
+
+抢回正在后台持续上报的 MCU:
+
+```bash
+cargo run -q -p rseq-cli --features serial -- \
+  --serial /dev/cu.usbmodem314201 \
+  --stop
 ```
 
 更完整的 FIFO report 语法、字段顺序、`physical_f32`/`raw_i16` 输出和 `frame_id`/`timestamp` 掉帧检查说明见 [SPEC-FIFO-REPORT.md](SPEC-FIFO-REPORT.md)。

@@ -39,6 +39,15 @@ static mut IRQ_HANDLERS: [Option<IrqHandler>; MAX_IRQ_HANDLERS] = [None, None];
 static IRQ_PENDING: [AtomicBool; MAX_IRQ_HANDLERS] =
     [AtomicBool::new(false), AtomicBool::new(false)];
 
+fn clear_irq_handlers() {
+    unsafe {
+        for i in 0..MAX_IRQ_HANDLERS {
+            IRQ_HANDLERS[i] = None;
+            IRQ_PENDING[i].store(false, Ordering::Release);
+        }
+    }
+}
+
 mod ffi {
     extern "C" {
         pub fn rust_usb_enable() -> i32;
@@ -565,13 +574,13 @@ fn mcu_loop<B: Bus, T: Transport>(
             FrameType::Reset => {
                 printk("rseq: RESET\n");
                 bytecode.clear();
-                // 清除中断处理器
-                unsafe {
-                    for i in 0..MAX_IRQ_HANDLERS {
-                        IRQ_HANDLERS[i] = None;
-                    }
-                }
+                clear_irq_handlers();
                 printk("rseq: reset, irq handlers cleared\n");
+                send_frame(&mut transport, FrameType::Ack, &[])?;
+            }
+            FrameType::Stop => {
+                printk("rseq: STOP reports\n");
+                clear_irq_handlers();
                 send_frame(&mut transport, FrameType::Ack, &[])?;
             }
             FrameType::Ping => {

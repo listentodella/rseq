@@ -48,10 +48,12 @@ Register Sequence **传输层**:主机 ↔ MCU 之间的二进制帧协议与可
 | `0x03` | Reset | H→M | 空 | MCU 回 Ack |
 | `0x04` | Ping | H→M | 空 | MCU 回 Pong |
 | `0x05` | Stop | H→M | 空 | MCU 回 Ack,清后台 IRQ/report handler |
+| `0x06` | Control | H→M | 直接控制请求(见 2.4) | MCU 回 ControlResult |
 | `0x81` | Ack | M→H | 空 | 确认收到 Load/Exec/Reset/Stop |
 | `0x82` | Trace | M→H | Trace 记录(见 2.2) | 尽力而为,不重传 |
 | `0x83` | Result | M→H | `[status u8]`(见 2.3) | Exec 终止状态 |
 | `0x84` | Pong | M→H | 空 | 响应 Ping |
+| `0x85` | ControlResult | M→H | 直接控制响应(见 2.4) | 与 Control 的 request_id 匹配 |
 
 > 方向:H=主机,M=MCU。`type` 的 bit7 置位表示 M→H 方向。
 
@@ -126,6 +128,34 @@ Trace Write(addr=0x40, data=[01,02,03]):  payload = [0x02][0x40 LE][3 LE][01 02 
 | `3` | InvalidLength | 操作长度非法 |
 | `4` | DivideByZero | 除零 |
 | `5` | BusError | 总线读写失败 |
+
+### 2.4 Control / ControlResult 载荷
+
+Control 是 EXEC 之外的调试控制面，用于不替换当前 rseq 程序地做一次通用总线访问。
+当前仅定义直接读:
+
+Control BusRead 请求:
+
+| 偏移 | 字段 | 类型 | 说明 |
+|----|------|------|------|
+| 0 | op | u8 | BusRead=`0x01` |
+| 1 | request_id | u16 LE | 主机分配,用于匹配响应 |
+| 3 | addr | u32 LE | 当前 MCU bus 上的寄存器 / 总线地址 |
+| 7 | len | u16 LE | 读取字节数,当前上限 `64` |
+
+ControlResult BusRead 响应:
+
+| 偏移 | 字段 | 类型 | 说明 |
+|----|------|------|------|
+| 0 | op | u8 | BusRead=`0x01` |
+| 1 | request_id | u16 LE | 对应请求 |
+| 3 | status | u8 | `0` 为 Ok,非 0 为错误 |
+| 4 | addr | u32 LE | 实际读取地址 |
+| 8 | dlen | u16 LE | data 字节数 |
+| 10 | data | `[u8; dlen]` | 读取结果 |
+
+Control BusRead 复用 MCU 当前的物理 bus 状态。例如脚本执行过 `bus!(i2c, 0x6a)` 后,
+后续 Control BusRead 就从该 I2C 设备读取；固件不包含任何芯片型号或寄存器语义。
 
 ---
 

@@ -620,7 +620,7 @@ fn run_watch(
     }
     println!("No LOAD/EXEC/PING frames will be sent. Press Ctrl-C to stop.");
 
-    let transport = match rseq_link::SerialTransport::open(path, baud) {
+    let transport = match rseq_link::SerialTransport::open_observing(path, baud) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("open serial {path} failed: {e}");

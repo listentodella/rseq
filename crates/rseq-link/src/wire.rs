@@ -27,6 +27,68 @@ pub const TRACE_OP_BUS_SELECT: u8 = 0x08;
 /// 4096B raw buffer 与最多 7 个 u32 参数，因此上限为 4153。
 pub const MAX_TRACE_PAYLOAD: usize = 1 + 1 + 4 + 8 + 4 + 1 + 7 * (1 + 4) + (1 + 2 + 4096);
 
+// ── Control 载荷 ─────────────────────────────────────────────
+/// Control op:直接读取当前 MCU 总线上的寄存器。
+pub const CONTROL_OP_BUS_READ: u8 = 0x01;
+/// 单次直接控制读的最大长度。寄存器 dump 通常为 1..4 字节，64B 足够覆盖
+/// 小块调试读取，同时避免在持续 report 流中制造过大的控制响应。
+pub const CONTROL_MAX_READ_LEN: usize = 64;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlStatus {
+    Ok = 0,
+    InvalidPayload = 1,
+    Unsupported = 2,
+    InvalidAddress = 3,
+    AccessSizeMismatch = 4,
+    Timeout = 5,
+    HardwareFailure = 6,
+}
+
+impl ControlStatus {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Ok),
+            1 => Some(Self::InvalidPayload),
+            2 => Some(Self::Unsupported),
+            3 => Some(Self::InvalidAddress),
+            4 => Some(Self::AccessSizeMismatch),
+            5 => Some(Self::Timeout),
+            6 => Some(Self::HardwareFailure),
+            _ => None,
+        }
+    }
+
+    pub const fn from_bus_error(error: rseq_vm::BusError) -> Self {
+        match error {
+            rseq_vm::BusError::InvalidAddress => Self::InvalidAddress,
+            rseq_vm::BusError::AccessSizeMismatch => Self::AccessSizeMismatch,
+            rseq_vm::BusError::Timeout => Self::Timeout,
+            rseq_vm::BusError::HardwareFailure => Self::HardwareFailure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRequestRef {
+    BusRead {
+        request_id: u16,
+        addr: u32,
+        len: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlResultRef<'a> {
+    BusRead {
+        request_id: u16,
+        status: ControlStatus,
+        addr: u32,
+        data: &'a [u8],
+    },
+}
+
 /// 解码后的 Trace 记录,载荷切片借用自帧缓冲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceRef<'a> {
@@ -228,6 +290,99 @@ pub fn encode_trace_bus_select(out: &mut [u8], kind: rseq_vm::BusKind, arg: u32)
     let crc = crate::crc32::crc32(&out[2..5 + PAYLOAD_LEN]);
     out[5 + PAYLOAD_LEN..5 + PAYLOAD_LEN + 4].copy_from_slice(&crc.to_le_bytes());
     total
+}
+
+/// 构造 Control/BusRead 请求载荷，返回 payload 字节数。
+///
+/// 布局：`[op=0x01][request_id u16 LE][addr u32 LE][len u16 LE]`。
+pub fn encode_control_bus_read_into(out: &mut [u8], request_id: u16, addr: u32, len: u16) -> usize {
+    const PAYLOAD_LEN: usize = 1 + 2 + 4 + 2;
+    assert!(
+        out.len() >= PAYLOAD_LEN,
+        "control read payload buffer too small"
+    );
+    out[0] = CONTROL_OP_BUS_READ;
+    out[1..3].copy_from_slice(&request_id.to_le_bytes());
+    out[3..7].copy_from_slice(&addr.to_le_bytes());
+    out[7..9].copy_from_slice(&len.to_le_bytes());
+    PAYLOAD_LEN
+}
+
+/// 解码 Control 请求载荷。
+pub fn decode_control_request(payload: &[u8]) -> Option<ControlRequestRef> {
+    if payload.is_empty() {
+        return None;
+    }
+    match payload[0] {
+        CONTROL_OP_BUS_READ => {
+            if payload.len() != 1 + 2 + 4 + 2 {
+                return None;
+            }
+            Some(ControlRequestRef::BusRead {
+                request_id: u16::from_le_bytes([payload[1], payload[2]]),
+                addr: u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]),
+                len: u16::from_le_bytes([payload[7], payload[8]]),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 构造 ControlResult/BusRead 响应载荷，返回 payload 字节数。
+///
+/// 布局：`[op=0x01][request_id u16 LE][status u8][addr u32 LE][dlen u16 LE][data]`。
+pub fn encode_control_bus_read_result_into(
+    out: &mut [u8],
+    request_id: u16,
+    status: ControlStatus,
+    addr: u32,
+    data: &[u8],
+) -> usize {
+    assert!(
+        data.len() <= CONTROL_MAX_READ_LEN,
+        "control read result exceeds CONTROL_MAX_READ_LEN"
+    );
+    let payload_len = 1 + 2 + 1 + 4 + 2 + data.len();
+    assert!(
+        out.len() >= payload_len,
+        "control read result payload buffer too small"
+    );
+    out[0] = CONTROL_OP_BUS_READ;
+    out[1..3].copy_from_slice(&request_id.to_le_bytes());
+    out[3] = status as u8;
+    out[4..8].copy_from_slice(&addr.to_le_bytes());
+    let dlen = data.len() as u16;
+    out[8..10].copy_from_slice(&dlen.to_le_bytes());
+    out[10..10 + data.len()].copy_from_slice(data);
+    payload_len
+}
+
+/// 解码 ControlResult 载荷。
+pub fn decode_control_result(payload: &[u8]) -> Option<ControlResultRef<'_>> {
+    if payload.is_empty() {
+        return None;
+    }
+    match payload[0] {
+        CONTROL_OP_BUS_READ => {
+            if payload.len() < 1 + 2 + 1 + 4 + 2 {
+                return None;
+            }
+            let request_id = u16::from_le_bytes([payload[1], payload[2]]);
+            let status = ControlStatus::from_u8(payload[3])?;
+            let addr = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let dlen = u16::from_le_bytes([payload[8], payload[9]]) as usize;
+            if dlen > CONTROL_MAX_READ_LEN || payload.len() < 10 + dlen {
+                return None;
+            }
+            Some(ControlResultRef::BusRead {
+                request_id,
+                status,
+                addr,
+                data: &payload[10..10 + dlen],
+            })
+        }
+        _ => None,
+    }
 }
 
 /// 在 `out` 中构造一条 Report Trace 帧（`report!`），返回总字节数。
@@ -718,6 +873,33 @@ mod tests {
             Some(TraceRef::BusSelect {
                 kind: rseq_vm::BusKind::I2c,
                 arg: 0x6a
+            })
+        );
+    }
+
+    #[test]
+    fn control_bus_read_round_trip() {
+        let mut req = vec![0u8; 16];
+        let n = encode_control_bus_read_into(&mut req, 7, 0x2e, 3);
+        assert_eq!(
+            decode_control_request(&req[..n]),
+            Some(ControlRequestRef::BusRead {
+                request_id: 7,
+                addr: 0x2e,
+                len: 3
+            })
+        );
+
+        let data = [0x11, 0x22, 0x33];
+        let mut res = vec![0u8; 32];
+        let n = encode_control_bus_read_result_into(&mut res, 7, ControlStatus::Ok, 0x2e, &data);
+        assert_eq!(
+            decode_control_result(&res[..n]),
+            Some(ControlResultRef::BusRead {
+                request_id: 7,
+                status: ControlStatus::Ok,
+                addr: 0x2e,
+                data: &data
             })
         );
     }

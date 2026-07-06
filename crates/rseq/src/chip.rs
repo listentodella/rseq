@@ -100,6 +100,10 @@ struct RegisterYaml {
     #[serde(default)]
     read_clear: bool,
     #[serde(default)]
+    no_dump: bool,
+    #[serde(default)]
+    no_dump_reason: String,
+    #[serde(default)]
     fields: Vec<FieldYaml>,
 }
 
@@ -149,6 +153,10 @@ pub struct Register {
     pub roles: Vec<String>,
     /// 读取后硬件自动清零（W1C-on-read 中断状态寄存器）。
     pub read_clear: bool,
+    /// 不适合普通 register dump 读取的寄存器。
+    pub no_dump: bool,
+    /// `no_dump` 的芯片字典说明。
+    pub no_dump_reason: String,
     pub fields: Vec<Field>,
 }
 
@@ -258,6 +266,8 @@ impl ChipRegistry {
                         desc: reg.desc,
                         roles: reg.roles,
                         read_clear: reg.read_clear,
+                        no_dump: reg.no_dump,
+                        no_dump_reason: reg.no_dump_reason,
                         fields,
                     })
                 })
@@ -692,6 +702,11 @@ mod tests {
         let (addr, reg) = registry.resolve_register("UI.WHOAMI").unwrap();
         assert_eq!(addr, 0x02);
         assert_eq!(reg.name, "WHOAMI");
+
+        let (addr, reg) = registry.resolve_register("UI.FIFO_DATA").unwrap();
+        assert_eq!(addr, 0x57);
+        assert!(reg.no_dump);
+        assert!(!reg.no_dump_reason.is_empty());
     }
 
     #[test]

@@ -1,6 +1,13 @@
 
 [workspace]
-members = ["crates/rseq-vm", "crates/rseq-link", "crates/rseq", "crates/rseq-cli", "crates/rseq-mcu-sim"]
+members = [
+    "crates/rseq-vm",
+    "crates/rseq-link",
+    "crates/rseq",
+    "crates/rseq-cli",
+    "crates/rseq-tui",
+    "crates/rseq-mcu-sim",
+]
 resolver = "2"
 
 [workspace.package]

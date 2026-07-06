@@ -86,7 +86,7 @@ pub use self::serial::SerialTransport;
 #[cfg(feature = "serial")]
 mod serial {
     use super::{LinkError, Transport};
-    use serialport::SerialPort;
+    use serialport::{ClearBuffer, SerialPort};
     use std::io::{Read, Write};
     use std::time::Duration;
 
@@ -98,10 +98,28 @@ mod serial {
     impl SerialTransport {
         /// 打开串口,设置波特率与 100ms 读超时(便于主机在等待时检查截止时间)。
         pub fn open(path: &str, baud: u32) -> Result<Self, LinkError> {
-            let port = serialport::new(path, baud)
+            Self::open_configured(path, baud, true)
+        }
+
+        /// 打开串口用于只观察已经运行的 MCU 上报流。
+        ///
+        /// 与 [`Self::open`] 不同，这里不清空系统串口缓冲，避免 watch/TUI 在
+        /// FIFO report 正在连续到达时切掉半帧。DTR/RTS 仍保持 ready 状态，和
+        /// 普通终端打开 CDC-ACM 的行为一致。
+        pub fn open_observing(path: &str, baud: u32) -> Result<Self, LinkError> {
+            Self::open_configured(path, baud, false)
+        }
+
+        fn open_configured(path: &str, baud: u32, clear_buffers: bool) -> Result<Self, LinkError> {
+            let mut port = serialport::new(path, baud)
                 .timeout(Duration::from_millis(100))
                 .open()
                 .map_err(|_| LinkError::Io)?;
+            let _ = port.write_data_terminal_ready(true);
+            let _ = port.write_request_to_send(true);
+            if clear_buffers {
+                let _ = port.clear(ClearBuffer::All);
+            }
             Ok(Self { port })
         }
     }

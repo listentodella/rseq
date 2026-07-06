@@ -36,11 +36,13 @@ pub enum FrameType {
     Reset = 0x03,
     Ping = 0x04,
     Stop = 0x05,
+    Control = 0x06,
     // MCU → Host
     Ack = 0x81,
     Trace = 0x82,
     Result = 0x83,
     Pong = 0x84,
+    ControlResult = 0x85,
 }
 
 impl FrameType {
@@ -51,10 +53,12 @@ impl FrameType {
             0x03 => Some(Self::Reset),
             0x04 => Some(Self::Ping),
             0x05 => Some(Self::Stop),
+            0x06 => Some(Self::Control),
             0x81 => Some(Self::Ack),
             0x82 => Some(Self::Trace),
             0x83 => Some(Self::Result),
             0x84 => Some(Self::Pong),
+            0x85 => Some(Self::ControlResult),
             _ => None,
         }
     }
@@ -62,7 +66,7 @@ impl FrameType {
     pub const fn is_host_to_mcu(self) -> bool {
         matches!(
             self,
-            Self::Load | Self::Exec | Self::Reset | Self::Ping | Self::Stop
+            Self::Load | Self::Exec | Self::Reset | Self::Ping | Self::Stop | Self::Control
         )
     }
 }

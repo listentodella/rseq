@@ -210,8 +210,26 @@ int rust_uart_write(const uint8_t *data, size_t len)
 		return -ENODEV;
 	}
 
+#ifdef CONFIG_UART_LINE_CTRL
+	uint32_t dtr = 0U;
+	int ctrl_ret = uart_line_ctrl_get(serial_dev, UART_LINE_CTRL_DTR, &dtr);
+	if (ctrl_ret == 0 && dtr == 0U) {
+		return -ENOTCONN;
+	}
+#endif
+
 	k_mutex_lock(&uart_tx_mutex, K_FOREVER);
 	for (size_t i = 0; i < len; i++) {
+#ifdef CONFIG_UART_LINE_CTRL
+		if ((i & 0x3fU) == 0U) {
+			dtr = 0U;
+			ctrl_ret = uart_line_ctrl_get(serial_dev, UART_LINE_CTRL_DTR, &dtr);
+			if (ctrl_ret == 0 && dtr == 0U) {
+				k_mutex_unlock(&uart_tx_mutex);
+				return -ENOTCONN;
+			}
+		}
+#endif
 		uart_poll_out(serial_dev, data[i]);
 	}
 	k_mutex_unlock(&uart_tx_mutex);

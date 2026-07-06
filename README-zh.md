@@ -71,11 +71,16 @@ bus_probe!(i2c, { addrs: [0x6a, 0x6b], read: UI.WHOAMI, expect: 0x06 });
 ```
 
 - CRC32(IEEE) 覆盖 `type || len || payload`, 不含 sync 与 crc 本身;
-- 主机 → MCU: `Load=0x01` / `Exec=0x02` / `Reset=0x03` / `Ping=0x04` / `Stop=0x05`;
-- MCU → 主机: `Ack=0x81` / `Trace=0x82` / `Result=0x83` / `Pong=0x84`;
+- 主机 → MCU: `Load=0x01` / `Exec=0x02` / `Reset=0x03` / `Ping=0x04` / `Stop=0x05` / `Control=0x06`;
+- MCU → 主机: `Ack=0x81` / `Trace=0x82` / `Result=0x83` / `Pong=0x84` / `ControlResult=0x85`;
 - `Load`/`Exec`/`Reset`/`Stop` 由 MCU 回 `Ack` 确认; `Exec` 期间 MCU 逐条发 `Trace`, 结束后发一条 `Result`(含状态码). `Trace`/`Result` 为尽力而为, 不重传.
 
 `Trace` 载荷: 读/写为 `[op u8][addr u32 LE][dlen u16 LE][data]`(`op`: Read=0x01 / Write=0x02), 延时为 `[0x03][us u32 LE]`.
+
+`Control` 是 EXEC 之外的直接调试控制面，当前支持一次性总线读：
+请求载荷 `[op=0x01][request_id u16 LE][addr u32 LE][len u16 LE]`，
+响应载荷 `[op=0x01][request_id u16 LE][status u8][addr u32 LE][dlen u16 LE][data]`。
+它复用 MCU 当前的 `bus!(...)` 状态，不会 LOAD/EXEC 临时脚本，也不会清除后台 IRQ handler。
 
 ### 上位机: --serial
 

@@ -319,3 +319,24 @@ int rust_irq_wait(uint8_t pin, uint32_t timeout_ms)
     return -ENOTSUP;
 #endif
 }
+
+int rust_irq_level(uint8_t pin)
+{
+#if RSEQ_HAS_INT1
+    int ret;
+
+    if (pin != 0U) {
+        return -ENOTSUP;
+    }
+
+    ret = rust_irq_init();
+    if (ret != 0) {
+        return ret;
+    }
+
+    return gpio_pin_get_dt(&rseq_int1);
+#else
+    (void)pin;
+    return -ENOTSUP;
+#endif
+}

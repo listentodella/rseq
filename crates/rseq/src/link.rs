@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
 use rseq_link::wire::{
-    ExecStatus, TraceRef, decode_trace, encode_load_main_into, encode_load_segments_into,
+    CONTROL_MAX_READ_LEN, ControlResultRef, ControlStatus, ExecStatus, TraceRef,
+    decode_control_result, decode_trace, encode_control_bus_read_into, encode_load_main_into,
+    encode_load_segments_into,
 };
 use rseq_link::{LinkError, Transport};
 
@@ -26,6 +28,14 @@ pub struct ExecResult {
     pub status: ExecStatus,
     /// EXEC 期间收集到的总线操作,顺序与 MCU 执行顺序一致。
     pub traces: Vec<BusOp>,
+}
+
+/// 直接控制读的结果。它走 Control/ControlResult 帧，不会替换 MCU 当前加载的 rseq 程序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlReadResult {
+    pub request_id: u16,
+    pub addr: u32,
+    pub data: Vec<u8>,
 }
 
 /// 把解码出的 Trace 记录转成主机侧共享的 [`BusOp`](数据拷贝出帧缓冲)。
@@ -83,6 +93,7 @@ pub struct HostLink<T> {
     /// EXEC 期间等待 Trace/Result 流的超时上限。中断脚本（含 `wait!`）
     /// 需要更长的等待，故暴露 [`HostLink::set_exec_timeout`] 供 CLI 调整。
     exec_timeout: Duration,
+    next_control_id: u16,
 }
 
 impl<T: Transport> HostLink<T> {
@@ -92,6 +103,7 @@ impl<T: Transport> HostLink<T> {
             dec: FrameDecoder::<HOST_FRAME_BUF>::new(),
             inbox: VecDeque::new(),
             exec_timeout: DEFAULT_TIMEOUT,
+            next_control_id: 1,
         }
     }
 
@@ -147,9 +159,16 @@ impl<T: Transport> HostLink<T> {
         }
     }
 
-    /// 等待指定类型的一帧;期间提前到达的其它帧按原顺序塞回 inbox 前部,
-    /// 供后续消费(协议锁步下一般不会乱序,此处防御性处理)。
-    fn expect(&mut self, want: FrameType, deadline: Instant) -> Result<Vec<u8>, LinkError> {
+    /// 等待一条控制响应，同时丢弃期间积压的 Trace/Result。
+    ///
+    /// 用于 `Stop`/`Reset` 这类“主机要夺回控制权”的命令：MCU 可能已经在
+    /// 连续上报 FIFO 数据，若把所有旧 Trace 都 deferred 到 inbox，ACK 还没到
+    /// 主机内存就会被历史数据拖住。这里保留非观测类帧，丢弃观测流。
+    fn expect_control_frame(
+        &mut self,
+        want: FrameType,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, LinkError> {
         let mut deferred: Vec<(FrameType, Vec<u8>)> = Vec::new();
         loop {
             match self.next_frame(deadline)? {
@@ -160,33 +179,17 @@ impl<T: Transport> HostLink<T> {
                     }
                     return Ok(p);
                 }
+                Some((FrameType::Trace | FrameType::Result, _)) => {
+                    // Drop stale observations while waiting for a control response.
+                }
                 Some(other) => deferred.push(other),
             }
         }
     }
 
-    /// 等待一条控制响应，同时丢弃期间积压的 Trace/Result。
-    ///
-    /// 用于 `Stop`/`Reset` 这类“主机要夺回控制权”的命令：MCU 可能已经在
-    /// 连续上报 FIFO 数据，若把所有旧 Trace 都 deferred 到 inbox，ACK 还没到
-    /// 主机内存就会被历史数据拖住。这里保留非观测类帧，丢弃观测流。
     fn expect_control_ack(&mut self, deadline: Instant) -> Result<(), LinkError> {
-        let mut deferred: Vec<(FrameType, Vec<u8>)> = Vec::new();
-        loop {
-            match self.next_frame(deadline)? {
-                None => return Err(LinkError::Timeout),
-                Some((FrameType::Ack, _)) => {
-                    for f in deferred.into_iter().rev() {
-                        self.inbox.push_front(f);
-                    }
-                    return Ok(());
-                }
-                Some((FrameType::Trace | FrameType::Result, _)) => {
-                    // Drop stale observations while waiting for control ACK.
-                }
-                Some(other) => deferred.push(other),
-            }
-        }
+        let _ = self.expect_control_frame(FrameType::Ack, deadline)?;
+        Ok(())
     }
 
     // ── 高层协议 ────────────────────────────────────────────
@@ -196,7 +199,7 @@ impl<T: Transport> HostLink<T> {
         let mut payload = vec![0u8; 2 + 3 + bytecode.len()];
         let n = encode_load_main_into(&mut payload, bytecode);
         self.send_frame(FrameType::Load, &payload[..n])?;
-        let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
+        self.expect_control_ack(Instant::now() + DEFAULT_TIMEOUT)?;
         Ok(())
     }
 
@@ -209,14 +212,14 @@ impl<T: Transport> HostLink<T> {
         let mut payload = vec![0u8; total_len];
         let n = encode_load_segments_into(&mut payload, segments);
         self.send_frame(FrameType::Load, &payload[..n])?;
-        let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
+        self.expect_control_ack(Instant::now() + DEFAULT_TIMEOUT)?;
         Ok(())
     }
 
     /// 触发执行;返回执行状态与期间回传的总线轨迹。
     pub fn exec(&mut self) -> Result<ExecResult, LinkError> {
         self.send_frame(FrameType::Exec, &[])?;
-        let _ = self.expect(FrameType::Ack, Instant::now() + DEFAULT_TIMEOUT)?;
+        self.expect_control_ack(Instant::now() + DEFAULT_TIMEOUT)?;
         let deadline = Instant::now() + self.exec_timeout;
         let mut traces: Vec<BusOp> = Vec::new();
         loop {
@@ -254,6 +257,83 @@ impl<T: Transport> HostLink<T> {
         }
     }
 
+    fn alloc_control_id(&mut self) -> u16 {
+        let id = self.next_control_id;
+        self.next_control_id = self.next_control_id.wrapping_add(1);
+        if self.next_control_id == 0 {
+            self.next_control_id = 1;
+        }
+        id
+    }
+
+    /// 直接读取 MCU 当前物理总线上的一段寄存器。
+    ///
+    /// 这条路径使用 Control/ControlResult 帧，不会 LOAD/EXEC 临时脚本，也不会清除
+    /// 已注册的 IRQ handler。等待响应期间收到的 Trace 会被丢弃；UI 类调用方若想
+    /// 保留 Trace 流，应使用 [`HostLink::control_read_observing`]。
+    pub fn control_read(&mut self, addr: u32, len: u16) -> Result<ControlReadResult, LinkError> {
+        self.control_read_observing(addr, len, DEFAULT_TIMEOUT, |_| {})
+    }
+
+    /// 直接读取寄存器，并在等待 ControlResult 时把穿插到来的 Trace 交给回调。
+    pub fn control_read_observing<F>(
+        &mut self,
+        addr: u32,
+        len: u16,
+        timeout: Duration,
+        mut on_trace: F,
+    ) -> Result<ControlReadResult, LinkError>
+    where
+        F: FnMut(BusOp),
+    {
+        if len == 0 || len as usize > CONTROL_MAX_READ_LEN {
+            return Err(LinkError::Nak(ControlStatus::AccessSizeMismatch as u8));
+        }
+
+        let request_id = self.alloc_control_id();
+        let mut payload = [0u8; 1 + 2 + 4 + 2];
+        let n = encode_control_bus_read_into(&mut payload, request_id, addr, len);
+        self.send_frame(FrameType::Control, &payload[..n])?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (ty, p) = self.next_frame(deadline)?.ok_or(LinkError::Timeout)?;
+            match ty {
+                FrameType::ControlResult => {
+                    let Some(ControlResultRef::BusRead {
+                        request_id: got_id,
+                        status,
+                        addr: got_addr,
+                        data,
+                    }) = decode_control_result(&p)
+                    else {
+                        return Err(LinkError::UnknownType);
+                    };
+                    if got_id != request_id {
+                        continue;
+                    }
+                    if status != ControlStatus::Ok {
+                        return Err(LinkError::Nak(status as u8));
+                    }
+                    return Ok(ControlReadResult {
+                        request_id: got_id,
+                        addr: got_addr,
+                        data: data.to_vec(),
+                    });
+                }
+                FrameType::Trace => {
+                    if let Some(r) = decode_trace(&p) {
+                        on_trace(BusOp::from(r));
+                    }
+                }
+                FrameType::Result => {
+                    // A stale EXEC result can be left in a long-running report stream; ignore it.
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 复位 MCU 程序区;收到 ACK 即返回。
     pub fn reset(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Reset, &[])?;
@@ -272,7 +352,7 @@ impl<T: Transport> HostLink<T> {
     /// 探活;收到 Pong 即返回。
     pub fn ping(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Ping, &[])?;
-        let _ = self.expect(FrameType::Pong, Instant::now() + DEFAULT_TIMEOUT)?;
+        let _ = self.expect_control_frame(FrameType::Pong, Instant::now() + DEFAULT_TIMEOUT)?;
         Ok(())
     }
 }
@@ -282,8 +362,9 @@ mod tests {
     use super::*;
     use rseq_link::wire::{
         REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportMeta as WireReportMeta, TRACE_OP_READ,
-        TRACE_OP_WRITE, encode_trace_delay, encode_trace_log, encode_trace_report,
-        encode_trace_report_v2, encode_trace_rw,
+        TRACE_OP_WRITE, decode_control_request, encode_control_bus_read_result_into,
+        encode_trace_delay, encode_trace_log, encode_trace_report, encode_trace_report_v2,
+        encode_trace_rw,
     };
 
     /// 脚本式传输:`read` 顺序吐出预置字节,`write` 全捕获到 `writes`。
@@ -374,6 +455,51 @@ mod tests {
     }
 
     #[test]
+    fn load_drops_stale_traces_until_ack() {
+        let mut rx = Vec::new();
+        let mut stale = vec![0u8; 32];
+        let n = encode_trace_log(&mut stale, "old report");
+        rx.extend(&stale[..n]);
+        rx.extend(frame(FrameType::Ack, &[]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        link.load(&[0x01, 0x02, 0x03]).unwrap();
+        let w = &link.transport_mut().writes;
+        assert_eq!(w[2], FrameType::Load as u8);
+        assert!(link.inbox.is_empty());
+    }
+
+    #[test]
+    fn exec_drops_stale_traces_before_ack() {
+        let mut rx = Vec::new();
+        let mut stale = vec![0u8; 32];
+        let n = encode_trace_log(&mut stale, "old report");
+        rx.extend(&stale[..n]);
+        rx.extend(frame(FrameType::Ack, &[]));
+        rx.extend(trace_rw_frame(TRACE_OP_READ, 0x10, &[0x01]));
+        rx.extend(frame(FrameType::Result, &[ExecStatus::Ok as u8]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let res = link.exec().unwrap();
+        assert_eq!(res.status, ExecStatus::Ok);
+        assert_eq!(
+            res.traces,
+            vec![BusOp::Read {
+                addr: 0x10,
+                data: vec![0x01]
+            }]
+        );
+    }
+
+    #[test]
     fn ping_expects_pong() {
         let rx = frame(FrameType::Pong, &[]);
         let mut link = HostLink::new(ScriptTransport {
@@ -403,6 +529,80 @@ mod tests {
         let w = &link.transport_mut().writes;
         assert_eq!(w[2], FrameType::Stop as u8);
         assert!(link.inbox.is_empty());
+    }
+
+    #[test]
+    fn control_read_writes_control_frame_and_reads_result() {
+        let mut result_payload = vec![0u8; 32];
+        let n = encode_control_bus_read_result_into(
+            &mut result_payload,
+            1,
+            ControlStatus::Ok,
+            0x2e,
+            &[0x44, 0x55],
+        );
+        let rx = frame(FrameType::ControlResult, &result_payload[..n]);
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let res = link.control_read(0x2e, 2).unwrap();
+
+        assert_eq!(
+            res,
+            ControlReadResult {
+                request_id: 1,
+                addr: 0x2e,
+                data: vec![0x44, 0x55]
+            }
+        );
+        let w = &link.transport_mut().writes;
+        assert_eq!(w[2], FrameType::Control as u8);
+        let payload_len = u16::from_le_bytes([w[3], w[4]]) as usize;
+        assert_eq!(
+            decode_control_request(&w[5..5 + payload_len]),
+            Some(rseq_link::wire::ControlRequestRef::BusRead {
+                request_id: 1,
+                addr: 0x2e,
+                len: 2
+            })
+        );
+    }
+
+    #[test]
+    fn control_read_observes_trace_while_waiting_for_result() {
+        let mut rx = Vec::new();
+        rx.extend(trace_rw_frame(TRACE_OP_READ, 0x10, &[0x01]));
+        let mut result_payload = vec![0u8; 32];
+        let n = encode_control_bus_read_result_into(
+            &mut result_payload,
+            1,
+            ControlStatus::Ok,
+            0x2e,
+            &[0xaa],
+        );
+        rx.extend(frame(FrameType::ControlResult, &result_payload[..n]));
+
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+        let mut observed = Vec::new();
+        let res = link
+            .control_read_observing(0x2e, 1, DEFAULT_TIMEOUT, |op| observed.push(op))
+            .unwrap();
+
+        assert_eq!(res.data, vec![0xaa]);
+        assert_eq!(
+            observed,
+            vec![BusOp::Read {
+                addr: 0x10,
+                data: vec![0x01]
+            }]
+        );
     }
 
     #[test]

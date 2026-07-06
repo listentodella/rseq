@@ -19,7 +19,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /* log macros bypassed — use rust_printk for console output (USART3). */
 
 use rseq_link::frame::{encode_into, FrameDecoder, FrameType, OVERHEAD};
-use rseq_link::wire::{load_segments, ExecStatus, SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
+use rseq_link::wire::{
+    decode_control_request, encode_control_bus_read_result_into, load_segments,
+    ControlRequestRef, ControlStatus, ExecStatus, CONTROL_MAX_READ_LEN, SEG_KIND_IRQ_INT1,
+    SEG_KIND_MAIN,
+};
 use rseq_link::{LinkError, TracingBus, Transport};
 use rseq_vm::{Bus, BusError, BusKind, Vm};
 
@@ -32,8 +36,14 @@ struct IrqHandler {
     bytecode: Vec<u8>,
 }
 
-/// 全局中断处理器数组（pin_id → handler）
-static mut IRQ_HANDLERS: [Option<IrqHandler>; MAX_IRQ_HANDLERS] = [None, None];
+/// 已激活的中断处理器（pin_id → handler）。只有这张表会被主循环调度。
+static mut IRQ_ACTIVE_HANDLERS: [Option<IrqHandler>; MAX_IRQ_HANDLERS] = [None, None];
+
+/// 已 LOAD、等待 main EXEC 成功后激活的中断处理器。
+///
+/// 这样可以避免“LOAD 注册 handler → EXEC 尚未完成配置 → INT 已经为高 → handler
+/// 提前读 FIFO/清状态”的竞态。
+static mut IRQ_STAGED_HANDLERS: [Option<IrqHandler>; MAX_IRQ_HANDLERS] = [None, None];
 
 /// IRQ 待处理标志（ISR 中设置，主循环中检查）
 static IRQ_PENDING: [AtomicBool; MAX_IRQ_HANDLERS] =
@@ -42,10 +52,45 @@ static IRQ_PENDING: [AtomicBool; MAX_IRQ_HANDLERS] =
 fn clear_irq_handlers() {
     unsafe {
         for i in 0..MAX_IRQ_HANDLERS {
-            IRQ_HANDLERS[i] = None;
+            IRQ_ACTIVE_HANDLERS[i] = None;
+            IRQ_STAGED_HANDLERS[i] = None;
             IRQ_PENDING[i].store(false, Ordering::Release);
         }
     }
+}
+
+fn begin_irq_load() {
+    unsafe {
+        for i in 0..MAX_IRQ_HANDLERS {
+            IRQ_ACTIVE_HANDLERS[i] = None;
+            IRQ_STAGED_HANDLERS[i] = None;
+            IRQ_PENDING[i].store(false, Ordering::Release);
+        }
+    }
+}
+
+fn stage_irq_handler(pin_id: usize, bytecode: &[u8]) {
+    if pin_id >= MAX_IRQ_HANDLERS {
+        return;
+    }
+    unsafe {
+        IRQ_STAGED_HANDLERS[pin_id] = Some(IrqHandler {
+            bytecode: bytecode.to_vec(),
+        });
+    }
+}
+
+fn activate_staged_irq_handlers() -> usize {
+    let mut activated = 0;
+    unsafe {
+        for i in 0..MAX_IRQ_HANDLERS {
+            if let Some(handler) = IRQ_STAGED_HANDLERS[i].take() {
+                IRQ_ACTIVE_HANDLERS[i] = Some(handler);
+                activated += 1;
+            }
+        }
+    }
+    activated
 }
 
 mod ffi {
@@ -91,6 +136,7 @@ mod ffi {
         ) -> i32;
         pub fn rust_irq_init() -> i32;
         pub fn rust_irq_wait(pin: u8, timeout_ms: u32) -> i32;
+        pub fn rust_irq_level(pin: u8) -> i32;
     }
 }
 
@@ -441,14 +487,85 @@ fn send_frame<T: Transport>(t: &mut T, ty: FrameType, payload: &[u8]) -> Result<
     t.write(&buf[..n])
 }
 
+fn send_control_read_result<T: Transport>(
+    transport: &mut T,
+    request_id: u16,
+    status: ControlStatus,
+    addr: u32,
+    data: &[u8],
+) -> Result<(), LinkError> {
+    let mut payload = alloc::vec![0u8; 1 + 2 + 1 + 4 + 2 + data.len()];
+    let n = encode_control_bus_read_result_into(&mut payload, request_id, status, addr, data);
+    send_frame(transport, FrameType::ControlResult, &payload[..n])
+}
+
+fn handle_control_frame<B: Bus, T: Transport>(
+    payload: &[u8],
+    bus: &mut B,
+    transport: &mut T,
+) -> Result<(), LinkError> {
+    match decode_control_request(payload) {
+        Some(ControlRequestRef::BusRead {
+            request_id,
+            addr,
+            len,
+        }) => {
+            if len == 0 || len as usize > CONTROL_MAX_READ_LEN {
+                return send_control_read_result(
+                    transport,
+                    request_id,
+                    ControlStatus::AccessSizeMismatch,
+                    addr,
+                    &[],
+                );
+            }
+
+            let mut data = alloc::vec![0u8; len as usize];
+            match bus.read(addr, &mut data) {
+                Ok(()) => send_control_read_result(
+                    transport,
+                    request_id,
+                    ControlStatus::Ok,
+                    addr,
+                    &data,
+                ),
+                Err(error) => send_control_read_result(
+                    transport,
+                    request_id,
+                    ControlStatus::from_bus_error(error),
+                    addr,
+                    &[],
+                ),
+            }
+        }
+        None => {
+            // The payload is malformed enough that request_id is unavailable.
+            // Reply with id=0 so a host-side diagnostic tool can still see the failure.
+            send_control_read_result(
+                transport,
+                0,
+                ControlStatus::InvalidPayload,
+                0,
+                &[],
+            )
+        }
+    }
+}
+
 fn run_pending_irqs<B: Bus, T: Transport>(bus: &mut B, transport: &mut T) {
     for pin_id in 0..MAX_IRQ_HANDLERS {
+        unsafe {
+            if IRQ_ACTIVE_HANDLERS[pin_id].is_none() {
+                continue;
+            }
+        }
+
         if !IRQ_PENDING[pin_id].swap(false, Ordering::Acquire) {
             continue;
         }
 
         unsafe {
-            if let Some(handler) = &IRQ_HANDLERS[pin_id] {
+            if let Some(handler) = &IRQ_ACTIVE_HANDLERS[pin_id] {
                 let mut tracing =
                     TracingBus::new_with_clock(&mut *bus, &mut *transport, report_timestamp_us);
                 if let Err(e) = Vm::new(&mut tracing, &handler.bytecode).run() {
@@ -457,6 +574,19 @@ fn run_pending_irqs<B: Bus, T: Transport>(bus: &mut B, transport: &mut T) {
             }
         }
     }
+}
+
+fn poll_level_irqs() -> bool {
+    let mut any = false;
+
+    unsafe {
+        if IRQ_ACTIVE_HANDLERS[0].is_some() && ffi::rust_irq_level(0) > 0 {
+            IRQ_PENDING[0].store(true, Ordering::Release);
+            any = true;
+        }
+    }
+
+    any
 }
 
 /// MCU-side main loop: decode frames from `transport`, dispatch Load/Exec/
@@ -476,6 +606,7 @@ fn mcu_loop<B: Bus, T: Transport>(
     printk("rseq: main loop start\n");
 
     loop {
+        poll_level_irqs();
         run_pending_irqs(&mut bus, &mut transport);
 
         // Pull the next complete frame, responding to `stop` while waiting.
@@ -501,6 +632,9 @@ fn mcu_loop<B: Bus, T: Transport>(
             };
 
             if n == 0 {
+                if poll_level_irqs() {
+                    continue;
+                }
                 // Sleep until CDC RX or INT1 wakes the loop. The long timeout is
                 // only a defensive fallback; normal IRQ latency is event-driven.
                 unsafe {
@@ -521,19 +655,15 @@ fn mcu_loop<B: Bus, T: Transport>(
         match ty {
             FrameType::Load => {
                 if let Some((_ver, segs)) = load_segments(&payload) {
+                    begin_irq_load();
                     for (kind, bytes) in segs {
                         match kind {
                             SEG_KIND_MAIN => {
                                 bytecode = bytes.to_vec();
                             }
                             SEG_KIND_IRQ_INT1 => {
-                                // 注册 INT1 中断处理器
-                                unsafe {
-                                    IRQ_HANDLERS[0] = Some(IrqHandler {
-                                        bytecode: bytes.to_vec(),
-                                    });
-                                }
-                                printk("rseq: irq int1 handler registered\n");
+                                stage_irq_handler(0, bytes);
+                                printk("rseq: irq int1 handler staged\n");
                             }
                             _ => {
                                 // 忽略未知段类型
@@ -560,7 +690,15 @@ fn mcu_loop<B: Bus, T: Transport>(
                     let (b, _) = tracing.into_inner();
                     bus = b;
                     match res {
-                        Ok(()) => ExecStatus::Ok,
+                        Ok(()) => {
+                            let activated = activate_staged_irq_handlers();
+                            if activated != 0 {
+                                printk(&alloc::format!(
+                                    "rseq: activated {activated} irq handler(s)\n"
+                                ));
+                            }
+                            ExecStatus::Ok
+                        }
                         Err(e) => ExecStatus::from_vm_error(e),
                     }
                 };
@@ -587,14 +725,18 @@ fn mcu_loop<B: Bus, T: Transport>(
                 printk("rseq: PING\n");
                 send_frame(&mut transport, FrameType::Pong, &[])?;
             }
+            FrameType::Control => {
+                if let Err(_e) = handle_control_frame(&payload, &mut bus, &mut transport) {
+                    printk("rseq: send ControlResult failed\n");
+                    continue;
+                }
+            }
             // MCU→Host frames are ignored on the MCU side.
             _ => {
                 printk("rseq: unknown frame type\n");
             }
         }
 
-        printk("rseq: match complete, looping back\n");
-        printk("rseq: --- end of iteration, back to top ---\n");
     }
 }
 

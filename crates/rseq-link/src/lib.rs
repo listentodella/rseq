@@ -27,10 +27,12 @@ pub use error::LinkError;
 pub use frame::{Frame, FrameDecoder, FrameType, HOST_FRAME_BUF, MAX_TRACE_FRAME};
 pub use tracing_bus::{LinkTx, TracingBus};
 pub use wire::{
+    CONTROL_MAX_READ_LEN, CONTROL_OP_BUS_READ, ControlRequestRef, ControlResultRef, ControlStatus,
     ExecStatus, LOAD_VERSION, LoadSegs, REPORT_ARG_BYTES, REPORT_ARG_U32,
     REPORT_FLAG_TIMESTAMP_VALID, ReportArgRef, ReportArgs, ReportMeta, SEG_KIND_IRQ_HANDLER,
     SEG_KIND_IRQ_TABLE, SEG_KIND_MAIN, TRACE_OP_DELAY, TRACE_OP_READ, TRACE_OP_REPORT,
-    TRACE_OP_REPORT_V2, TRACE_OP_WRITE, TraceRef,
+    TRACE_OP_REPORT_V2, TRACE_OP_WRITE, TraceRef, decode_control_request, decode_control_result,
+    encode_control_bus_read_into, encode_control_bus_read_result_into,
 };
 
 #[cfg(feature = "std")]

@@ -89,3 +89,20 @@ report_format!(FIFO_RAW, i16_le, {
 `output: physical_f32` drives Motion charts. `output: raw_i16` is accepted by the
 host decoder for textual/report workflows, but Motion still needs gyro and accel
 field groups to produce physical samples.
+
+If the FIFO sample also carries temperature, add a temperature field and scaling
+metadata. The Motion page will show the temperature panel only after it receives
+samples with `temp_c`, and the panel can be hidden from the UI:
+
+```rseq
+report_format!(FIFO_RAW, i16_le, {
+    fields: [gx, gy, gz, ax, ay, az, temp],
+    gyro_fields: [gx, gy, gz],
+    accel_fields: [ax, ay, az],
+    temp_field: temp,
+    accel_fs_g: 16,
+    gyro_fs_dps: 4096,
+    temp_lsb_per_c: 256,
+    output: physical_f32,
+});
+```

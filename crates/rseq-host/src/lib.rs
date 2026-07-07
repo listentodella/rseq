@@ -14,6 +14,8 @@ use rseq::{CompiledProgram, ProgramUnit};
 
 pub const DEFAULT_ACCEL_FULL_SCALE_G: f64 = 16.0;
 pub const DEFAULT_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
+pub const DEFAULT_TEMP_LSB_PER_C: f64 = 1.0;
+pub const DEFAULT_TEMP_OFFSET_C: f64 = 0.0;
 pub const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 pub const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 pub const DEFAULT_BAUD: u32 = 115_200;
@@ -701,8 +703,11 @@ pub struct I16LeReportDecoder {
     pub fields: Vec<String>,
     pub accel_fields: Vec<String>,
     pub gyro_fields: Vec<String>,
+    pub temp_field: Option<String>,
     pub accel_fs_g: f64,
     pub gyro_fs_dps: f64,
+    pub temp_lsb_per_c: f64,
+    pub temp_offset_c: f64,
     pub output: ReportOutputMode,
 }
 
@@ -726,6 +731,17 @@ impl I16LeReportDecoder {
                 return Err(format!(
                     "scaled report field '{field}' is not present in fields"
                 ));
+            }
+        }
+        if let Some(field) = &self.temp_field {
+            if !seen.contains(field) {
+                return Err(format!("temp field '{field}' is not present in fields"));
+            }
+            if !self.temp_lsb_per_c.is_finite() || self.temp_lsb_per_c <= 0.0 {
+                return Err("temp_lsb_per_c must be greater than zero".to_string());
+            }
+            if !self.temp_offset_c.is_finite() {
+                return Err("temp_offset_c must be finite".to_string());
             }
         }
         Ok(())
@@ -756,20 +772,26 @@ fn build_report_decoder(
             let mut fields = None;
             let mut accel_fields = Vec::new();
             let mut gyro_fields = Vec::new();
+            let mut temp_field = None;
             let mut accel_fs_g = DEFAULT_ACCEL_FULL_SCALE_G;
             let mut gyro_fs_dps = DEFAULT_GYRO_FULL_SCALE_DPS;
+            let mut temp_lsb_per_c = DEFAULT_TEMP_LSB_PER_C;
+            let mut temp_offset_c = DEFAULT_TEMP_OFFSET_C;
             let mut output = ReportOutputMode::PhysicalF32;
             for (name, value) in options {
                 match name.as_str() {
                     "fields" => fields = Some(option_ident_array(decoder, name, value)?),
                     "accel_fields" => accel_fields = option_ident_array(decoder, name, value)?,
                     "gyro_fields" => gyro_fields = option_ident_array(decoder, name, value)?,
+                    "temp_field" => temp_field = Some(option_ident(decoder, name, value)?),
                     "accel_fs_g" => accel_fs_g = option_number(decoder, name, value)?,
                     "gyro_fs_dps" => gyro_fs_dps = option_number(decoder, name, value)?,
+                    "temp_lsb_per_c" => temp_lsb_per_c = option_number(decoder, name, value)?,
+                    "temp_offset_c" => temp_offset_c = option_number(decoder, name, value)?,
                     "output" => output = option_output_mode(decoder, name, value)?,
                     _ => {
                         return Err(format!(
-                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, accel_fs_g, gyro_fs_dps, or output"
+                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, temp_field, accel_fs_g, gyro_fs_dps, temp_lsb_per_c, temp_offset_c, or output"
                         ));
                     }
                 }
@@ -781,8 +803,11 @@ fn build_report_decoder(
                 fields,
                 gyro_fields,
                 accel_fields,
+                temp_field,
                 accel_fs_g,
                 gyro_fs_dps,
+                temp_lsb_per_c,
+                temp_offset_c,
                 output,
             )
         }
@@ -810,8 +835,11 @@ fn build_report_decoder(
                     .collect(),
                 ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
                 ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                None,
                 accel_fs_g,
                 gyro_fs_dps,
+                DEFAULT_TEMP_LSB_PER_C,
+                DEFAULT_TEMP_OFFSET_C,
                 output,
             )
         }
@@ -826,8 +854,11 @@ pub fn make_i16_le_decoder(
     fields: Vec<String>,
     gyro_fields: Vec<String>,
     accel_fields: Vec<String>,
+    temp_field: Option<String>,
     accel_fs_g: f64,
     gyro_fs_dps: f64,
+    temp_lsb_per_c: f64,
+    temp_offset_c: f64,
     output: ReportOutputMode,
 ) -> Result<ReportDecoder, String> {
     let decoder = I16LeReportDecoder {
@@ -835,8 +866,11 @@ pub fn make_i16_le_decoder(
         fields,
         accel_fields,
         gyro_fields,
+        temp_field,
         accel_fs_g,
         gyro_fs_dps,
+        temp_lsb_per_c,
+        temp_offset_c,
         output,
     };
     decoder.validate()?;
@@ -942,10 +976,16 @@ impl I16LeFifoSample {
                 ScaleKind::Accel,
             )?,
         ];
+        let temp_c = decoder
+            .temp_field
+            .as_deref()
+            .and_then(|field| self.value_by_name(decoder, field))
+            .map(|raw| temp_raw_to_c(raw, decoder.temp_lsb_per_c, decoder.temp_offset_c));
         Some(MotionSample {
             timestamp_us: meta.and_then(|meta| meta.timestamp_valid().then_some(meta.timestamp_us)),
             acc,
             gyro,
+            temp_c,
         })
     }
 }
@@ -961,6 +1001,7 @@ pub struct MotionSample {
     pub timestamp_us: Option<u64>,
     pub acc: [f64; 3],
     pub gyro: [f64; 3],
+    pub temp_c: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1016,6 +1057,10 @@ pub fn accel_raw_to_m_s2(raw: i16, full_scale_g: f64) -> f64 {
 
 pub fn gyro_raw_to_rad_s(raw: i16, full_scale_dps: f64) -> f64 {
     raw as f64 * full_scale_dps / I16_FULL_SCALE_COUNTS * std::f64::consts::PI / 180.0
+}
+
+pub fn temp_raw_to_c(raw: i16, lsb_per_c: f64, offset_c: f64) -> f64 {
+    raw as f64 / lsb_per_c + offset_c
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1494,6 +1539,7 @@ fn spawn_demo_session(
                     (phase * 1.3).cos() * 0.4,
                     (phase * 0.9).sin() * 0.3,
                 ],
+                temp_c: Some(28.0 + (phase * 0.18).sin() * 1.5),
             };
             let meta = ReportMeta {
                 flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
@@ -1846,8 +1892,11 @@ let whoami = read!(UI.WHOAMI, 1);
                 .collect(),
             ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
             ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+            None,
             16.0,
             4096.0,
+            DEFAULT_TEMP_LSB_PER_C,
+            DEFAULT_TEMP_OFFSET_C,
             output,
         )
         .unwrap()
@@ -1938,6 +1987,37 @@ let whoami = read!(UI.WHOAMI, 1);
         let sample = decoded.samples[0].to_motion(&decoder, None).unwrap();
         assert!((sample.acc[0] - 9.80665).abs() < 0.001);
         assert!(sample.gyro[2] > 10.0);
+        assert_eq!(sample.temp_c, None);
+    }
+
+    #[test]
+    fn decodes_optional_temperature_field_to_celsius() {
+        let decoder = match make_i16_le_decoder(
+            "i16_le",
+            ["gx", "gy", "gz", "ax", "ay", "az", "temp"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
+            ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+            Some("temp".to_string()),
+            16.0,
+            4096.0,
+            256.0,
+            0.0,
+            ReportOutputMode::PhysicalF32,
+        )
+        .unwrap()
+        {
+            ReportDecoder::I16Le(decoder) => decoder,
+        };
+        let raw = [1i16, -1, 0x1234, 2048, 0, -2048, 6400]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let decoded = decode_i16_le_fifo_samples(&raw, &decoder);
+        let sample = decoded.samples[0].to_motion(&decoder, None).unwrap();
+        assert_eq!(sample.temp_c, Some(25.0));
     }
 
     #[test]

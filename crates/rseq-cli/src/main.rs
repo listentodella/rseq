@@ -926,6 +926,8 @@ fn print_fifo_raw_report(
 const FIFO_DECODE_PREVIEW_SAMPLES: usize = 8;
 const DEFAULT_QMI8660_ACCEL_FULL_SCALE_G: f64 = 16.0;
 const DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS: f64 = 4096.0;
+const DEFAULT_TEMP_LSB_PER_C: f64 = 1.0;
+const DEFAULT_TEMP_OFFSET_C: f64 = 0.0;
 const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 const DEFAULT_REPORT_OUTPUT_MODE: ReportOutputMode = ReportOutputMode::PhysicalF32;
@@ -956,8 +958,11 @@ struct I16LeReportDecoder {
     fields: Vec<String>,
     accel_fields: Vec<String>,
     gyro_fields: Vec<String>,
+    temp_field: Option<String>,
     accel_fs_g: f64,
     gyro_fs_dps: f64,
+    temp_lsb_per_c: f64,
+    temp_offset_c: f64,
     output: ReportOutputMode,
 }
 
@@ -981,6 +986,17 @@ impl I16LeReportDecoder {
                 return Err(format!(
                     "scaled report field '{field}' is not present in fields"
                 ));
+            }
+        }
+        if let Some(field) = &self.temp_field {
+            if !seen.contains(field) {
+                return Err(format!("temp field '{field}' is not present in fields"));
+            }
+            if !self.temp_lsb_per_c.is_finite() || self.temp_lsb_per_c <= 0.0 {
+                return Err("temp_lsb_per_c must be greater than zero".to_string());
+            }
+            if !self.temp_offset_c.is_finite() {
+                return Err("temp_offset_c must be finite".to_string());
             }
         }
         Ok(())
@@ -1044,6 +1060,10 @@ fn accel_raw_to_m_s2(raw: i16, full_scale_g: f64) -> f64 {
 
 fn gyro_raw_to_rad_s(raw: i16, full_scale_dps: f64) -> f64 {
     raw as f64 * full_scale_dps / I16_FULL_SCALE_COUNTS * std::f64::consts::PI / 180.0
+}
+
+fn temp_raw_to_c(raw: i16, lsb_per_c: f64, offset_c: f64) -> f64 {
+    raw as f64 / lsb_per_c + offset_c
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1132,6 +1152,11 @@ fn scaled_field_names(decoder: &I16LeReportDecoder) -> Vec<String> {
             fields.push(field.clone());
         }
     }
+    if let Some(field) = &decoder.temp_field {
+        if !fields.iter().any(|existing| existing == field) {
+            fields.push(field.clone());
+        }
+    }
     fields
 }
 
@@ -1169,6 +1194,9 @@ fn format_i16_le_fifo_decode(
         if !decoder.accel_fields.is_empty() {
             out.push_str(" acc_m_s2");
         }
+        if decoder.temp_field.is_some() {
+            out.push_str(" temp_c");
+        }
     }
     out.push_str("): ");
     let scaled_fields = scaled_field_names(decoder);
@@ -1198,6 +1226,18 @@ fn format_i16_le_fifo_decode(
                             accel_raw_to_m_s2(raw, decoder.accel_fs_g)
                         });
                     let _ = write!(out, " acc=({accel})");
+                }
+                if let Some(field) = &decoder.temp_field {
+                    match sample.value_by_name(decoder, field) {
+                        Some(raw) => {
+                            let temp_c =
+                                temp_raw_to_c(raw, decoder.temp_lsb_per_c, decoder.temp_offset_c);
+                            let _ = write!(out, " temp=({field}={temp_c:.3})");
+                        }
+                        None => {
+                            let _ = write!(out, " temp=({field}=missing)");
+                        }
+                    }
                 }
                 let raw = format_raw_fields(sample, decoder, &scaled_fields);
                 if !raw.is_empty() {
@@ -1666,6 +1706,12 @@ fn i16_field_display(raw: i16, field: &str, decoder: &I16LeReportDecoder) -> (f6
         if decoder.accel_fields.iter().any(|name| name == field) {
             return (accel_raw_to_m_s2(raw, decoder.accel_fs_g), "m/s^2");
         }
+        if decoder.temp_field.as_deref() == Some(field) {
+            return (
+                temp_raw_to_c(raw, decoder.temp_lsb_per_c, decoder.temp_offset_c),
+                "C",
+            );
+        }
     }
     (raw as f64, "count")
 }
@@ -2027,8 +2073,11 @@ fn make_i16_le_decoder(
     fields: Vec<String>,
     gyro_fields: Vec<String>,
     accel_fields: Vec<String>,
+    temp_field: Option<String>,
     accel_fs_g: f64,
     gyro_fs_dps: f64,
+    temp_lsb_per_c: f64,
+    temp_offset_c: f64,
     output: ReportOutputMode,
 ) -> Result<ReportDecoder, String> {
     validated_report_decoder(ReportDecoder::I16Le(I16LeReportDecoder {
@@ -2036,8 +2085,11 @@ fn make_i16_le_decoder(
         fields,
         gyro_fields,
         accel_fields,
+        temp_field,
         accel_fs_g,
         gyro_fs_dps,
+        temp_lsb_per_c,
+        temp_offset_c,
         output,
     }))
 }
@@ -2051,8 +2103,11 @@ fn build_report_decoder(
             let mut fields = None;
             let mut accel_fields = Vec::new();
             let mut gyro_fields = Vec::new();
+            let mut temp_field = None;
             let mut accel_fs_g = DEFAULT_QMI8660_ACCEL_FULL_SCALE_G;
             let mut gyro_fs_dps = DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS;
+            let mut temp_lsb_per_c = DEFAULT_TEMP_LSB_PER_C;
+            let mut temp_offset_c = DEFAULT_TEMP_OFFSET_C;
             let mut output = DEFAULT_REPORT_OUTPUT_MODE;
             for (name, value) in options {
                 match name.as_str() {
@@ -2061,12 +2116,17 @@ fn build_report_decoder(
                         accel_fields = report_option_ident_array(decoder, name, value)?
                     }
                     "gyro_fields" => gyro_fields = report_option_ident_array(decoder, name, value)?,
+                    "temp_field" => temp_field = Some(report_option_ident(decoder, name, value)?),
                     "accel_fs_g" => accel_fs_g = report_option_number(decoder, name, value)?,
                     "gyro_fs_dps" => gyro_fs_dps = report_option_number(decoder, name, value)?,
+                    "temp_lsb_per_c" => {
+                        temp_lsb_per_c = report_option_number(decoder, name, value)?
+                    }
+                    "temp_offset_c" => temp_offset_c = report_option_number(decoder, name, value)?,
                     "output" => output = report_output_mode(decoder, name, value)?,
                     _ => {
                         return Err(format!(
-                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, accel_fs_g, gyro_fs_dps, or output"
+                            "unknown i16_le option '{name}', expected fields, accel_fields, gyro_fields, temp_field, accel_fs_g, gyro_fs_dps, temp_lsb_per_c, temp_offset_c, or output"
                         ));
                     }
                 }
@@ -2078,8 +2138,11 @@ fn build_report_decoder(
                 fields,
                 gyro_fields,
                 accel_fields,
+                temp_field,
                 accel_fs_g,
                 gyro_fs_dps,
+                temp_lsb_per_c,
+                temp_offset_c,
                 output,
             )
         }
@@ -2107,8 +2170,11 @@ fn build_report_decoder(
                     .collect(),
                 ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
                 ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                None,
                 accel_fs_g,
                 gyro_fs_dps,
+                DEFAULT_TEMP_LSB_PER_C,
+                DEFAULT_TEMP_OFFSET_C,
                 output,
             )
         }
@@ -2429,8 +2495,11 @@ mod tests {
                 .iter()
                 .map(|field| (*field).to_string())
                 .collect(),
+            temp_field: None,
             accel_fs_g: DEFAULT_QMI8660_ACCEL_FULL_SCALE_G,
             gyro_fs_dps: DEFAULT_QMI8660_GYRO_FULL_SCALE_DPS,
+            temp_lsb_per_c: DEFAULT_TEMP_LSB_PER_C,
+            temp_offset_c: DEFAULT_TEMP_OFFSET_C,
             output,
         }
     }
@@ -2584,8 +2653,11 @@ mod tests {
                     .collect(),
                 gyro_fields: ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
                 accel_fields: ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                temp_field: None,
                 accel_fs_g: 16.0,
                 gyro_fs_dps: 4096.0,
+                temp_lsb_per_c: DEFAULT_TEMP_LSB_PER_C,
+                temp_offset_c: DEFAULT_TEMP_OFFSET_C,
                 output: DEFAULT_REPORT_OUTPUT_MODE,
             }))
         );

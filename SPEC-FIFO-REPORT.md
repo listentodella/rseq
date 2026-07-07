@@ -105,9 +105,27 @@ report_format!(FIFO_RAW, i16_le, {
 | `fields` | identifier array | 必填。每个 sample 的字段顺序。字段名只是解析标签, 不自动绑定芯片寄存器。 |
 | `gyro_fields` | identifier array | 可选。哪些字段按 gyro 量程转换。字段必须存在于 `fields`。 |
 | `accel_fields` | identifier array | 可选。哪些字段按 accel 量程转换。字段必须存在于 `fields`。 |
+| `temp_field` | identifier | 可选。哪个字段按温度转换。字段必须存在于 `fields`。 |
 | `gyro_fs_dps` | number | 可选。gyro 满量程, 单位 dps, 默认 `4096`。 |
 | `accel_fs_g` | number | 可选。accel 满量程, 单位 g, 默认 `16`。 |
+| `temp_lsb_per_c` | number | 可选。多少 raw count 等于 1 摄氏度, 默认 `1`。例如 `256` 表示 `temp_c = raw_i16 / 256`。 |
+| `temp_offset_c` | number | 可选。温度偏移, 单位摄氏度, 默认 `0`。当前 DSL 数字选项只支持非负整数。 |
 | `output` | identifier | 可选。`physical_f32` 或 `raw_i16`, 默认 `physical_f32`。 |
+
+如果 FIFO sample 中包含温度, 可以把字段顺序和转换方式显式写出来：
+
+```rseq
+report_format!(FIFO_RAW, i16_le, {
+    fields: [gx, gy, gz, ax, ay, az, temp],
+    gyro_fields: [gx, gy, gz],
+    accel_fields: [ax, ay, az],
+    temp_field: temp,
+    accel_fs_g: 16,
+    gyro_fs_dps: 4096,
+    temp_lsb_per_c: 256,
+    output: physical_f32,
+});
+```
 
 旧的 `qmi8660_fifo6` decoder 仍保留为兼容别名, 等价于：
 
@@ -131,12 +149,14 @@ report_format!(FIFO_RAW, i16_le, {
 ```text
 gyro_rad_s = raw_i16 * gyro_fs_dps / 32768 * pi / 180
 acc_m_s2   = raw_i16 * accel_fs_g * 9.80665 / 32768
+temp_c     = raw_i16 / temp_lsb_per_c + temp_offset_c
 ```
 
 CLI 打印单位：
 
 - gyro: `rad/s`
 - accel: `m/s^2`
+- temperature: `C`
 
 示例输出：
 

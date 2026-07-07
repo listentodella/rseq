@@ -2,7 +2,7 @@ mod plot;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use gpui::prelude::FluentBuilder as _;
@@ -18,7 +18,10 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-use plot::{TripleLineChart, Vec3};
+use plot::{
+    ScalarLineChart, TripleLineChart, TripleOhlc, TripleOhlcChart, Vec3, new_triple_ohlc,
+    push_triple_ohlc,
+};
 use rseq_host::{
     AccessKind, FieldInfo, HostMetadata, MAX_TEXT_LINES, MotionSample, RegisterCatalog,
     RegisterInfo, ReportHealth, RseqSource, SessionCommand, SessionConfig, SessionEvent,
@@ -28,6 +31,9 @@ use rseq_host::{
 
 const UI_TICK: Duration = Duration::from_millis(33);
 const MAX_SAMPLES: usize = 600;
+const HISTORY_BUCKET_SECS: u64 = 1;
+const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
+const MAX_HISTORY_BARS: usize = 120;
 const DEFAULT_RSEQ_SOURCE: &str = r#"// New rseq script.
 // Pick a chip YAML in the Sequences sidebar or add chip!("chip.yaml") here.
 
@@ -244,6 +250,41 @@ impl Render for DragVisualStep {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HistoryBucket {
+    acc: TripleOhlc,
+    gyro: TripleOhlc,
+    samples: usize,
+    start_timestamp_us: Option<u64>,
+    started_at: Instant,
+}
+
+impl HistoryBucket {
+    fn new(acc: Vec3, gyro: Vec3, timestamp_us: Option<u64>, now: Instant) -> Self {
+        Self {
+            acc: new_triple_ohlc(acc),
+            gyro: new_triple_ohlc(gyro),
+            samples: 1,
+            start_timestamp_us: timestamp_us,
+            started_at: now,
+        }
+    }
+
+    fn push(&mut self, acc: Vec3, gyro: Vec3) {
+        push_triple_ohlc(&mut self.acc, acc);
+        push_triple_ohlc(&mut self.gyro, gyro);
+        self.samples += 1;
+    }
+
+    fn should_finish_before(&self, timestamp_us: Option<u64>, now: Instant) -> bool {
+        if let (Some(start), Some(timestamp)) = (self.start_timestamp_us, timestamp_us) {
+            timestamp >= start && timestamp - start >= HISTORY_BUCKET_US
+        } else {
+            now.duration_since(self.started_at) >= Duration::from_secs(HISTORY_BUCKET_SECS)
+        }
+    }
+}
+
 pub struct RseqGpui {
     cli: Cli,
     metadata: HostMetadata,
@@ -267,6 +308,10 @@ pub struct RseqGpui {
     inline_write_input: Entity<InputState>,
     write_input: Entity<InputState>,
     samples: VecDeque<MotionSample>,
+    acc_history: VecDeque<TripleOhlc>,
+    gyro_history: VecDeque<TripleOhlc>,
+    history_bucket: Option<HistoryBucket>,
+    show_temperature_panel: bool,
     registers: BTreeMap<u32, RegisterValue>,
     reports: VecDeque<String>,
     logs: VecDeque<String>,
@@ -380,6 +425,10 @@ impl RseqGpui {
             inline_write_input,
             write_input,
             samples: VecDeque::with_capacity(MAX_SAMPLES),
+            acc_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
+            gyro_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
+            history_bucket: None,
+            show_temperature_panel: true,
             registers: BTreeMap::new(),
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
@@ -996,10 +1045,7 @@ impl RseqGpui {
                 }
             }
             SessionEvent::Sample(sample) => {
-                if self.samples.len() == MAX_SAMPLES {
-                    self.samples.pop_front();
-                }
-                self.samples.push_back(sample);
+                self.ingest_motion_sample(sample);
             }
             SessionEvent::Report(summary) => {
                 push_bounded(&mut self.reports, summary.line, MAX_TEXT_LINES);
@@ -1209,33 +1255,81 @@ impl RseqGpui {
     }
 
     fn axis_colors(cx: &Context<Self>) -> [Hsla; 3] {
-        [cx.theme().chart_1, cx.theme().chart_2, cx.theme().chart_3]
+        [cx.theme().red, cx.theme().green, cx.theme().blue]
+    }
+
+    fn ingest_motion_sample(&mut self, sample: MotionSample) {
+        let acc = motion_acc_vec3(&sample);
+        let gyro = motion_gyro_vec3(&sample);
+
+        if self.samples.len() == MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+        self.push_history_sample(acc, gyro, sample.timestamp_us);
+    }
+
+    fn push_history_sample(&mut self, acc: Vec3, gyro: Vec3, timestamp_us: Option<u64>) {
+        let now = Instant::now();
+        if self
+            .history_bucket
+            .as_ref()
+            .is_some_and(|bucket| bucket.should_finish_before(timestamp_us, now))
+        {
+            self.finish_history_bucket();
+        }
+
+        match self.history_bucket.as_mut() {
+            Some(bucket) => bucket.push(acc, gyro),
+            None => self.history_bucket = Some(HistoryBucket::new(acc, gyro, timestamp_us, now)),
+        }
+    }
+
+    fn finish_history_bucket(&mut self) {
+        let Some(bucket) = self.history_bucket.take() else {
+            return;
+        };
+        push_history_capped(&mut self.acc_history, bucket.acc);
+        push_history_capped(&mut self.gyro_history, bucket.gyro);
     }
 
     fn acc_data(&self) -> Vec<Vec3> {
-        self.samples
-            .iter()
-            .map(|sample| {
-                [
-                    sample.acc[0] as f32,
-                    sample.acc[1] as f32,
-                    sample.acc[2] as f32,
-                ]
-            })
-            .collect()
+        self.samples.iter().map(motion_acc_vec3).collect()
     }
 
     fn gyro_data(&self) -> Vec<Vec3> {
+        self.samples.iter().map(motion_gyro_vec3).collect()
+    }
+
+    fn temperature_data(&self) -> Vec<f32> {
         self.samples
             .iter()
-            .map(|sample| {
-                [
-                    sample.gyro[0] as f32,
-                    sample.gyro[1] as f32,
-                    sample.gyro[2] as f32,
-                ]
-            })
+            .filter_map(|sample| sample.temp_c.map(|value| value as f32))
             .collect()
+    }
+
+    fn latest_temperature_c(&self) -> Option<f64> {
+        self.samples.iter().rev().find_map(|sample| sample.temp_c)
+    }
+
+    fn has_temperature_data(&self) -> bool {
+        self.latest_temperature_c().is_some()
+    }
+
+    fn acc_history_data(&self) -> Vec<TripleOhlc> {
+        let mut data = self.acc_history.iter().copied().collect::<Vec<_>>();
+        if let Some(bucket) = self.history_bucket {
+            data.push(bucket.acc);
+        }
+        data
+    }
+
+    fn gyro_history_data(&self) -> Vec<TripleOhlc> {
+        let mut data = self.gyro_history.iter().copied().collect::<Vec<_>>();
+        if let Some(bucket) = self.history_bucket {
+            data.push(bucket.gyro);
+        }
+        data
     }
 
     fn render_connection_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1358,7 +1452,7 @@ impl RseqGpui {
         let labels = ["x", "y", "z"];
         v_flex()
             .flex_1()
-            .min_h(px(180.))
+            .min_h(px(150.))
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius)
@@ -1392,13 +1486,199 @@ impl RseqGpui {
             )
     }
 
+    fn render_temperature_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+        let data = self.temperature_data();
+        let latest = self.latest_temperature_c().unwrap_or_default();
+        let color = cx.theme().yellow;
+
+        v_flex()
+            .h(px(116.))
+            .min_h(px(104.))
+            .flex_none()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().size_2().rounded_full().bg(color))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(format!("Temperature {latest:.2} C")),
+                            ),
+                    )
+                    .child(
+                        Button::new("hide-temperature")
+                            .small()
+                            .label("Hide")
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.show_temperature_panel = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .child(ScalarLineChart::new(data, color, 1.0)),
+            )
+    }
+
+    fn render_temperature_collapsed(&self, cx: &Context<Self>) -> impl IntoElement {
+        let latest = self.latest_temperature_c().unwrap_or_default();
+        h_flex()
+            .flex_none()
+            .justify_between()
+            .px_3()
+            .py_1()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().size_2().rounded_full().bg(cx.theme().yellow))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("Temperature hidden · latest {latest:.2} C")),
+                    ),
+            )
+            .child(
+                Button::new("show-temperature")
+                    .small()
+                    .label("Show")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.show_temperature_panel = true;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_history_chart(
+        &self,
+        title: &str,
+        data: Vec<TripleOhlc>,
+        min_span: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = Self::axis_colors(cx);
+        let labels = ["x", "y", "z"];
+        let latest = data.last().copied();
+
+        v_flex()
+            .flex_1()
+            .min_w(px(240.))
+            .h_full()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .px_2()
+                    .pb_1()
+                    .child(div().text_xs().font_semibold().child(title.to_string()))
+                    .child(h_flex().gap_2().children((0..3).map(|idx| {
+                        let range = latest
+                            .map(|bucket| bucket[idx].high - bucket[idx].low)
+                            .unwrap_or(0.0);
+                        h_flex()
+                            .gap_1()
+                            .child(div().size_2().rounded_full().bg(colors[idx]))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} d{:.2}", labels[idx], range)),
+                            )
+                    }))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(TripleOhlcChart::new(data, colors, min_span)),
+            )
+    }
+
+    fn render_history_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+        let acc_data = self.acc_history_data();
+        let gyro_data = self.gyro_history_data();
+        let bars = acc_data.len().max(gyro_data.len());
+
+        v_flex()
+            .h(px(170.))
+            .min_h(px(150.))
+            .flex_none()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(format!("{HISTORY_BUCKET_SECS}s OHLC History")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{bars}/{MAX_HISTORY_BARS} bars")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_3()
+                    .p_2()
+                    .overflow_hidden()
+                    .child(self.render_history_chart("Accelerometer (m/s^2)", acc_data, 12.0, cx))
+                    .child(self.render_history_chart("Gyroscope (rad/s)", gyro_data, 2.0, cx)),
+            )
+    }
+
     fn render_motion(&self, cx: &Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
+            .min_h_0()
+            .overflow_hidden()
             .p_3()
             .gap_3()
             .child(self.render_chart("Accelerometer (m/s^2)", self.acc_data(), 12.0, cx))
             .child(self.render_chart("Gyroscope (rad/s)", self.gyro_data(), 2.0, cx))
+            .when(
+                self.has_temperature_data() && self.show_temperature_panel,
+                |this| this.child(self.render_temperature_panel(cx)),
+            )
+            .when(
+                self.has_temperature_data() && !self.show_temperature_panel,
+                |this| this.child(self.render_temperature_collapsed(cx)),
+            )
+            .child(self.render_history_panel(cx))
             .into_any_element()
     }
 
@@ -3349,6 +3629,29 @@ impl Render for RseqGpui {
             .child(div().flex_1().min_h_0().child(content))
             .child(self.render_status_bar(cx))
     }
+}
+
+fn motion_acc_vec3(sample: &MotionSample) -> Vec3 {
+    [
+        sample.acc[0] as f32,
+        sample.acc[1] as f32,
+        sample.acc[2] as f32,
+    ]
+}
+
+fn motion_gyro_vec3(sample: &MotionSample) -> Vec3 {
+    [
+        sample.gyro[0] as f32,
+        sample.gyro[1] as f32,
+        sample.gyro[2] as f32,
+    ]
+}
+
+fn push_history_capped(buf: &mut VecDeque<TripleOhlc>, value: TripleOhlc) {
+    if buf.len() >= MAX_HISTORY_BARS {
+        buf.pop_front();
+    }
+    buf.push_back(value);
 }
 
 fn register_display_width(regs: &[RegisterInfo], addr: u32) -> usize {

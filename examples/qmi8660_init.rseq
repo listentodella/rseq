@@ -4,12 +4,14 @@
 // raw 8-bit values. Delays are microseconds.
 
 chip!("qmi8660.yaml");
+bus_probe!(spi, { read: UI.WHOAMI, expect: 0x06 });
 
 // ── Reset ────────────────────────────────────────────────────────────────────
 // 0x7B = CTRL9 (RESET), 0x98 = device reset; wait 50 ms, then read WHOAMI (0x02)
 // to confirm the chip is alive (expected 0x06).
 write!(UI.RESET, [0x98], 50000);
 let whoami = read!(UI.WHOAMI, 1, 100);
+print!("WHOAMI: {x}\n", whoami);
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 // Burst-write 13 bytes to 0x1D (accel/gyro config block), then the remaining
@@ -33,4 +35,4 @@ write!(0x52, [0xFC], 50);
 
 // ── Enable Accel + Gyro ─────────────────────────────────────────────────────
 // 0x3D = CTRL7 (ENCTL), 0x03 = enable accel + gyro; wait 200 ms to settle.
-write!(UI.ENCTL, [0x03], 200000);
+write!(UI.ENCTL, [0x03], 50);

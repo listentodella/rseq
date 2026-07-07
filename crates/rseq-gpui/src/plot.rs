@@ -132,20 +132,38 @@ impl Plot for ScalarLineChart {
 pub struct TripleLineChart {
     data: Vec<Vec3>,
     colors: [Hsla; 3],
-    y_abs: f32,
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
 }
 
 impl TripleLineChart {
-    pub fn new(data: Vec<Vec3>, colors: [Hsla; 3], min_span: f32) -> Self {
-        let peak = data
-            .iter()
-            .flat_map(|sample| sample.iter())
-            .fold(0f32, |max, value| max.max(value.abs()));
-        let y_abs = (peak * 1.15).max(min_span);
+    pub fn new_with_ranges(
+        data: Vec<Vec3>,
+        colors: [Hsla; 3],
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+    ) -> Self {
+        let (x_min, x_max) = if x_max > x_min {
+            (x_min, x_max)
+        } else {
+            (0.0, 1.0)
+        };
+        let (y_min, y_max) = if y_max > y_min {
+            (y_min, y_max)
+        } else {
+            (-1.0, 1.0)
+        };
         Self {
             data,
             colors,
-            y_abs,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
         }
     }
 }
@@ -159,11 +177,8 @@ impl Plot for TripleLineChart {
 
         let width = bounds.size.width.as_f32();
         let height = bounds.size.height.as_f32();
-        let x = ScaleLinear::new(vec![0.0f64, (n - 1) as f64], vec![0., width]);
-        let y = ScaleLinear::new(
-            vec![-(self.y_abs as f64), self.y_abs as f64],
-            vec![height, 0.],
-        );
+        let x = ScaleLinear::new(vec![self.x_min as f64, self.x_max as f64], vec![0., width]);
+        let y = ScaleLinear::new(vec![self.y_min as f64, self.y_max as f64], vec![height, 0.]);
 
         Grid::new()
             .y((0..=4).map(|i| height * i as f32 / 4.0).collect())
@@ -178,6 +193,10 @@ impl Plot for TripleLineChart {
                 .data
                 .iter()
                 .enumerate()
+                .filter(|(idx, _)| {
+                    let idx = *idx as f32;
+                    idx >= self.x_min && idx <= self.x_max
+                })
                 .map(|(idx, sample)| (idx, sample[axis]))
                 .collect::<Vec<_>>();
 

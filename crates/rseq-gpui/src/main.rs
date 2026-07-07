@@ -8,8 +8,8 @@ use clap::Parser;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable as _, Sizable as _,
-    StyledExt as _, Theme, ThemeMode, TitleBar,
+    ActiveTheme, Disableable as _, ElementExt as _, Icon, IconName, Root, Selectable as _,
+    Sizable as _, StyledExt as _, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants as _, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -38,8 +38,12 @@ const MAX_SAMPLES: usize = 600;
 const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
 const MAX_HISTORY_BARS: usize = 120;
+const MAX_HISTORY_BAR_SAMPLES: usize = 4096;
 const REGISTER_DUMP_BATCH_MAX_LEN: usize = rseq_link::wire::CONTROL_MAX_READ_LEN;
 const MAX_CAPTURE_RECORDS: usize = 200_000;
+const CHART_ZOOM_MIN: f32 = 0.25;
+const CHART_ZOOM_MAX: f32 = 8.0;
+const CHART_WHEEL_ZOOM_STEP: f32 = 1.12;
 const COMMON_SERIAL_BAUDS: [u32; 10] = [
     9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000,
 ];
@@ -117,6 +121,88 @@ enum LinkMode {
     Ble,
     WebSocket,
     Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionSeries {
+    Acc,
+    Gyro,
+}
+
+impl MotionSeries {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Acc => "Accelerometer",
+            Self::Gyro => "Gyroscope",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartRange {
+    y_min: f32,
+    y_max: f32,
+}
+
+impl ChartRange {
+    fn span(self) -> f32 {
+        (self.y_max - self.y_min).max(f32::EPSILON)
+    }
+
+    fn value_at_y_fraction(self, y_fraction: f32) -> f32 {
+        self.y_max - y_fraction.clamp(0.0, 1.0) * self.span()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartXRange {
+    x_min: f32,
+    x_max: f32,
+}
+
+impl ChartXRange {
+    fn span(self) -> f32 {
+        (self.x_max - self.x_min).max(f32::EPSILON)
+    }
+
+    fn value_at_x_fraction(self, x_fraction: f32) -> f32 {
+        self.x_min + x_fraction.clamp(0.0, 1.0) * self.span()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartDragState {
+    series: MotionSeries,
+    start_position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    y_range: ChartRange,
+    x_range: ChartXRange,
+    auto_x_range: ChartXRange,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryBar {
+    acc: TripleOhlc,
+    gyro: TripleOhlc,
+    acc_samples: Vec<Vec3>,
+    gyro_samples: Vec<Vec3>,
+}
+
+impl HistoryBar {
+    fn samples_for(&self, series: MotionSeries) -> &[Vec3] {
+        match series {
+            MotionSeries::Acc => &self.acc_samples,
+            MotionSeries::Gyro => &self.gyro_samples,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryIntradayView {
+    series: MotionSeries,
+    bar_index: usize,
+    bar_count: usize,
+    samples: Vec<Vec3>,
 }
 
 impl LinkMode {
@@ -367,10 +453,12 @@ impl Render for DragVisualStep {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HistoryBucket {
     acc: TripleOhlc,
     gyro: TripleOhlc,
+    acc_samples: Vec<Vec3>,
+    gyro_samples: Vec<Vec3>,
     samples: usize,
     start_timestamp_us: Option<u64>,
     started_at: Instant,
@@ -381,6 +469,8 @@ impl HistoryBucket {
         Self {
             acc: new_triple_ohlc(acc),
             gyro: new_triple_ohlc(gyro),
+            acc_samples: vec![acc],
+            gyro_samples: vec![gyro],
             samples: 1,
             start_timestamp_us: timestamp_us,
             started_at: now,
@@ -390,6 +480,8 @@ impl HistoryBucket {
     fn push(&mut self, acc: Vec3, gyro: Vec3) {
         push_triple_ohlc(&mut self.acc, acc);
         push_triple_ohlc(&mut self.gyro, gyro);
+        push_vec_capped(&mut self.acc_samples, acc, MAX_HISTORY_BAR_SAMPLES);
+        push_vec_capped(&mut self.gyro_samples, gyro, MAX_HISTORY_BAR_SAMPLES);
         self.samples += 1;
     }
 
@@ -398,6 +490,15 @@ impl HistoryBucket {
             timestamp >= start && timestamp - start >= HISTORY_BUCKET_US
         } else {
             now.duration_since(self.started_at) >= Duration::from_secs(HISTORY_BUCKET_SECS)
+        }
+    }
+
+    fn to_bar(&self) -> HistoryBar {
+        HistoryBar {
+            acc: self.acc,
+            gyro: self.gyro,
+            acc_samples: self.acc_samples.clone(),
+            gyro_samples: self.gyro_samples.clone(),
         }
     }
 }
@@ -432,9 +533,18 @@ pub struct RseqGpui {
     samples: VecDeque<MotionSample>,
     sample_skip_count: usize,
     sample_skip_remaining: usize,
-    acc_history: VecDeque<TripleOhlc>,
-    gyro_history: VecDeque<TripleOhlc>,
+    history_bars: VecDeque<HistoryBar>,
     history_bucket: Option<HistoryBucket>,
+    acc_chart_range: Option<ChartRange>,
+    gyro_chart_range: Option<ChartRange>,
+    acc_chart_x_range: Option<ChartXRange>,
+    gyro_chart_x_range: Option<ChartXRange>,
+    acc_chart_bounds: Option<Bounds<Pixels>>,
+    gyro_chart_bounds: Option<Bounds<Pixels>>,
+    chart_drag: Option<ChartDragState>,
+    acc_history_bounds: Option<Bounds<Pixels>>,
+    gyro_history_bounds: Option<Bounds<Pixels>>,
+    history_intraday: Option<HistoryIntradayView>,
     show_temperature_panel: bool,
     registers: BTreeMap<u32, RegisterValue>,
     capture_records: Vec<ReportCaptureRecord>,
@@ -582,9 +692,18 @@ impl RseqGpui {
             samples: VecDeque::with_capacity(MAX_SAMPLES),
             sample_skip_count: 0,
             sample_skip_remaining: 0,
-            acc_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
-            gyro_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
+            history_bars: VecDeque::with_capacity(MAX_HISTORY_BARS),
             history_bucket: None,
+            acc_chart_range: None,
+            gyro_chart_range: None,
+            acc_chart_x_range: None,
+            gyro_chart_x_range: None,
+            acc_chart_bounds: None,
+            gyro_chart_bounds: None,
+            chart_drag: None,
+            acc_history_bounds: None,
+            gyro_history_bounds: None,
+            history_intraday: None,
             show_temperature_panel: true,
             registers: BTreeMap::new(),
             capture_records: Vec::new(),
@@ -1755,9 +1874,10 @@ impl RseqGpui {
 
     fn reset_stream_state(&mut self, clear_capture: bool) {
         self.samples.clear();
-        self.acc_history.clear();
-        self.gyro_history.clear();
+        self.history_bars.clear();
         self.history_bucket = None;
+        self.history_intraday = None;
+        self.chart_drag = None;
         self.health = ReportHealth::default();
         self.sample_skip_remaining = self.sample_skip_count;
         if clear_capture {
@@ -1789,9 +1909,10 @@ impl RseqGpui {
 
     fn clear_motion_samples(&mut self) {
         self.samples.clear();
-        self.acc_history.clear();
-        self.gyro_history.clear();
+        self.history_bars.clear();
         self.history_bucket = None;
+        self.history_intraday = None;
+        self.chart_drag = None;
         self.sample_skip_remaining = self.sample_skip_count;
         push_bounded(
             &mut self.logs,
@@ -1836,8 +1957,7 @@ impl RseqGpui {
         let Some(bucket) = self.history_bucket.take() else {
             return;
         };
-        push_history_capped(&mut self.acc_history, bucket.acc);
-        push_history_capped(&mut self.gyro_history, bucket.gyro);
+        push_history_capped(&mut self.history_bars, bucket.to_bar());
     }
 
     fn acc_data(&self) -> Vec<Vec3> {
@@ -1846,6 +1966,245 @@ impl RseqGpui {
 
     fn gyro_data(&self) -> Vec<Vec3> {
         self.samples.iter().map(motion_gyro_vec3).collect()
+    }
+
+    fn series_data(&self, series: MotionSeries) -> Vec<Vec3> {
+        match series {
+            MotionSeries::Acc => self.acc_data(),
+            MotionSeries::Gyro => self.gyro_data(),
+        }
+    }
+
+    fn chart_range(&self, series: MotionSeries) -> Option<ChartRange> {
+        match series {
+            MotionSeries::Acc => self.acc_chart_range,
+            MotionSeries::Gyro => self.gyro_chart_range,
+        }
+    }
+
+    fn set_chart_range(&mut self, series: MotionSeries, range: Option<ChartRange>) {
+        match series {
+            MotionSeries::Acc => self.acc_chart_range = range,
+            MotionSeries::Gyro => self.gyro_chart_range = range,
+        }
+    }
+
+    fn chart_x_range(&self, series: MotionSeries) -> Option<ChartXRange> {
+        match series {
+            MotionSeries::Acc => self.acc_chart_x_range,
+            MotionSeries::Gyro => self.gyro_chart_x_range,
+        }
+    }
+
+    fn set_chart_x_range(&mut self, series: MotionSeries, range: Option<ChartXRange>) {
+        match series {
+            MotionSeries::Acc => self.acc_chart_x_range = range,
+            MotionSeries::Gyro => self.gyro_chart_x_range = range,
+        }
+    }
+
+    fn chart_bounds(&self, series: MotionSeries) -> Option<Bounds<Pixels>> {
+        match series {
+            MotionSeries::Acc => self.acc_chart_bounds,
+            MotionSeries::Gyro => self.gyro_chart_bounds,
+        }
+    }
+
+    fn set_chart_bounds(&mut self, series: MotionSeries, bounds: Bounds<Pixels>) {
+        match series {
+            MotionSeries::Acc => self.acc_chart_bounds = Some(bounds),
+            MotionSeries::Gyro => self.gyro_chart_bounds = Some(bounds),
+        }
+    }
+
+    fn history_bounds(&self, series: MotionSeries) -> Option<Bounds<Pixels>> {
+        match series {
+            MotionSeries::Acc => self.acc_history_bounds,
+            MotionSeries::Gyro => self.gyro_history_bounds,
+        }
+    }
+
+    fn set_history_bounds(&mut self, series: MotionSeries, bounds: Bounds<Pixels>) {
+        match series {
+            MotionSeries::Acc => self.acc_history_bounds = Some(bounds),
+            MotionSeries::Gyro => self.gyro_history_bounds = Some(bounds),
+        }
+    }
+
+    fn chart_display_range(
+        &self,
+        series: MotionSeries,
+        data: &[Vec3],
+        min_span: f32,
+    ) -> ChartRange {
+        self.chart_range(series)
+            .unwrap_or_else(|| auto_chart_range(data, min_span))
+    }
+
+    fn chart_display_x_range(&self, series: MotionSeries, data_len: usize) -> ChartXRange {
+        self.chart_x_range(series)
+            .unwrap_or_else(|| auto_chart_x_range(data_len))
+    }
+
+    fn chart_display_zoom(&self, series: MotionSeries, data: &[Vec3], min_span: f32) -> f32 {
+        let auto = auto_chart_range(data, min_span);
+        let range = self.chart_display_range(series, data, min_span);
+        (auto.span() / range.span()).clamp(CHART_ZOOM_MIN, CHART_ZOOM_MAX)
+    }
+
+    fn zoom_chart_from_wheel(
+        &mut self,
+        series: MotionSeries,
+        min_span: f32,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let data = self.series_data(series);
+        let auto = auto_chart_range(&data, min_span);
+        let current = self.chart_range(series).unwrap_or(auto);
+        let y_fraction = self
+            .chart_bounds(series)
+            .and_then(|bounds| chart_y_fraction_at(bounds, event.position))
+            .unwrap_or(0.5);
+        let x_fraction = self
+            .chart_bounds(series)
+            .and_then(|bounds| chart_x_fraction_at(bounds, event.position))
+            .unwrap_or(0.5);
+        let next_y = chart_range_after_wheel(current, auto, y_fraction, delta.y.as_f32());
+        let auto_x = auto_chart_x_range(data.len());
+        let current_x = self.chart_x_range(series).unwrap_or(auto_x);
+        let next_x = chart_x_range_after_wheel(current_x, auto_x, x_fraction, delta.y.as_f32());
+        self.set_chart_range(series, Some(next_y));
+        self.set_chart_x_range(series, Some(next_x));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn reset_chart_zoom(&mut self, series: MotionSeries, cx: &mut Context<Self>) {
+        self.set_chart_range(series, None);
+        self.set_chart_x_range(series, None);
+        if self.chart_drag.is_some_and(|drag| drag.series == series) {
+            self.chart_drag = None;
+        }
+        cx.notify();
+    }
+
+    fn start_chart_drag(
+        &mut self,
+        series: MotionSeries,
+        min_span: f32,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.chart_bounds(series) else {
+            return;
+        };
+        if !bounds.contains(&event.position) {
+            return;
+        }
+
+        let data = self.series_data(series);
+        let auto_y = auto_chart_range(&data, min_span);
+        let auto_x = auto_chart_x_range(data.len());
+        self.chart_drag = Some(ChartDragState {
+            series,
+            start_position: event.position,
+            bounds,
+            y_range: self.chart_range(series).unwrap_or(auto_y),
+            x_range: self.chart_x_range(series).unwrap_or(auto_x),
+            auto_x_range: auto_x,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn update_chart_drag(
+        &mut self,
+        series: MotionSeries,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.chart_drag else {
+            return;
+        };
+        if drag.series != series {
+            return;
+        }
+        if !event.dragging() {
+            self.chart_drag = None;
+            cx.notify();
+            return;
+        }
+
+        let next_y = chart_range_after_drag(
+            drag.y_range,
+            drag.bounds,
+            drag.start_position,
+            event.position,
+        );
+        let next_x = chart_x_range_after_drag(
+            drag.x_range,
+            drag.auto_x_range,
+            drag.bounds,
+            drag.start_position,
+            event.position,
+        );
+        self.set_chart_range(series, Some(next_y));
+        self.set_chart_x_range(series, Some(next_x));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn end_chart_drag(&mut self, series: MotionSeries, cx: &mut Context<Self>) {
+        if self.chart_drag.is_some_and(|drag| drag.series == series) {
+            self.chart_drag = None;
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn show_history_intraday_at_position(
+        &mut self,
+        series: MotionSeries,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.history_bounds(series) else {
+            return;
+        };
+        let Some(bar_index) =
+            history_bar_index_at_x(bounds, event.position, self.history_bar_count())
+        else {
+            return;
+        };
+        self.show_history_intraday(series, bar_index, cx);
+    }
+
+    fn show_history_intraday(
+        &mut self,
+        series: MotionSeries,
+        bar_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let bar_count = self.history_bar_count();
+        let Some(samples) = self.history_bar_samples(series, bar_index) else {
+            return;
+        };
+        self.history_intraday = Some(HistoryIntradayView {
+            series,
+            bar_index,
+            bar_count,
+            samples,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn hide_history_intraday(&mut self, cx: &mut Context<Self>) {
+        self.history_intraday = None;
+        cx.notify();
     }
 
     fn temperature_data(&self) -> Vec<f32> {
@@ -1864,19 +2223,49 @@ impl RseqGpui {
     }
 
     fn acc_history_data(&self) -> Vec<TripleOhlc> {
-        let mut data = self.acc_history.iter().copied().collect::<Vec<_>>();
-        if let Some(bucket) = self.history_bucket {
+        let mut data = self
+            .history_bars
+            .iter()
+            .map(|bar| bar.acc)
+            .collect::<Vec<_>>();
+        if let Some(bucket) = &self.history_bucket {
             data.push(bucket.acc);
         }
         data
     }
 
     fn gyro_history_data(&self) -> Vec<TripleOhlc> {
-        let mut data = self.gyro_history.iter().copied().collect::<Vec<_>>();
-        if let Some(bucket) = self.history_bucket {
+        let mut data = self
+            .history_bars
+            .iter()
+            .map(|bar| bar.gyro)
+            .collect::<Vec<_>>();
+        if let Some(bucket) = &self.history_bucket {
             data.push(bucket.gyro);
         }
         data
+    }
+
+    fn history_bar_count(&self) -> usize {
+        self.history_bars.len() + usize::from(self.history_bucket.is_some())
+    }
+
+    fn history_bar_samples(&self, series: MotionSeries, bar_index: usize) -> Option<Vec<Vec3>> {
+        if let Some(bar) = self.history_bars.get(bar_index) {
+            let samples = bar.samples_for(series);
+            return (!samples.is_empty()).then(|| samples.to_vec());
+        }
+
+        if bar_index == self.history_bars.len() {
+            let bucket = self.history_bucket.as_ref()?;
+            let samples = match series {
+                MotionSeries::Acc => &bucket.acc_samples,
+                MotionSeries::Gyro => &bucket.gyro_samples,
+            };
+            return (!samples.is_empty()).then(|| samples.clone());
+        }
+
+        None
     }
 
     fn set_link_mode(&mut self, mode: LinkMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -2231,6 +2620,7 @@ impl RseqGpui {
 
     fn render_chart(
         &self,
+        series: MotionSeries,
         title: &str,
         data: Vec<Vec3>,
         min_span: f32,
@@ -2238,7 +2628,12 @@ impl RseqGpui {
     ) -> impl IntoElement {
         let colors = Self::axis_colors(cx);
         let latest = data.last().copied().unwrap_or([0.0; 3]);
+        let stats = axis_stddev(&data);
+        let range = self.chart_display_range(series, &data, min_span);
+        let x_range = self.chart_display_x_range(series, data.len());
+        let zoom = self.chart_display_zoom(series, &data, min_span);
         let labels = ["x", "y", "z"];
+        let view = cx.entity();
         v_flex()
             .flex_1()
             .min_h(px(150.))
@@ -2254,24 +2649,88 @@ impl RseqGpui {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().text_sm().font_semibold().child(title.to_string()))
-                    .child(h_flex().gap_3().children((0..3).map(|idx| {
+                    .child(
                         h_flex()
-                            .gap_1()
-                            .child(div().size_2().rounded_full().bg(colors[idx]))
+                            .gap_3()
+                            .children((0..3).map(|idx| {
+                                h_flex()
+                                    .gap_1()
+                                    .child(div().size_2().rounded_full().bg(colors[idx]))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} {:+.2} σ{:.2}",
+                                                labels[idx], latest[idx], stats[idx]
+                                            )),
+                                    )
+                            }))
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{} {:+.2}", labels[idx], latest[idx])),
+                                    .child(format!("{zoom:.2}x")),
                             )
-                    }))),
+                            .child(
+                                Button::new(format!("reset-{}-zoom", series.label()))
+                                    .xsmall()
+                                    .label("Reset")
+                                    .disabled(
+                                        self.chart_range(series).is_none()
+                                            && self.chart_x_range(series).is_none(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.reset_chart_zoom(series, cx);
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .p_2()
-                    .child(TripleLineChart::new(data, colors, min_span)),
+                    .cursor_grab()
+                    .on_prepaint(move |bounds, _window, cx| {
+                        view.update(cx, |this, _| this.set_chart_bounds(series, bounds));
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.start_chart_drag(series, min_span, event, cx);
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                            this.update_chart_drag(series, event, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                            this.end_chart_drag(series, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                            this.end_chart_drag(series, cx);
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(
+                        move |this, event: &ScrollWheelEvent, window, cx| {
+                            this.zoom_chart_from_wheel(series, min_span, event, window, cx);
+                        },
+                    ))
+                    .child(TripleLineChart::new_with_ranges(
+                        data,
+                        colors,
+                        x_range.x_min,
+                        x_range.x_max,
+                        range.y_min,
+                        range.y_max,
+                    )),
             )
     }
 
@@ -2359,6 +2818,7 @@ impl RseqGpui {
 
     fn render_history_chart(
         &self,
+        series: MotionSeries,
         title: &str,
         data: Vec<TripleOhlc>,
         min_span: f32,
@@ -2367,6 +2827,7 @@ impl RseqGpui {
         let colors = Self::axis_colors(cx);
         let labels = ["x", "y", "z"];
         let latest = data.last().copied();
+        let view = cx.entity();
 
         v_flex()
             .flex_1()
@@ -2399,6 +2860,17 @@ impl RseqGpui {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .on_prepaint(move |bounds, _window, cx| {
+                        view.update(cx, |this, _| this.set_history_bounds(series, bounds));
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            if event.click_count >= 2 {
+                                this.show_history_intraday_at_position(series, event, cx);
+                            }
+                        }),
+                    )
                     .child(TripleOhlcChart::new(data, colors, min_span)),
             )
     }
@@ -2407,6 +2879,7 @@ impl RseqGpui {
         let acc_data = self.acc_history_data();
         let gyro_data = self.gyro_history_data();
         let bars = acc_data.len().max(gyro_data.len());
+        let intraday = self.history_intraday.as_ref();
 
         v_flex()
             .h(px(170.))
@@ -2430,14 +2903,40 @@ impl RseqGpui {
                             .child(format!("{HISTORY_BUCKET_SECS}s OHLC History")),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{bars}/{MAX_HISTORY_BARS} bars")),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(match intraday {
+                                        Some(view) => format!(
+                                            "{} intraday · bar {}/{} · {} samples",
+                                            view.series.label(),
+                                            view.bar_index + 1,
+                                            view.bar_count,
+                                            view.samples.len()
+                                        ),
+                                        None => format!(
+                                            "{bars}/{MAX_HISTORY_BARS} bars · double-click a chart"
+                                        ),
+                                    }),
+                            )
+                            .when(intraday.is_some(), |this| {
+                                this.child(
+                                    Button::new("history-ohlc-view")
+                                        .xsmall()
+                                        .label("OHLC")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.hide_history_intraday(cx);
+                                        })),
+                                )
+                            }),
                     ),
             )
-            .child(
-                div()
+            .child(match intraday {
+                Some(view) => self.render_history_intraday(view, cx).into_any_element(),
+                None => div()
                     .flex()
                     .flex_row()
                     .flex_1()
@@ -2445,9 +2944,51 @@ impl RseqGpui {
                     .gap_3()
                     .p_2()
                     .overflow_hidden()
-                    .child(self.render_history_chart("Accelerometer (m/s^2)", acc_data, 12.0, cx))
-                    .child(self.render_history_chart("Gyroscope (rad/s)", gyro_data, 2.0, cx)),
-            )
+                    .child(self.render_history_chart(
+                        MotionSeries::Acc,
+                        "Accelerometer (m/s^2)",
+                        acc_data,
+                        12.0,
+                        cx,
+                    ))
+                    .child(self.render_history_chart(
+                        MotionSeries::Gyro,
+                        "Gyroscope (rad/s)",
+                        gyro_data,
+                        2.0,
+                        cx,
+                    ))
+                    .into_any_element(),
+            })
+    }
+
+    fn render_history_intraday(
+        &self,
+        view: &HistoryIntradayView,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = Self::axis_colors(cx);
+        let series = view.series;
+        let data = view.samples.clone();
+        let min_span = match series {
+            MotionSeries::Acc => 12.0,
+            MotionSeries::Gyro => 2.0,
+        };
+        let range = self.chart_display_range(series, &data, min_span);
+        let x_range = auto_chart_x_range(data.len());
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .p_2()
+            .child(TripleLineChart::new_with_ranges(
+                data,
+                colors,
+                x_range.x_min,
+                x_range.x_max,
+                range.y_min,
+                range.y_max,
+            ))
     }
 
     fn render_motion(&self, cx: &Context<Self>) -> AnyElement {
@@ -2458,8 +2999,20 @@ impl RseqGpui {
             .p_3()
             .gap_3()
             .child(self.render_motion_toolbar(cx))
-            .child(self.render_chart("Accelerometer (m/s^2)", self.acc_data(), 12.0, cx))
-            .child(self.render_chart("Gyroscope (rad/s)", self.gyro_data(), 2.0, cx))
+            .child(self.render_chart(
+                MotionSeries::Acc,
+                "Accelerometer (m/s^2)",
+                self.acc_data(),
+                12.0,
+                cx,
+            ))
+            .child(self.render_chart(
+                MotionSeries::Gyro,
+                "Gyroscope (rad/s)",
+                self.gyro_data(),
+                2.0,
+                cx,
+            ))
             .when(
                 self.has_temperature_data() && self.show_temperature_panel,
                 |this| this.child(self.render_temperature_panel(cx)),
@@ -4574,11 +5127,216 @@ fn motion_gyro_vec3(sample: &MotionSample) -> Vec3 {
     ]
 }
 
-fn push_history_capped(buf: &mut VecDeque<TripleOhlc>, value: TripleOhlc) {
+fn axis_stddev(data: &[Vec3]) -> Vec3 {
+    if data.is_empty() {
+        return [0.0; 3];
+    }
+
+    let inv_len = 1.0 / data.len() as f32;
+    let mut mean = [0.0f32; 3];
+    for sample in data {
+        for axis in 0..3 {
+            mean[axis] += sample[axis] * inv_len;
+        }
+    }
+
+    let mut variance = [0.0f32; 3];
+    for sample in data {
+        for axis in 0..3 {
+            let delta = sample[axis] - mean[axis];
+            variance[axis] += delta * delta * inv_len;
+        }
+    }
+
+    [variance[0].sqrt(), variance[1].sqrt(), variance[2].sqrt()]
+}
+
+fn auto_chart_range(data: &[Vec3], min_span: f32) -> ChartRange {
+    let peak = data
+        .iter()
+        .flat_map(|sample| sample.iter())
+        .fold(0f32, |max, value| max.max(value.abs()));
+    let y_abs = (peak * 1.15).max(min_span);
+    ChartRange {
+        y_min: -y_abs,
+        y_max: y_abs,
+    }
+}
+
+fn chart_y_fraction_at(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<f32> {
+    let height = bounds.size.height.as_f32();
+    if height <= 0.0 {
+        return None;
+    }
+
+    Some(((position.y.as_f32() - bounds.origin.y.as_f32()) / height).clamp(0.0, 1.0))
+}
+
+fn chart_x_fraction_at(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<f32> {
+    let width = bounds.size.width.as_f32();
+    if width <= 0.0 {
+        return None;
+    }
+
+    Some(((position.x.as_f32() - bounds.origin.x.as_f32()) / width).clamp(0.0, 1.0))
+}
+
+fn auto_chart_x_range(data_len: usize) -> ChartXRange {
+    ChartXRange {
+        x_min: 0.0,
+        x_max: data_len.saturating_sub(1).max(1) as f32,
+    }
+}
+
+fn chart_range_after_wheel(
+    current: ChartRange,
+    auto: ChartRange,
+    y_fraction: f32,
+    delta_y: f32,
+) -> ChartRange {
+    if delta_y == 0.0 {
+        return current;
+    }
+
+    let base_span = auto.span();
+    let min_span = base_span / CHART_ZOOM_MAX;
+    let max_span = base_span / CHART_ZOOM_MIN;
+    let next_span = if delta_y < 0.0 {
+        current.span() / CHART_WHEEL_ZOOM_STEP
+    } else if delta_y > 0.0 {
+        current.span() * CHART_WHEEL_ZOOM_STEP
+    } else {
+        current.span()
+    }
+    .clamp(min_span, max_span);
+
+    let y_fraction = y_fraction.clamp(0.0, 1.0);
+    let anchor_value = current.value_at_y_fraction(y_fraction);
+    ChartRange {
+        y_min: anchor_value - (1.0 - y_fraction) * next_span,
+        y_max: anchor_value + y_fraction * next_span,
+    }
+}
+
+fn chart_range_after_drag(
+    start: ChartRange,
+    bounds: Bounds<Pixels>,
+    start_position: Point<Pixels>,
+    current_position: Point<Pixels>,
+) -> ChartRange {
+    let height = bounds.size.height.as_f32();
+    if height <= 0.0 {
+        return start;
+    }
+
+    let dy = current_position.y.as_f32() - start_position.y.as_f32();
+    let shift = dy / height * start.span();
+    ChartRange {
+        y_min: start.y_min + shift,
+        y_max: start.y_max + shift,
+    }
+}
+
+fn chart_x_range_after_wheel(
+    current: ChartXRange,
+    auto: ChartXRange,
+    x_fraction: f32,
+    delta_y: f32,
+) -> ChartXRange {
+    if delta_y == 0.0 {
+        return current;
+    }
+
+    let base_span = auto.span();
+    let min_span = (base_span / CHART_ZOOM_MAX).max(1.0).min(base_span);
+    let next_span = if delta_y < 0.0 {
+        current.span() / CHART_WHEEL_ZOOM_STEP
+    } else if delta_y > 0.0 {
+        current.span() * CHART_WHEEL_ZOOM_STEP
+    } else {
+        current.span()
+    }
+    .clamp(min_span, base_span);
+
+    let x_fraction = x_fraction.clamp(0.0, 1.0);
+    let anchor_value = current.value_at_x_fraction(x_fraction);
+    let x_min = anchor_value - x_fraction * next_span;
+    let x_max = anchor_value + (1.0 - x_fraction) * next_span;
+    clamp_chart_x_range_to_auto(ChartXRange { x_min, x_max }, auto)
+}
+
+fn chart_x_range_after_drag(
+    start: ChartXRange,
+    auto: ChartXRange,
+    bounds: Bounds<Pixels>,
+    start_position: Point<Pixels>,
+    current_position: Point<Pixels>,
+) -> ChartXRange {
+    let width = bounds.size.width.as_f32();
+    if width <= 0.0 {
+        return start;
+    }
+
+    let dx = current_position.x.as_f32() - start_position.x.as_f32();
+    let shift = -dx / width * start.span();
+    clamp_chart_x_range_to_auto(
+        ChartXRange {
+            x_min: start.x_min + shift,
+            x_max: start.x_max + shift,
+        },
+        auto,
+    )
+}
+
+fn clamp_chart_x_range_to_auto(mut range: ChartXRange, auto: ChartXRange) -> ChartXRange {
+    let span = range.span().min(auto.span());
+    if range.x_min < auto.x_min {
+        range.x_min = auto.x_min;
+        range.x_max = auto.x_min + span;
+    }
+    if range.x_max > auto.x_max {
+        range.x_max = auto.x_max;
+        range.x_min = auto.x_max - span;
+    }
+    range.x_min = range.x_min.max(auto.x_min);
+    range.x_max = range.x_max.min(auto.x_max);
+    range
+}
+
+fn history_bar_index_at_x(
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    bar_count: usize,
+) -> Option<usize> {
+    if bar_count == 0 {
+        return None;
+    }
+
+    let width = bounds.size.width.as_f32();
+    if width <= 0.0 {
+        return None;
+    }
+
+    let x_fraction =
+        ((position.x.as_f32() - bounds.origin.x.as_f32()) / width).clamp(0.0, 0.999_999);
+    Some((x_fraction * bar_count as f32).floor() as usize)
+}
+
+fn push_history_capped(buf: &mut VecDeque<HistoryBar>, value: HistoryBar) {
     if buf.len() >= MAX_HISTORY_BARS {
         buf.pop_front();
     }
     buf.push_back(value);
+}
+
+fn push_vec_capped<T>(buf: &mut Vec<T>, value: T, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if buf.len() >= cap {
+        buf.remove(0);
+    }
+    buf.push(value);
 }
 
 fn register_display_width(regs: &[RegisterInfo], addr: u32) -> usize {
@@ -5969,6 +6727,243 @@ mod tests {
                     len: 2,
                 },
             ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn axis_stddev_computes_xyz_population_stddev() {
+        let data = vec![[1.0, 2.0, 3.0], [3.0, 2.0, -1.0], [5.0, 2.0, 3.0]];
+        let std = axis_stddev(&data);
+        assert!((std[0] - 1.6329932).abs() < 0.00001);
+        assert_eq!(std[1], 0.0);
+        assert!((std[2] - 1.8856181).abs() < 0.00001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_range_after_wheel_keeps_mouse_anchor_value_stable() {
+        let current = ChartRange {
+            y_min: -10.0,
+            y_max: 10.0,
+        };
+        let auto = current;
+        let y_fraction = 0.25;
+        let before = current.value_at_y_fraction(y_fraction);
+        let after = chart_range_after_wheel(current, auto, y_fraction, -10.0);
+
+        assert!(after.span() < current.span());
+        assert!((after.value_at_y_fraction(y_fraction) - before).abs() < 0.0001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_range_after_wheel_clamps_to_zoom_limits() {
+        let auto = ChartRange {
+            y_min: -10.0,
+            y_max: 10.0,
+        };
+        let min = chart_range_after_wheel(
+            ChartRange {
+                y_min: -1.25,
+                y_max: 1.25,
+            },
+            auto,
+            0.5,
+            -10.0,
+        );
+        let max = chart_range_after_wheel(
+            ChartRange {
+                y_min: -40.0,
+                y_max: 40.0,
+            },
+            auto,
+            0.5,
+            10.0,
+        );
+
+        assert!((min.span() - auto.span() / CHART_ZOOM_MAX).abs() < 0.0001);
+        assert!((max.span() - auto.span() / CHART_ZOOM_MIN).abs() < 0.0001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_x_range_after_wheel_keeps_mouse_anchor_index_stable() {
+        let current = ChartXRange {
+            x_min: 0.0,
+            x_max: 99.0,
+        };
+        let auto = current;
+        let x_fraction = 0.75;
+        let before = current.value_at_x_fraction(x_fraction);
+        let after = chart_x_range_after_wheel(current, auto, x_fraction, -10.0);
+
+        assert!(after.span() < current.span());
+        assert!((after.value_at_x_fraction(x_fraction) - before).abs() < 0.0001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_x_range_after_wheel_stays_inside_data_bounds() {
+        let auto = ChartXRange {
+            x_min: 0.0,
+            x_max: 99.0,
+        };
+        let left = chart_x_range_after_wheel(auto, auto, 0.0, -10.0);
+        let right = chart_x_range_after_wheel(auto, auto, 1.0, -10.0);
+        let max = chart_x_range_after_wheel(
+            ChartXRange {
+                x_min: 10.0,
+                x_max: 90.0,
+            },
+            auto,
+            0.5,
+            10.0,
+        );
+
+        assert_eq!(left.x_min, auto.x_min);
+        assert_eq!(right.x_max, auto.x_max);
+        assert!(max.x_min >= auto.x_min);
+        assert!(max.x_max <= auto.x_max);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_range_after_drag_pans_y_by_pixel_delta() {
+        let bounds = Bounds {
+            origin: Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            size: Size {
+                width: px(400.0),
+                height: px(100.0),
+            },
+        };
+        let start = ChartRange {
+            y_min: -10.0,
+            y_max: 10.0,
+        };
+        let after = chart_range_after_drag(
+            start,
+            bounds,
+            Point {
+                x: px(200.0),
+                y: px(50.0),
+            },
+            Point {
+                x: px(200.0),
+                y: px(60.0),
+            },
+        );
+
+        assert!((after.y_min - -8.0).abs() < 0.0001);
+        assert!((after.y_max - 12.0).abs() < 0.0001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chart_x_range_after_drag_pans_and_clamps_to_data_bounds() {
+        let bounds = Bounds {
+            origin: Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            size: Size {
+                width: px(400.0),
+                height: px(100.0),
+            },
+        };
+        let auto = ChartXRange {
+            x_min: 0.0,
+            x_max: 99.0,
+        };
+        let start = ChartXRange {
+            x_min: 20.0,
+            x_max: 60.0,
+        };
+        let after = chart_x_range_after_drag(
+            start,
+            auto,
+            bounds,
+            Point {
+                x: px(200.0),
+                y: px(50.0),
+            },
+            Point {
+                x: px(160.0),
+                y: px(50.0),
+            },
+        );
+        let clamped = chart_x_range_after_drag(
+            start,
+            auto,
+            bounds,
+            Point {
+                x: px(200.0),
+                y: px(50.0),
+            },
+            Point {
+                x: px(-1200.0),
+                y: px(50.0),
+            },
+        );
+
+        assert!((after.x_min - 24.0).abs() < 0.0001);
+        assert!((after.x_max - 64.0).abs() < 0.0001);
+        assert!(clamped.x_min >= auto.x_min);
+        assert_eq!(clamped.x_max, auto.x_max);
+    }
+
+    #[::core::prelude::v1::test]
+    fn history_bar_index_at_x_uses_horizontal_position() {
+        let bounds = Bounds {
+            origin: Point {
+                x: px(10.0),
+                y: px(20.0),
+            },
+            size: Size {
+                width: px(400.0),
+                height: px(100.0),
+            },
+        };
+
+        assert_eq!(
+            history_bar_index_at_x(
+                bounds,
+                Point {
+                    x: px(10.0),
+                    y: px(20.0)
+                },
+                4
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            history_bar_index_at_x(
+                bounds,
+                Point {
+                    x: px(210.0),
+                    y: px(20.0)
+                },
+                4
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            history_bar_index_at_x(
+                bounds,
+                Point {
+                    x: px(999.0),
+                    y: px(20.0)
+                },
+                4
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            history_bar_index_at_x(
+                bounds,
+                Point {
+                    x: px(10.0),
+                    y: px(20.0)
+                },
+                0
+            ),
+            None
         );
     }
 

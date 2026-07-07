@@ -1,6 +1,6 @@
 mod plot;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ const MAX_SAMPLES: usize = 600;
 const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
 const MAX_HISTORY_BARS: usize = 120;
+const REGISTER_DUMP_BATCH_MAX_LEN: usize = rseq_link::wire::CONTROL_MAX_READ_LEN;
 const DEFAULT_RSEQ_SOURCE: &str = r#"// New rseq script.
 // Pick a chip YAML in the Sequences sidebar or add chip!("chip.yaml") here.
 
@@ -122,6 +123,12 @@ impl RegisterViewMode {
 struct RegisterValue {
     access: AccessKind,
     data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisterDumpRange {
+    start: u32,
+    len: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1066,20 +1073,14 @@ impl RseqGpui {
     }
 
     fn request_active_register_page_dump(&mut self) {
-        let targets = self
-            .active_register_page_registers()
-            .into_iter()
-            .filter(|reg| !reg.no_dump && register_is_readable(&reg.access))
-            .filter_map(|reg| match self.selected_register_read_target(reg.addr) {
-                Ok(target) => Some(target),
-                Err(reason) => {
-                    push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let page = self
+            .active_register_page
+            .clone()
+            .unwrap_or_else(|| "registers".to_string());
+        let registers = self.active_register_page_registers();
+        let (ranges, skipped) = register_dump_ranges(&registers, REGISTER_DUMP_BATCH_MAX_LEN);
 
-        if targets.is_empty() {
+        if ranges.is_empty() {
             push_bounded(
                 &mut self.logs,
                 "no readable registers in active page".to_string(),
@@ -1088,16 +1089,44 @@ impl RseqGpui {
             return;
         }
 
+        let byte_count: usize = ranges.iter().map(|range| range.len as usize).sum();
         push_bounded(
             &mut self.logs,
-            format!("dumping {} register(s) from active page", targets.len()),
+            format!(
+                "dumping active page {page}: {} range(s), {byte_count} byte(s), skipped {} register(s)",
+                ranges.len(),
+                skipped.len()
+            ),
             MAX_TEXT_LINES,
         );
-        for target in targets {
+        for range in &ranges {
+            push_bounded(
+                &mut self.logs,
+                format!(
+                    "dump range {page}.0x{:02x}..0x{:02x} len={}",
+                    range.start,
+                    range.start + range.len as u32 - 1,
+                    range.len
+                ),
+                MAX_TEXT_LINES,
+            );
+        }
+        for item in skipped.iter().take(8) {
+            push_bounded(&mut self.logs, item.clone(), MAX_TEXT_LINES);
+        }
+        if skipped.len() > 8 {
+            push_bounded(
+                &mut self.logs,
+                format!("... {} more skipped registers omitted", skipped.len() - 8),
+                MAX_TEXT_LINES,
+            );
+        }
+
+        for range in ranges {
             self.send_command(SessionCommand::ReadRegister {
-                addr: target.addr,
-                len: target.len,
-                label: target.label,
+                addr: range.start,
+                len: range.len,
+                label: format!("{page}.0x{:02x}+{}", range.start, range.len),
             });
         }
     }
@@ -2957,37 +2986,41 @@ impl RseqGpui {
                     .id("register-matrix-grid")
                     .size_full()
                     .overflow_y_scrollbar()
-                    .gap_1()
-                    .min_w(px(640.))
-                    .child(self.render_register_header(cx))
-                    .children((0..rows).map(|row| {
-                        let base = row * 16;
-                        h_flex()
+                    .child(
+                        v_flex()
+                            .flex_none()
                             .gap_1()
-                            .child(
-                                div()
-                                    .w(px(52.))
-                                    .h(px(28.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font_family("monospace")
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("0x{base:02x}")),
-                            )
-                            .children(
-                                (0..16).map(move |offset| {
-                                    self.render_register_cell(base + offset, cx)
-                                }),
-                            )
-                    })),
+                            .min_w(px(640.))
+                            .child(self.render_register_header(cx))
+                            .children((0..rows).map(|row| {
+                                let base = row * 16;
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w(px(52.))
+                                            .h(px(28.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .font_family("monospace")
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("0x{base:02x}")),
+                                    )
+                                    .children((0..16).map(move |offset| {
+                                        self.render_register_cell(base + offset, cx)
+                                    }))
+                            })),
+                    ),
             )
             .into_any_element()
     }
 
     fn render_register_header(&self, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
+            .flex_none()
             .gap_1()
             .child(
                 div()
@@ -3145,7 +3178,6 @@ impl RseqGpui {
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded(cx.theme().radius)
-                    .overflow_hidden()
                     .child(self.render_register_map_header(cx))
                     .children(
                         registers
@@ -3159,6 +3191,7 @@ impl RseqGpui {
 
     fn render_register_map_header(&self, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
+            .flex_none()
             .w_full()
             .px_3()
             .py_2()
@@ -3701,6 +3734,91 @@ fn register_is_readable(access: &str) -> bool {
 
 fn register_is_writable(access: &str) -> bool {
     access.is_empty() || access.chars().any(|ch| ch == 'w' || ch == 'W')
+}
+
+fn register_dump_addresses(reg: &RegisterInfo) -> Vec<u32> {
+    (0..reg.width.max(1))
+        .map(|offset| reg.addr + offset)
+        .collect()
+}
+
+fn register_dump_ranges(
+    registers: &[RegisterInfo],
+    max_range_len: usize,
+) -> (Vec<RegisterDumpRange>, Vec<String>) {
+    let max_range_len = max_range_len.max(1);
+    let mut excluded = BTreeSet::new();
+    let mut skipped = Vec::new();
+
+    for reg in registers {
+        let reason = if reg.no_dump {
+            if reg.no_dump_reason.is_empty() {
+                "no_dump=true".to_string()
+            } else {
+                reg.no_dump_reason.clone()
+            }
+        } else if !register_is_readable(&reg.access) {
+            "write-only register".to_string()
+        } else {
+            continue;
+        };
+
+        for addr in register_dump_addresses(reg) {
+            excluded.insert(addr);
+        }
+        skipped.push(format!(
+            "{}.{}@0x{:02x} skipped: {reason}",
+            reg.page, reg.name, reg.addr
+        ));
+    }
+
+    let mut addresses = BTreeSet::new();
+    for reg in registers {
+        if reg.no_dump || !register_is_readable(&reg.access) {
+            continue;
+        }
+        for addr in register_dump_addresses(reg) {
+            if !excluded.contains(&addr) {
+                addresses.insert(addr);
+            }
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut last = 0u32;
+    let mut len = 0usize;
+
+    for addr in addresses {
+        let continues = start.is_some()
+            && last.checked_add(1) == Some(addr)
+            && len < max_range_len
+            && len < u16::MAX as usize;
+        if continues {
+            last = addr;
+            len += 1;
+            continue;
+        }
+
+        if let Some(start) = start {
+            ranges.push(RegisterDumpRange {
+                start,
+                len: len as u16,
+            });
+        }
+        start = Some(addr);
+        last = addr;
+        len = 1;
+    }
+
+    if let Some(start) = start {
+        ranges.push(RegisterDumpRange {
+            start,
+            len: len as u16,
+        });
+    }
+
+    (ranges, skipped)
 }
 
 fn field_bit_label(field: &FieldInfo) -> String {
@@ -4735,6 +4853,27 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn test_register(
+        page: &str,
+        name: &str,
+        addr: u32,
+        width: u32,
+        access: &str,
+        no_dump: bool,
+    ) -> RegisterInfo {
+        RegisterInfo {
+            page: page.to_string(),
+            name: name.to_string(),
+            addr,
+            access: access.to_string(),
+            width,
+            desc: String::new(),
+            no_dump,
+            no_dump_reason: String::new(),
+            fields: Vec::new(),
+        }
+    }
+
     #[::core::prelude::v1::test]
     fn visual_parser_collects_read_write_steps_from_rseq() {
         let source = r#"
@@ -4786,6 +4925,62 @@ mod tests {
             base_dir: None,
         };
         rseq::compile_program_units(&[unit]).unwrap();
+    }
+
+    #[::core::prelude::v1::test]
+    fn register_dump_ranges_batch_contiguous_readable_bytes() {
+        let registers = vec![
+            test_register("UI", "WHOAMI", 0x00, 1, "ro", false),
+            test_register("UI", "CTRL", 0x01, 2, "rw", false),
+            test_register("UI", "SECRET", 0x03, 1, "ro", true),
+            test_register("UI", "FIFO_DATA", 0x04, 1, "ro", false),
+            test_register("UI", "CMD", 0x08, 1, "wo", false),
+            test_register("UI", "STATUS", 0x09, 1, "ro", false),
+        ];
+
+        let (ranges, skipped) = register_dump_ranges(&registers, 64);
+        assert_eq!(
+            ranges,
+            vec![
+                RegisterDumpRange {
+                    start: 0x00,
+                    len: 3,
+                },
+                RegisterDumpRange {
+                    start: 0x04,
+                    len: 1,
+                },
+                RegisterDumpRange {
+                    start: 0x09,
+                    len: 1,
+                },
+            ]
+        );
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[::core::prelude::v1::test]
+    fn register_dump_ranges_split_at_batch_limit() {
+        let registers = vec![test_register("UI", "BLOCK", 0x20, 10, "ro", false)];
+        let (ranges, skipped) = register_dump_ranges(&registers, 4);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            ranges,
+            vec![
+                RegisterDumpRange {
+                    start: 0x20,
+                    len: 4,
+                },
+                RegisterDumpRange {
+                    start: 0x24,
+                    len: 4,
+                },
+                RegisterDumpRange {
+                    start: 0x28,
+                    len: 2,
+                },
+            ]
+        );
     }
 
     #[::core::prelude::v1::test]

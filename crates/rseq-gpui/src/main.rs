@@ -87,13 +87,19 @@ impl RseqEditorLanguageProvider {
         rseq_lsp::completion_items_at_offset(source, offset, &analysis.facts)
             .into_iter()
             .filter_map(convert_rseq_lsp_type)
-            .map(rseq_gpui_completion_item)
+            .map(|item| rseq_gpui_completion_item(source, item))
             .collect()
     }
 
     fn hover(&self, source: &str, offset: usize) -> Option<lsp_types::Hover> {
         let analysis = self.analysis(source);
-        rseq_lsp::hover_at_offset(source, offset, &analysis.facts).and_then(convert_rseq_lsp_type)
+        let mut hover: lsp_types::Hover =
+            rseq_lsp::hover_at_offset(source, offset, &analysis.facts)
+                .and_then(convert_rseq_lsp_type)?;
+        if let Some(range) = hover.range.as_mut() {
+            *range = rseq_lsp_range_to_gpui_range(source, *range);
+        }
+        Some(hover)
     }
 }
 
@@ -154,18 +160,98 @@ impl CompletionProvider for RseqEditorLanguageProvider {
     }
 }
 
-fn rseq_gpui_completion_item(mut item: lsp_types::CompletionItem) -> lsp_types::CompletionItem {
+fn rseq_gpui_completion_item(
+    source: &str,
+    mut item: lsp_types::CompletionItem,
+) -> lsp_types::CompletionItem {
     let label = item.label.clone();
     if let Some(text_edit) = item.text_edit.as_mut() {
         match text_edit {
-            lsp_types::CompletionTextEdit::Edit(edit) => edit.new_text = label.clone(),
-            lsp_types::CompletionTextEdit::InsertAndReplace(edit) => edit.new_text = label.clone(),
+            lsp_types::CompletionTextEdit::Edit(edit) => {
+                edit.range = rseq_lsp_range_to_gpui_range(source, edit.range);
+                edit.new_text = label.clone();
+            }
+            lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                edit.insert = rseq_lsp_range_to_gpui_range(source, edit.insert);
+                edit.replace = rseq_lsp_range_to_gpui_range(source, edit.replace);
+                edit.new_text = label.clone();
+            }
         }
     } else {
         item.insert_text = Some(label.clone());
     }
     item.insert_text_format = Some(lsp_types::InsertTextFormat::PLAIN_TEXT);
     item
+}
+
+fn rseq_lsp_range_to_gpui_range(source: &str, range: lsp_types::Range) -> lsp_types::Range {
+    lsp_types::Range::new(
+        rseq_lsp_position_to_gpui_position(source, range.start),
+        rseq_lsp_position_to_gpui_position(source, range.end),
+    )
+}
+
+fn rseq_lsp_position_to_gpui_position(
+    source: &str,
+    position: lsp_types::Position,
+) -> lsp_types::Position {
+    let byte_offset = rseq_lsp_position_to_byte_offset(source, position);
+    let (line, character) = rseq_byte_offset_to_gpui_position(source, byte_offset);
+    lsp_types::Position::new(line, character)
+}
+
+fn rseq_lsp_position_to_byte_offset(source: &str, position: lsp_types::Position) -> usize {
+    let mut current_line = 0u32;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if current_line == position.line {
+            break;
+        }
+        if ch == '\n' {
+            current_line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+
+    if current_line < position.line {
+        return source.len();
+    }
+
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|idx| line_start + idx)
+        .unwrap_or(source.len());
+    line_start + rseq_utf16_column_to_byte(&source[line_start..line_end], position.character)
+}
+
+fn rseq_utf16_column_to_byte(line: &str, target_col: u32) -> usize {
+    let mut col = 0u32;
+    for (idx, ch) in line.char_indices() {
+        let width = ch.len_utf16() as u32;
+        if col + width > target_col {
+            return idx;
+        }
+        col += width;
+    }
+    line.len()
+}
+
+fn rseq_byte_offset_to_gpui_position(source: &str, offset: usize) -> (u32, u32) {
+    let offset = offset.min(source.len());
+    let mut line = 0u32;
+    let mut character = 0u32;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+    (line, character)
 }
 
 fn rseq_should_offer_completion(source: &str, offset: usize) -> bool {
@@ -1187,16 +1273,15 @@ impl RseqGpui {
         ));
         let sequence_editor = cx.new(|cx| {
             let mut input = InputState::new(window, cx)
-                .code_editor("text")
+                .multi_line(true)
+                .rows(24)
                 .soft_wrap(false)
-                .line_number(true)
                 .scroll_beyond_last_line(Some(3))
                 .cursor_surrounding_lines(Some(1))
                 .placeholder("write rseq here")
                 .default_value(sequence_text);
             input.lsp.completion_provider = Some(sequence_lsp_provider.clone());
             input.lsp.hover_provider = Some(sequence_lsp_provider.clone());
-            input.lsp.semantic_tokens_provider = Some(sequence_lsp_provider.clone());
             input
         });
         let inline_write_input = cx.new(|cx| {
@@ -1394,8 +1479,9 @@ impl RseqGpui {
             if let Some(diagnostics) = input.diagnostics_mut() {
                 diagnostics.reset(&text);
                 diagnostics.extend(analysis.diagnostics.into_iter().map(|diagnostic| {
-                    lsp_types::Diagnostic {
-                        range: lsp_types::Range::new(
+                    let range = rseq_lsp_range_to_gpui_range(
+                        &source.source,
+                        lsp_types::Range::new(
                             lsp_types::Position::new(
                                 diagnostic.range.start.line,
                                 diagnostic.range.start.character,
@@ -1405,6 +1491,9 @@ impl RseqGpui {
                                 diagnostic.range.end.character,
                             ),
                         ),
+                    );
+                    lsp_types::Diagnostic {
+                        range,
                         severity: Some(lsp_types::DiagnosticSeverity::ERROR),
                         source: diagnostic.source,
                         message: diagnostic.message,
@@ -3838,6 +3927,9 @@ impl RseqGpui {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius)
+            .text_color(cx.theme().foreground)
+            .font_family("monospace")
+            .text_sm()
             .overflow_hidden()
             .child(Input::new(&self.sequence_editor).w_full().h_full())
             .into_any_element()
@@ -7288,21 +7380,77 @@ mod tests {
             .collect()
     }
 
+    fn gpui_position_to_offset_like_component(source: &str, line: u32, character: u32) -> usize {
+        let mut current_line = 0u32;
+        let mut line_start = 0usize;
+        for (idx, ch) in source.char_indices() {
+            if current_line == line {
+                break;
+            }
+            if ch == '\n' {
+                current_line += 1;
+                line_start = idx + ch.len_utf8();
+            }
+        }
+        if current_line != line {
+            return source.len();
+        }
+
+        let line_end = source[line_start..]
+            .find('\n')
+            .map(|rel| line_start + rel)
+            .unwrap_or(source.len());
+        line_start
+            + source[line_start..line_end]
+                .chars()
+                .take(character as usize)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    }
+
+    fn semantic_token_byte_ranges_like_gpui(
+        source: &str,
+        tokens: &lsp_types::SemanticTokens,
+    ) -> Vec<Range<usize>> {
+        let mut line = 0u32;
+        let mut character = 0u32;
+        let mut ranges = Vec::new();
+
+        for token in &tokens.data {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                character = token.delta_start;
+            } else {
+                character += token.delta_start;
+            }
+
+            let start = gpui_position_to_offset_like_component(source, line, character);
+            let end =
+                gpui_position_to_offset_like_component(source, line, character + token.length);
+            ranges.push(start..end);
+        }
+
+        ranges
+    }
+
     #[::core::prelude::v1::test]
     fn rseq_gpui_completion_items_insert_plain_labels_not_snippets() {
         let range = lsp_types::Range::new(
             lsp_types::Position::new(0, 0),
             lsp_types::Position::new(0, 5),
         );
-        let item = rseq_gpui_completion_item(lsp_types::CompletionItem {
-            label: "write!".to_string(),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
-                range,
-                new_text: "write!(${1:REG}, ${2:[0x00]}, ${3:50});".to_string(),
-            })),
-            ..Default::default()
-        });
+        let item = rseq_gpui_completion_item(
+            "",
+            lsp_types::CompletionItem {
+                label: "write!".to_string(),
+                insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range,
+                    new_text: "write!(${1:REG}, ${2:[0x00]}, ${3:50});".to_string(),
+                })),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             item.insert_text_format,
@@ -7311,6 +7459,50 @@ mod tests {
         let Some(lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit else {
             panic!("expected edit");
         };
+        assert_eq!(edit.new_text, "write!");
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_lsp_ranges_convert_utf16_columns_to_gpui_character_columns() {
+        let source = "// 🎉 comment\nwrite!(UI.FIFO_DATA, 1);\n";
+        let lsp_range = lsp_types::Range::new(
+            lsp_types::Position::new(0, 3),
+            lsp_types::Position::new(0, 5),
+        );
+        let gpui_range = rseq_lsp_range_to_gpui_range(source, lsp_range);
+
+        assert_eq!(gpui_range.start, lsp_types::Position::new(0, 3));
+        assert_eq!(gpui_range.end, lsp_types::Position::new(0, 4));
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_completion_item_converts_edit_range_for_gpui_component() {
+        let source = "// 🎉 comment\nwri";
+        let item = rseq_gpui_completion_item(
+            source,
+            lsp_types::CompletionItem {
+                label: "write!".to_string(),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(1, 0),
+                        lsp_types::Position::new(1, 3),
+                    ),
+                    new_text: "write!(${1:REG})".to_string(),
+                })),
+                ..Default::default()
+            },
+        );
+
+        let Some(lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit else {
+            panic!("expected edit");
+        };
+        assert_eq!(
+            edit.range,
+            lsp_types::Range::new(
+                lsp_types::Position::new(1, 0),
+                lsp_types::Position::new(1, 3)
+            )
+        );
         assert_eq!(edit.new_text, "write!");
     }
 
@@ -7373,6 +7565,62 @@ mod tests {
         )));
         assert_eq!(read_functions, 1);
         assert_eq!(register_refs, 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_semantic_tokens_use_gpui_character_columns_for_non_ascii_text() {
+        let facts = test_language_facts();
+        let source = "// 中断处理 🎉 ±4096 dps\nwrite!(UI.FIFO_DATA, 1);\n";
+        let tokens = rseq_semantic_tokens(source, 0..source.len(), &facts);
+
+        assert_eq!(tokens.data[0].delta_line, 0);
+        assert_eq!(tokens.data[0].delta_start, 0);
+        assert_eq!(
+            tokens.data[0].length,
+            "// 中断处理 🎉 ±4096 dps".chars().count() as u32
+        );
+
+        let write = tokens
+            .data
+            .iter()
+            .find(|token| {
+                token.delta_line == 1 && token.token_type == RseqSemanticKind::Function.token_type()
+            })
+            .expect("write! should be highlighted on the second line");
+        assert_eq!(write.delta_start, 0);
+        assert_eq!(write.length, "write!".chars().count() as u32);
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_semantic_token_ranges_are_utf8_boundaries_for_qmi_style_comments() {
+        let facts = test_language_facts();
+        let source = r#"
+chip!("qmi8660.yaml");
+write!(UI.ACTL1, { afs_ui: 2 }, 50);  // Accel: ODR 100 Hz, full-scale ±16 g.
+
+irq!(int1) {
+    // FIFO 水位线：先读取 FIFO 长度，再读取 FIFO_DATA，把 FIFO 水位线条件撤销。
+    on(fifo_watermark) {
+        // 按当前 FIFO 长度精确读取 FIFO_DATA，撤销 watermark 条件，并上报原始 FIFO。
+        let data = read!(UI.FIFO_DATA, 14);
+        report!(FIFO_RAW, 14, data);
+    }
+}
+"#;
+        let tokens = rseq_semantic_tokens(source, 0..source.len(), &facts);
+        let ranges = semantic_token_byte_ranges_like_gpui(source, &tokens);
+
+        assert!(!ranges.is_empty());
+        for range in ranges {
+            assert!(
+                source.is_char_boundary(range.start),
+                "semantic token starts inside utf-8 codepoint: {range:?}"
+            );
+            assert!(
+                source.is_char_boundary(range.end),
+                "semantic token ends inside utf-8 codepoint: {range:?}"
+            );
+        }
     }
 
     #[::core::prelude::v1::test]

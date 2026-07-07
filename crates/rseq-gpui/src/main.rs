@@ -24,11 +24,14 @@ use plot::{
 };
 use rseq_host::{
     AccessKind, FieldInfo, HostMetadata, MAX_TEXT_LINES, MotionSample, RegisterCatalog,
-    RegisterInfo, ReportHealth, RseqSource, SessionCommand, SessionConfig, SessionEvent,
+    RegisterInfo, ReportCaptureRecord, ReportDecoder, ReportDecoderRegistry, ReportHealth,
+    ReportOutputMode, ReportProcessor, RseqSource, SessionCommand, SessionConfig, SessionEvent,
     SessionHandle, compile_rseq_files, compile_rseq_sources, hex_bytes, load_host_metadata,
-    load_host_metadata_from_sources, parse_register_write_bytes, push_bounded,
+    load_host_metadata_from_sources, make_i16_le_decoder, parse_register_write_bytes, push_bounded,
+    read_report_capture, write_report_capture,
 };
 use serde::Deserialize;
+use serde::Serialize;
 
 const UI_TICK: Duration = Duration::from_millis(33);
 const MAX_SAMPLES: usize = 600;
@@ -36,6 +39,7 @@ const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
 const MAX_HISTORY_BARS: usize = 120;
 const REGISTER_DUMP_BATCH_MAX_LEN: usize = rseq_link::wire::CONTROL_MAX_READ_LEN;
+const MAX_CAPTURE_RECORDS: usize = 200_000;
 const COMMON_SERIAL_BAUDS: [u32; 10] = [
     9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000,
 ];
@@ -56,6 +60,32 @@ struct SelectSerialPortAction(String);
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = rseq_gpui, no_json)]
 struct SelectSerialBaudAction(u32);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CaptureSidecar {
+    version: u32,
+    format: String,
+    rseq_files: Vec<String>,
+    chip_files: Vec<String>,
+    skip_samples: usize,
+    report_decoders: Vec<CaptureDecoderMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CaptureDecoderMeta {
+    kind: u32,
+    kind_label: String,
+    decoder: String,
+    fields: Vec<String>,
+    gyro_fields: Vec<String>,
+    accel_fields: Vec<String>,
+    temp_field: Option<String>,
+    accel_fs_g: f64,
+    gyro_fs_dps: f64,
+    temp_lsb_per_c: f64,
+    temp_offset_c: f64,
+    output: String,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "GPUI workstation for rseq MCU reports")]
@@ -393,17 +423,21 @@ pub struct RseqGpui {
     serial_port_input: Entity<InputState>,
     serial_baud_input: Entity<InputState>,
     serial_ports: Vec<rseq_host::SerialPortInfo>,
+    skip_samples_input: Entity<InputState>,
     rseq_path_input: Entity<InputState>,
     chip_path_input: Entity<InputState>,
     sequence_editor: Entity<InputState>,
     inline_write_input: Entity<InputState>,
     write_input: Entity<InputState>,
     samples: VecDeque<MotionSample>,
+    sample_skip_count: usize,
+    sample_skip_remaining: usize,
     acc_history: VecDeque<TripleOhlc>,
     gyro_history: VecDeque<TripleOhlc>,
     history_bucket: Option<HistoryBucket>,
     show_temperature_panel: bool,
     registers: BTreeMap<u32, RegisterValue>,
+    capture_records: Vec<ReportCaptureRecord>,
     reports: VecDeque<String>,
     logs: VecDeque<String>,
     health: ReportHealth,
@@ -445,6 +479,11 @@ impl RseqGpui {
             InputState::new(window, cx)
                 .placeholder("115200")
                 .default_value(serial_baud_value)
+        });
+        let skip_samples_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("0")
+                .default_value("0")
         });
         let rseq_path_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -534,17 +573,21 @@ impl RseqGpui {
             serial_port_input,
             serial_baud_input,
             serial_ports,
+            skip_samples_input,
             rseq_path_input,
             chip_path_input,
             sequence_editor,
             inline_write_input,
             write_input,
             samples: VecDeque::with_capacity(MAX_SAMPLES),
+            sample_skip_count: 0,
+            sample_skip_remaining: 0,
             acc_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
             gyro_history: VecDeque::with_capacity(MAX_HISTORY_BARS),
             history_bucket: None,
             show_temperature_panel: true,
             registers: BTreeMap::new(),
+            capture_records: Vec::new(),
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
             health: ReportHealth::default(),
@@ -1107,11 +1150,248 @@ impl RseqGpui {
         .detach();
     }
 
+    fn save_capture_file_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.capture_records.is_empty() {
+            push_bounded(
+                &mut self.logs,
+                "no report capture records to save".to_string(),
+                MAX_TEXT_LINES,
+            );
+            cx.notify();
+            return;
+        }
+
+        let directory = self.capture_save_directory();
+        let default_name = self.capture_default_file_name();
+        let receiver = cx.prompt_for_new_path(&directory, Some(default_name.as_str()));
+        let records = self.capture_records.clone();
+        let sidecar = self.capture_sidecar(cx);
+
+        push_bounded(
+            &mut self.logs,
+            format!("choosing capture save path for {} report(s)", records.len()),
+            MAX_TEXT_LINES,
+        );
+        cx.notify();
+
+        cx.spawn_in(window, async move |view, cx| {
+            let selected = receiver.await.ok().and_then(|result| result.ok()).flatten();
+            let Some(path) = selected else {
+                _ = cx.update(|_, cx| {
+                    _ = view.update(cx, |this, cx| {
+                        push_bounded(
+                            &mut this.logs,
+                            "capture save cancelled".to_string(),
+                            MAX_TEXT_LINES,
+                        );
+                        cx.notify();
+                    });
+                });
+                return;
+            };
+
+            Self::write_capture_files(view, path, records, sidecar, cx).await;
+        })
+        .detach();
+    }
+
+    async fn write_capture_files(
+        view: WeakEntity<Self>,
+        path: PathBuf,
+        records: Vec<ReportCaptureRecord>,
+        sidecar: CaptureSidecar,
+        cx: &mut AsyncWindowContext,
+    ) {
+        let result = if path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+            Err(format!(
+                "capture path {} must end with .bin",
+                path.display()
+            ))
+        } else {
+            write_report_capture(&path, &records).and_then(|_| {
+                let sidecar_path = capture_sidecar_path(&path);
+                let json = serde_json::to_string_pretty(&sidecar)
+                    .map_err(|err| format!("failed to encode capture metadata: {err}"))?;
+                std::fs::write(&sidecar_path, json).map_err(|err| {
+                    format!(
+                        "failed to write capture metadata {}: {err}",
+                        sidecar_path.display()
+                    )
+                })
+            })
+        };
+
+        _ = cx.update(|_, cx| {
+            _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => push_bounded(
+                        &mut this.logs,
+                        format!(
+                            "saved {} report(s) to {} and {}",
+                            records.len(),
+                            path.display(),
+                            capture_sidecar_path(&path).display()
+                        ),
+                        MAX_TEXT_LINES,
+                    ),
+                    Err(message) => push_bounded(&mut this.logs, message, MAX_TEXT_LINES),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn replay_capture_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Replay rseq capture".into()),
+        });
+
+        push_bounded(
+            &mut self.logs,
+            "choosing capture replay file...".to_string(),
+            MAX_TEXT_LINES,
+        );
+        cx.notify();
+
+        cx.spawn_in(window, async move |view, cx| {
+            let selected = receiver
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+
+            let Some(path) = selected else {
+                _ = cx.update(|_, cx| {
+                    _ = view.update(cx, |this, cx| {
+                        push_bounded(
+                            &mut this.logs,
+                            "capture replay cancelled".to_string(),
+                            MAX_TEXT_LINES,
+                        );
+                        cx.notify();
+                    });
+                });
+                return;
+            };
+
+            let records = read_report_capture(&path);
+            let sidecar = read_capture_sidecar(&path);
+
+            _ = cx.update(|window, cx| {
+                _ = view.update(cx, |this, cx| {
+                    match records {
+                        Ok(records) => {
+                            this.stop_session();
+                            if let Some(sidecar) = sidecar {
+                                if let Err(message) =
+                                    this.apply_capture_sidecar(sidecar, window, cx)
+                                {
+                                    push_bounded(&mut this.logs, message, MAX_TEXT_LINES);
+                                }
+                            }
+                            this.reset_stream_state(true);
+                            this.session_mode = "replay".to_string();
+                            this.connection_label = format!("replay {}", display_path_name(&path));
+                            let count = records.len();
+                            let mut processor =
+                                ReportProcessor::new(this.metadata.report_decoders.clone());
+                            for record in records {
+                                let events =
+                                    processor.handle_report(record.meta, record.kind, &record.args);
+                                for event in events {
+                                    this.apply_event(event);
+                                }
+                            }
+                            push_bounded(
+                                &mut this.logs,
+                                format!("replayed {count} report(s) from {}", path.display()),
+                                MAX_TEXT_LINES,
+                            );
+                        }
+                        Err(message) => push_bounded(&mut this.logs, message, MAX_TEXT_LINES),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn capture_save_directory(&self) -> PathBuf {
+        self.sequence_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn capture_default_file_name(&self) -> String {
+        let stem = self
+            .sequence_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|name| name.to_str())
+            .unwrap_or("rseq");
+        format!("{stem}-capture.bin")
+    }
+
+    fn capture_sidecar(&self, cx: &Context<Self>) -> CaptureSidecar {
+        CaptureSidecar {
+            version: 1,
+            format: "rseq-report-capture-bin-v1".to_string(),
+            rseq_files: self
+                .rseq_files_from_input(cx)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            chip_files: self
+                .chip_files_from_input(cx)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            skip_samples: self.sample_skip_count,
+            report_decoders: capture_decoder_meta(&self.metadata.report_decoders),
+        }
+    }
+
+    fn apply_capture_sidecar(
+        &mut self,
+        sidecar: CaptureSidecar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let registry = report_decoder_registry_from_sidecar(&sidecar)?;
+        if !registry.is_empty() {
+            self.metadata.report_decoders = registry;
+        }
+
+        self.cli.file = sidecar.rseq_files.iter().map(PathBuf::from).collect();
+        self.cli.chip = sidecar.chip_files.iter().map(PathBuf::from).collect();
+        self.rseq_path_input.update(cx, |input, cx| {
+            input.set_value(sidecar.rseq_files.join("; "), window, cx);
+        });
+        self.chip_path_input.update(cx, |input, cx| {
+            input.set_value(sidecar.chip_files.join("; "), window, cx);
+        });
+        self.sample_skip_count = sidecar.skip_samples;
+        self.sample_skip_remaining = sidecar.skip_samples;
+        self.skip_samples_input.update(cx, |input, cx| {
+            input.set_value(sidecar.skip_samples.to_string(), window, cx);
+        });
+        Ok(())
+    }
+
     fn start_session(&mut self, watch: bool) {
         if let Some(session) = self.session.take() {
             session.stop();
         }
 
+        self.reset_stream_state(true);
         let demo = self.link_mode == LinkMode::Demo || self.cli.demo;
         let serial = if demo { None } else { self.cli.serial.clone() };
         self.connected = false;
@@ -1236,6 +1516,11 @@ impl RseqGpui {
                 self.ingest_motion_sample(sample);
             }
             SessionEvent::Report(summary) => {
+                self.push_capture_record(ReportCaptureRecord {
+                    meta: summary.meta,
+                    kind: summary.kind,
+                    args: summary.args.clone(),
+                });
                 push_bounded(&mut self.reports, summary.line, MAX_TEXT_LINES);
             }
             SessionEvent::Health(health) => self.health = health,
@@ -1468,7 +1753,59 @@ impl RseqGpui {
         [cx.theme().red, cx.theme().green, cx.theme().blue]
     }
 
+    fn reset_stream_state(&mut self, clear_capture: bool) {
+        self.samples.clear();
+        self.acc_history.clear();
+        self.gyro_history.clear();
+        self.history_bucket = None;
+        self.health = ReportHealth::default();
+        self.sample_skip_remaining = self.sample_skip_count;
+        if clear_capture {
+            self.capture_records.clear();
+        }
+    }
+
+    fn push_capture_record(&mut self, record: ReportCaptureRecord) {
+        if self.capture_records.len() >= MAX_CAPTURE_RECORDS {
+            self.capture_records.remove(0);
+        }
+        self.capture_records.push(record);
+    }
+
+    fn apply_sample_skip_setting(&mut self, cx: &Context<Self>) {
+        match parse_nonnegative_usize(&self.skip_samples_input.read(cx).value(), "skip samples") {
+            Ok(count) => {
+                self.sample_skip_count = count;
+                self.sample_skip_remaining = count;
+                push_bounded(
+                    &mut self.logs,
+                    format!("sample skip set to {count}; next {count} sample(s) will be hidden"),
+                    MAX_TEXT_LINES,
+                );
+            }
+            Err(reason) => push_bounded(&mut self.logs, reason, MAX_TEXT_LINES),
+        }
+    }
+
+    fn clear_motion_samples(&mut self) {
+        self.samples.clear();
+        self.acc_history.clear();
+        self.gyro_history.clear();
+        self.history_bucket = None;
+        self.sample_skip_remaining = self.sample_skip_count;
+        push_bounded(
+            &mut self.logs,
+            "motion chart cleared".to_string(),
+            MAX_TEXT_LINES,
+        );
+    }
+
     fn ingest_motion_sample(&mut self, sample: MotionSample) {
+        if self.sample_skip_remaining > 0 {
+            self.sample_skip_remaining -= 1;
+            return;
+        }
+
         let acc = motion_acc_vec3(&sample);
         let gyro = motion_gyro_vec3(&sample);
 
@@ -2120,6 +2457,7 @@ impl RseqGpui {
             .overflow_hidden()
             .p_3()
             .gap_3()
+            .child(self.render_motion_toolbar(cx))
             .child(self.render_chart("Accelerometer (m/s^2)", self.acc_data(), 12.0, cx))
             .child(self.render_chart("Gyroscope (rad/s)", self.gyro_data(), 2.0, cx))
             .when(
@@ -2134,8 +2472,120 @@ impl RseqGpui {
             .into_any_element()
     }
 
+    fn render_motion_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().font_semibold().child("Motion Stream"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "samples={} skip_remaining={}",
+                                self.samples.len(),
+                                self.sample_skip_remaining
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Skip samples"),
+                    )
+                    .child(
+                        div()
+                            .w(px(70.))
+                            .child(Input::new(&self.skip_samples_input).xsmall()),
+                    )
+                    .child(
+                        Button::new("apply-sample-skip")
+                            .xsmall()
+                            .label("Apply")
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.apply_sample_skip_setting(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-motion")
+                            .xsmall()
+                            .label("Clear")
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.clear_motion_samples();
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     fn render_reports(&self, cx: &Context<Self>) -> AnyElement {
-        text_panel("Reports", &self.reports, cx).into_any_element()
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .overflow_hidden()
+            .child(self.render_reports_toolbar(cx))
+            .child(text_panel("Reports", &self.reports, cx))
+            .into_any_element()
+    }
+
+    fn render_reports_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().font_semibold().child("Report Capture"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} record(s), {} decoder(s)",
+                                self.capture_records.len(),
+                                self.metadata.report_decoders.len()
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("save-capture")
+                            .small()
+                            .label("Save Capture")
+                            .disabled(self.capture_records.is_empty())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_capture_file_as(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("replay-capture")
+                            .small()
+                            .label("Replay Capture")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.replay_capture_file(window, cx);
+                            })),
+                    ),
+            )
     }
 
     fn render_logs(&self, cx: &Context<Self>) -> AnyElement {
@@ -5266,12 +5716,88 @@ fn parse_serial_baud(value: &str) -> Result<u32, String> {
     }
 }
 
+fn parse_nonnegative_usize(value: &str, label: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {label}: {trimmed}"))
+}
+
 fn serial_port_menu_label(port: &rseq_host::SerialPortInfo) -> String {
     if port.detail.is_empty() {
         port.label.clone()
     } else {
         format!("{} ({})", port.label, port.detail)
     }
+}
+
+fn capture_sidecar_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.json")),
+        _ => path.with_extension("json"),
+    }
+}
+
+fn read_capture_sidecar(path: &Path) -> Option<CaptureSidecar> {
+    let sidecar_path = capture_sidecar_path(path);
+    let text = std::fs::read_to_string(sidecar_path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn capture_decoder_meta(registry: &ReportDecoderRegistry) -> Vec<CaptureDecoderMeta> {
+    registry
+        .iter()
+        .map(|(kind, decoder)| match decoder {
+            ReportDecoder::I16Le(decoder) => CaptureDecoderMeta {
+                kind: *kind,
+                kind_label: rseq_host::report_kind_label(*kind),
+                decoder: decoder.label.clone(),
+                fields: decoder.fields.clone(),
+                gyro_fields: decoder.gyro_fields.clone(),
+                accel_fields: decoder.accel_fields.clone(),
+                temp_field: decoder.temp_field.clone(),
+                accel_fs_g: decoder.accel_fs_g,
+                gyro_fs_dps: decoder.gyro_fs_dps,
+                temp_lsb_per_c: decoder.temp_lsb_per_c,
+                temp_offset_c: decoder.temp_offset_c,
+                output: decoder.output.as_str().to_string(),
+            },
+        })
+        .collect()
+}
+
+fn report_decoder_registry_from_sidecar(
+    sidecar: &CaptureSidecar,
+) -> Result<ReportDecoderRegistry, String> {
+    let mut registry = ReportDecoderRegistry::default();
+    for decoder in &sidecar.report_decoders {
+        let output = match decoder.output.as_str() {
+            "physical_f32" => ReportOutputMode::PhysicalF32,
+            "raw_i16" => ReportOutputMode::RawI16,
+            other => {
+                return Err(format!(
+                    "capture metadata decoder output must be physical_f32 or raw_i16, got {other}"
+                ));
+            }
+        };
+        let decoder_value = make_i16_le_decoder(
+            &decoder.decoder,
+            decoder.fields.clone(),
+            decoder.gyro_fields.clone(),
+            decoder.accel_fields.clone(),
+            decoder.temp_field.clone(),
+            decoder.accel_fs_g,
+            decoder.gyro_fs_dps,
+            decoder.temp_lsb_per_c,
+            decoder.temp_offset_c,
+            output,
+        )?;
+        registry.insert(decoder.kind, decoder_value);
+    }
+    Ok(registry)
 }
 
 fn main() {
@@ -5455,6 +5981,14 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn parse_nonnegative_usize_treats_empty_as_zero() {
+        assert_eq!(parse_nonnegative_usize("", "skip samples").unwrap(), 0);
+        assert_eq!(parse_nonnegative_usize("12", "skip samples").unwrap(), 12);
+        assert!(parse_nonnegative_usize("-1", "skip samples").is_err());
+        assert!(parse_nonnegative_usize("abc", "skip samples").is_err());
+    }
+
+    #[::core::prelude::v1::test]
     fn serial_port_menu_label_includes_detail_when_present() {
         let plain = rseq_host::SerialPortInfo {
             port_name: "/dev/cu.usbmodem1".to_string(),
@@ -5472,6 +6006,49 @@ mod tests {
             serial_port_menu_label(&detailed),
             "cu.usbmodem2 - STLINK (USB 0483:374b STMicroelectronics)"
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn capture_sidecar_path_keeps_bin_extension_visible() {
+        assert_eq!(
+            capture_sidecar_path(Path::new("/tmp/fifo.bin")),
+            PathBuf::from("/tmp/fifo.bin.json")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn capture_decoder_meta_round_trips_i16_le_decoder() {
+        let mut registry = ReportDecoderRegistry::default();
+        registry.insert(
+            rseq::REPORT_KIND_FIFO_RAW,
+            make_i16_le_decoder(
+                "i16_le",
+                ["gx", "gy", "gz", "ax", "ay", "az", "temp"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ["gx", "gy", "gz"].into_iter().map(str::to_string).collect(),
+                ["ax", "ay", "az"].into_iter().map(str::to_string).collect(),
+                Some("temp".to_string()),
+                16.0,
+                4096.0,
+                256.0,
+                0.0,
+                ReportOutputMode::PhysicalF32,
+            )
+            .unwrap(),
+        );
+        let sidecar = CaptureSidecar {
+            version: 1,
+            format: "rseq-report-capture-bin-v1".to_string(),
+            rseq_files: vec!["examples/qmi8660_fifo.rseq".to_string()],
+            chip_files: vec!["qmi8660.yaml".to_string()],
+            skip_samples: 3,
+            report_decoders: capture_decoder_meta(&registry),
+        };
+
+        let restored = report_decoder_registry_from_sidecar(&sidecar).unwrap();
+        assert_eq!(restored, registry);
     }
 
     #[::core::prelude::v1::test]

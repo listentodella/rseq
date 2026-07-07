@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -20,6 +21,7 @@ pub const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 pub const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 pub const DEFAULT_BAUD: u32 = 115_200;
 pub const MAX_TEXT_LINES: usize = 512;
+pub const CAPTURE_MAGIC: &[u8] = b"RSEQCAP1\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialPortInfo {
@@ -690,6 +692,10 @@ impl ReportDecoderRegistry {
         self.by_kind.get(&kind)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &ReportDecoder)> {
+        self.by_kind.iter()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_kind.is_empty()
     }
@@ -1121,6 +1127,7 @@ impl ReportHealthTracker {
 pub struct ReportSummary {
     pub meta: Option<ReportMeta>,
     pub kind: u32,
+    pub args: Vec<ReportArg>,
     pub label: String,
     pub line: String,
     pub fifo_len: Option<u32>,
@@ -1190,6 +1197,7 @@ impl ReportProcessor {
         let mut summary = ReportSummary {
             meta,
             kind,
+            args: args.to_vec(),
             label,
             line: String::new(),
             fifo_len: None,
@@ -1253,6 +1261,186 @@ impl ReportProcessor {
         events.push(SessionEvent::Health(health));
         events
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportCaptureRecord {
+    pub meta: Option<ReportMeta>,
+    pub kind: u32,
+    pub args: Vec<ReportArg>,
+}
+
+pub struct BinaryReportCaptureWriter {
+    file: std::fs::File,
+}
+
+impl BinaryReportCaptureWriter {
+    pub fn create(path: &Path) -> Result<Self, String> {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create capture {}: {e}", path.display()))?;
+        file.write_all(CAPTURE_MAGIC)
+            .map_err(|e| format!("failed to write capture header {}: {e}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    pub fn write_report(
+        &mut self,
+        meta: Option<ReportMeta>,
+        kind: u32,
+        args: &[ReportArg],
+    ) -> Result<(), String> {
+        self.write_record(&ReportCaptureRecord {
+            meta,
+            kind,
+            args: args.to_vec(),
+        })
+    }
+
+    pub fn write_record(&mut self, record: &ReportCaptureRecord) -> Result<(), String> {
+        let payload = encode_capture_record(record)?;
+        let len = payload.len() as u32;
+        self.file
+            .write_all(&len.to_le_bytes())
+            .and_then(|_| self.file.write_all(&payload))
+            .map_err(|e| format!("failed to write capture record: {e}"))
+    }
+}
+
+pub fn write_report_capture(path: &Path, records: &[ReportCaptureRecord]) -> Result<(), String> {
+    let mut writer = BinaryReportCaptureWriter::create(path)?;
+    for record in records {
+        writer.write_record(record)?;
+    }
+    Ok(())
+}
+
+pub fn read_report_capture(path: &Path) -> Result<Vec<ReportCaptureRecord>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open capture {}: {e}", path.display()))?;
+    let mut magic = vec![0u8; CAPTURE_MAGIC.len()];
+    file.read_exact(&mut magic)
+        .map_err(|e| format!("failed to read capture header {}: {e}", path.display()))?;
+    if magic != CAPTURE_MAGIC {
+        return Err(format!("{} is not an rseq report capture", path.display()));
+    }
+
+    let mut records = Vec::new();
+    loop {
+        let mut len_bytes = [0u8; 4];
+        match file.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("failed to read capture length: {e}")),
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let mut payload = vec![0u8; len];
+        file.read_exact(&mut payload)
+            .map_err(|e| format!("failed to read capture payload: {e}"))?;
+        records.push(decode_capture_record(&payload)?);
+    }
+    Ok(records)
+}
+
+pub fn encode_capture_record(record: &ReportCaptureRecord) -> Result<Vec<u8>, String> {
+    if record.args.len() > u8::MAX as usize {
+        return Err(format!(
+            "capture report has {} args, max is {}",
+            record.args.len(),
+            u8::MAX
+        ));
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&record.kind.to_le_bytes());
+    match record.meta {
+        Some(meta) => {
+            payload.push(1);
+            payload.push(meta.flags);
+            payload.extend_from_slice(&meta.frame_id.to_le_bytes());
+            payload.extend_from_slice(&meta.timestamp_us.to_le_bytes());
+        }
+        None => {
+            payload.push(0);
+            payload.push(0);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    payload.push(record.args.len() as u8);
+    for arg in &record.args {
+        match arg {
+            ReportArg::U32(value) => {
+                payload.push(rseq_link::wire::REPORT_ARG_U32);
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            ReportArg::Bytes(bytes) => {
+                let len = u32::try_from(bytes.len()).map_err(|_| {
+                    format!("capture bytes arg is too large: {} byte(s)", bytes.len())
+                })?;
+                payload.push(rseq_link::wire::REPORT_ARG_BYTES);
+                payload.extend_from_slice(&len.to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+        }
+    }
+    Ok(payload)
+}
+
+pub fn decode_capture_record(payload: &[u8]) -> Result<ReportCaptureRecord, String> {
+    let mut pos = 0usize;
+    let kind = take_u32(payload, &mut pos)?;
+    let meta_present = take_u8(payload, &mut pos)? != 0;
+    let flags = take_u8(payload, &mut pos)?;
+    let frame_id = take_u32(payload, &mut pos)?;
+    let timestamp_us = take_u64(payload, &mut pos)?;
+    let meta = meta_present.then_some(ReportMeta {
+        flags,
+        frame_id,
+        timestamp_us,
+    });
+    let argc = take_u8(payload, &mut pos)? as usize;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        match take_u8(payload, &mut pos)? {
+            rseq_link::wire::REPORT_ARG_U32 => {
+                args.push(ReportArg::U32(take_u32(payload, &mut pos)?));
+            }
+            rseq_link::wire::REPORT_ARG_BYTES => {
+                let len = take_u32(payload, &mut pos)? as usize;
+                let bytes = take_bytes(payload, &mut pos, len)?.to_vec();
+                args.push(ReportArg::Bytes(bytes));
+            }
+            tag => return Err(format!("invalid capture arg tag 0x{tag:02x}")),
+        }
+    }
+    Ok(ReportCaptureRecord { meta, kind, args })
+}
+
+fn take_u8(payload: &[u8], pos: &mut usize) -> Result<u8, String> {
+    let bytes = take_bytes(payload, pos, 1)?;
+    Ok(bytes[0])
+}
+
+fn take_u32(payload: &[u8], pos: &mut usize) -> Result<u32, String> {
+    let bytes = take_bytes(payload, pos, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn take_u64(payload: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let bytes = take_bytes(payload, pos, 8)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn take_bytes<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], String> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| "capture record length overflow".to_string())?;
+    if end > payload.len() {
+        return Err("truncated capture record".to_string());
+    }
+    let bytes = &payload[*pos..end];
+    *pos = end;
+    Ok(bytes)
 }
 
 pub fn report_kind_label(kind: u32) -> String {
@@ -1618,6 +1806,10 @@ fn spawn_demo_session(
             let summary = ReportSummary {
                 meta: Some(meta),
                 kind: rseq::REPORT_KIND_FIFO_RAW,
+                args: vec![
+                    ReportArg::U32(12),
+                    ReportArg::Bytes(vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x08]),
+                ],
                 label: "FIFO_RAW".to_string(),
                 line: format!(
                     "FIFO_RAW frame_id={} ts_us={} demo sample",
@@ -2035,6 +2227,27 @@ let whoami = read!(UI.WHOAMI, 1);
                 .selected_write_target(0x00)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn binary_report_capture_round_trips_records() {
+        let dir = temp_dir();
+        let path = dir.join("capture.bin");
+        let records = vec![ReportCaptureRecord {
+            meta: Some(ReportMeta {
+                flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 42,
+                timestamp_us: 123_456,
+            }),
+            kind: rseq::REPORT_KIND_FIFO_RAW,
+            args: vec![
+                ReportArg::U32(4),
+                ReportArg::Bytes(vec![0x11, 0x22, 0x33, 0x44]),
+            ],
+        }];
+
+        write_report_capture(&path, &records).unwrap();
+        assert_eq!(read_report_capture(&path).unwrap(), records);
     }
 
     #[test]

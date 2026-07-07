@@ -43,14 +43,18 @@ struct Cli {
     chip: Vec<PathBuf>,
 
     /// Serial port used to load/execute an rseq file or watch an already running MCU.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tcp")]
     serial: Option<String>,
+
+    /// TCP byte-stream endpoint forwarded from a remote CDC/UART, for example 10.2.8.42:5657.
+    #[arg(long, conflicts_with = "serial")]
+    tcp: Option<String>,
 
     /// Serial baud rate.
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
 
-    /// Force the synthetic data source. This is also the default when --serial is absent.
+    /// Force the synthetic data source. This is also the default when no endpoint is supplied.
     #[arg(long)]
     demo: bool,
 
@@ -105,27 +109,33 @@ fn start_source(
     cmd_rx: Receiver<SourceCommand>,
     stop: Arc<AtomicBool>,
 ) -> String {
-    if cli.demo || cli.serial.is_none() {
+    if cli.demo || (cli.serial.is_none() && cli.tcp.is_none()) {
         spawn_demo_source(tx, cmd_rx, stop);
         return "demo".to_string();
     }
 
-    let serial = cli.serial.clone().expect("--serial checked above");
     let mode = if startup_program.is_some() {
         "load+exec"
     } else {
         "watch"
     };
-    let label = format!("{serial} @ {} ({mode})", cli.baud);
-    spawn_serial_source(
-        serial,
-        cli.baud,
-        startup_program,
-        report_decoders,
-        tx,
-        cmd_rx,
-        stop,
-    );
+    if let Some(serial) = cli.serial.clone() {
+        let label = format!("{serial} @ {} ({mode})", cli.baud);
+        spawn_serial_source(
+            serial,
+            cli.baud,
+            startup_program,
+            report_decoders,
+            tx,
+            cmd_rx,
+            stop,
+        );
+        return label;
+    }
+
+    let tcp = cli.tcp.clone().expect("--tcp checked above");
+    let label = format!("{tcp} ({mode})");
+    spawn_tcp_source(tcp, startup_program, report_decoders, tx, cmd_rx, stop);
     label
 }
 
@@ -1457,7 +1467,7 @@ fn spawn_serial_source(
         };
         let mut host = rseq::link::HostLink::new(transport);
         if let Some(program) = startup_program {
-            if !load_and_exec_serial_program(&mut host, &program, &report_decoders, &tx) {
+            if !load_and_exec_program(&mut host, &program, &report_decoders, &tx) {
                 return;
             }
         } else {
@@ -1466,6 +1476,61 @@ fn spawn_serial_source(
             ));
         }
         let _ = tx.send(AppEvent::Log("serial observe loop started".to_string()));
+        while !stop.load(Ordering::Relaxed) {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                handle_source_command(cmd, &mut host, &report_decoders, &tx);
+            }
+
+            match host.observe_next_trace(Duration::from_millis(20)) {
+                Ok(Some(op)) => handle_bus_op(op, &report_decoders, &tx),
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = tx.send(AppEvent::Error(format!("observe failed: {err}")));
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    });
+}
+
+fn spawn_tcp_source(
+    addr: String,
+    startup_program: Option<CompiledProgram>,
+    report_decoders: ReportDecoderRegistry,
+    tx: Sender<AppEvent>,
+    cmd_rx: Receiver<SourceCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let mode = if startup_program.is_some() {
+            "load+exec"
+        } else {
+            "watch"
+        };
+        let _ = tx.send(AppEvent::Log(format!("opening tcp {addr} ({mode})")));
+        let transport = if startup_program.is_some() {
+            rseq_link::TcpTransport::connect(addr.as_str())
+        } else {
+            rseq_link::TcpTransport::connect_observing(addr.as_str())
+        };
+        let transport = match transport {
+            Ok(transport) => transport,
+            Err(err) => {
+                let _ = tx.send(AppEvent::Error(format!("open tcp failed: {err}")));
+                return;
+            }
+        };
+        let mut host = rseq::link::HostLink::new(transport);
+        if let Some(program) = startup_program {
+            if !load_and_exec_program(&mut host, &program, &report_decoders, &tx) {
+                return;
+            }
+        } else {
+            let _ = tx.send(AppEvent::Log(
+                "watch mode: no LOAD/EXEC frames will be sent".to_string(),
+            ));
+        }
+        let _ = tx.send(AppEvent::Log("tcp observe loop started".to_string()));
         while !stop.load(Ordering::Relaxed) {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 handle_source_command(cmd, &mut host, &report_decoders, &tx);
@@ -1498,9 +1563,8 @@ fn spawn_serial_source(
     )));
 }
 
-#[cfg(feature = "serial")]
-fn load_and_exec_serial_program(
-    host: &mut rseq::link::HostLink<rseq_link::SerialTransport>,
+fn load_and_exec_program<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
     program: &CompiledProgram,
     report_decoders: &ReportDecoderRegistry,
     tx: &Sender<AppEvent>,
@@ -1549,10 +1613,9 @@ fn load_and_exec_serial_program(
     }
 }
 
-#[cfg(feature = "serial")]
-fn handle_source_command(
+fn handle_source_command<T: rseq_link::Transport>(
     cmd: SourceCommand,
-    host: &mut rseq::link::HostLink<rseq_link::SerialTransport>,
+    host: &mut rseq::link::HostLink<T>,
     report_decoders: &ReportDecoderRegistry,
     tx: &Sender<AppEvent>,
 ) {
@@ -2049,7 +2112,7 @@ fn gyro_raw_to_rad_s(raw: i16, full_scale_dps: f64) -> f64 {
 }
 
 fn serial_startup_program(cli: &Cli) -> Result<Option<CompiledProgram>, String> {
-    if cli.demo || cli.serial.is_none() || cli.watch || cli.file.is_empty() {
+    if cli.demo || (cli.serial.is_none() && cli.tcp.is_none()) || cli.watch || cli.file.is_empty() {
         return Ok(None);
     }
 

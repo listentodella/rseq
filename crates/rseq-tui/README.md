@@ -36,6 +36,19 @@ cargo run -p rseq-tui --features serial -- \
   -f examples/qmi8660_fifo.rseq
 ```
 
+Use a CDC/UART port forwarded by a remote machine as a TCP byte stream:
+
+```bash
+# remote machine attached to the board
+python3 skills/serial/scripts/serial_tcp_forward.py --serial /dev/ttyACM0 --baud 115200 --listen 0.0.0.0:5657
+
+# local workstation
+cargo run -p rseq-tui -- \
+  --tcp 10.2.8.42:5657 \
+  --chip qmi8660.yaml \
+  -f examples/qmi8660_fifo.rseq
+```
+
 The TUI reads `report_format!` metadata from `-f` files and currently supports `i16_le` plus the
 legacy `qmi8660_fifo6` alias. `FIFO_RAW` samples are converted to acc `m/s^2` and gyro `rad/s` for
 the chart tab.

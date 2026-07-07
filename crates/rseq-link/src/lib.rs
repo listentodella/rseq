@@ -7,7 +7,8 @@
 //!
 //! 核心无分配(no_std 默认):帧编解码、CRC32、Trace 载荷、`TracingBus`、
 //! `Transport`/`LinkTx` trait。`std` feature 启用进程内回环管道
-//! [`MockTransport`];`serial` feature 启用串口实现 [`SerialTransport`]。
+//! [`MockTransport`] 和 TCP 实现 [`TcpTransport`];`serial` feature 启用串口实现
+//! [`SerialTransport`]。
 
 // 单测在 no_std 构建下也需要 `std`(`Vec`/`vec!`/`Arc`/`Mutex`):
 // `#[macro_use] extern crate std` 链接 std 并把 `vec!` 等宏引入 crate 域;
@@ -39,6 +40,8 @@ pub use wire::{
 
 #[cfg(feature = "std")]
 pub use transport::MockTransport;
+#[cfg(feature = "std")]
+pub use transport::TcpTransport;
 pub use transport::Transport;
 #[cfg(feature = "serial")]
 pub use transport::{SerialPortInfo, SerialTransport};

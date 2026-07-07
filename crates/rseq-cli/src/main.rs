@@ -46,9 +46,13 @@ struct Cli {
     #[arg(short = 'x', long)]
     hex: Option<String>,
 
-    /// 通过串口把字节码下发到真实 MCU 并收集回传轨迹:--serial /dev/ttyUSB0
-    #[arg(long)]
+    /// 通过本地串口把字节码下发到真实 MCU 并收集回传轨迹:--serial /dev/ttyUSB0
+    #[arg(long, conflicts_with = "tcp")]
     serial: Option<String>,
+
+    /// 通过 TCP 字节流连接远端转发的 MCU CDC/UART:--tcp 10.2.8.42:5657
+    #[arg(long, conflicts_with = "serial")]
+    tcp: Option<String>,
 
     /// 只监听已运行 MCU 主动回传的 Trace/Report,可选解析 -f/--manifest 里的 report_format!,不发送 LOAD/EXEC/PING。
     #[arg(long, alias = "observe-only", alias = "rx-only")]
@@ -83,6 +87,30 @@ struct Cli {
     baud: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Endpoint<'a> {
+    Serial(&'a str),
+    Tcp(&'a str),
+}
+
+impl<'a> Endpoint<'a> {
+    fn label(self, baud: u32) -> String {
+        match self {
+            Self::Serial(path) => format!("serial {path} @ {baud} baud"),
+            Self::Tcp(addr) => format!("tcp {addr}"),
+        }
+    }
+}
+
+impl Cli {
+    fn endpoint(&self) -> Option<Endpoint<'_>> {
+        self.serial
+            .as_deref()
+            .map(Endpoint::Serial)
+            .or_else(|| self.tcp.as_deref().map(Endpoint::Tcp))
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -97,54 +125,70 @@ fn main() {
     }
 
     if cli.stop || cli.reset_mcu || cli.ping {
-        let Some(path) = cli.serial.as_deref() else {
-            eprintln!("--stop/--reset-mcu/--ping require --serial <port>");
+        let Some(endpoint) = cli.endpoint() else {
+            eprintln!("--stop/--reset-mcu/--ping require --serial <port> or --tcp <host:port>");
             std::process::exit(2);
         };
 
-        #[cfg(feature = "serial")]
-        {
-            run_control(path, cli.baud, cli.stop, cli.reset_mcu, cli.ping);
-            return;
-        }
-        #[cfg(not(feature = "serial"))]
-        {
-            eprintln!(
-                "control commands over --serial {path} 需要以 `serial` feature 编译 \
-                 (cargo run -p rseq-cli --features serial -- ...)"
-            );
-            std::process::exit(2);
+        match endpoint {
+            Endpoint::Serial(path) => {
+                #[cfg(feature = "serial")]
+                {
+                    run_control_serial(path, cli.baud, cli.stop, cli.reset_mcu, cli.ping);
+                    return;
+                }
+                #[cfg(not(feature = "serial"))]
+                {
+                    eprintln!(
+                        "control commands over --serial {path} 需要以 `serial` feature 编译 \
+                         (cargo run -p rseq-cli --features serial -- ...)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            Endpoint::Tcp(addr) => {
+                run_control_tcp(addr, cli.stop, cli.reset_mcu, cli.ping);
+                return;
+            }
         }
     }
 
     if cli.watch {
-        let Some(path) = cli.serial.as_deref() else {
-            eprintln!("--watch requires --serial <port>");
+        let Some(endpoint) = cli.endpoint() else {
+            eprintln!("--watch requires --serial <port> or --tcp <host:port>");
             std::process::exit(2);
         };
 
-        #[cfg(feature = "serial")]
-        {
-            if watch_ignores_control_options(&cli) {
-                println!(
-                    "Watch mode: ignoring compile/execute control options and sending no control frames."
-                );
-            }
-            let report_decoders = load_watch_report_decoders(&cli);
-            let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
-                eprintln!("{err}");
-                std::process::exit(1);
-            });
-            run_watch(path, cli.baud, report_decoders, &mut save, cli.stats_every);
-            return;
-        }
-        #[cfg(not(feature = "serial"))]
-        {
-            eprintln!(
-                "--watch --serial {path} 需要以 `serial` feature 编译 \
-                 (cargo run -p rseq-cli --features serial -- ... --watch --serial ...)"
+        if watch_ignores_control_options(&cli) {
+            println!(
+                "Watch mode: ignoring compile/execute control options and sending no control frames."
             );
-            std::process::exit(2);
+        }
+        let report_decoders = load_watch_report_decoders(&cli);
+        let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
+        match endpoint {
+            Endpoint::Serial(path) => {
+                #[cfg(feature = "serial")]
+                {
+                    run_watch_serial(path, cli.baud, report_decoders, &mut save, cli.stats_every);
+                    return;
+                }
+                #[cfg(not(feature = "serial"))]
+                {
+                    eprintln!(
+                        "--watch --serial {path} 需要以 `serial` feature 编译 \
+                         (cargo run -p rseq-cli --features serial -- ... --watch --serial ...)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            Endpoint::Tcp(addr) => {
+                run_watch_tcp(addr, report_decoders, &mut save, cli.stats_every);
+                return;
+            }
         }
     }
 
@@ -518,30 +562,44 @@ fn main() {
             println!("\nUse --execute to run in MockBus");
         }
 
-        if let Some(path) = &cli.serial {
-            #[cfg(feature = "serial")]
-            {
-                let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
-                    eprintln!("{err}");
-                    std::process::exit(1);
-                });
-                run_over_serial(
-                    path,
-                    cli.baud,
-                    &bytecode,
-                    &irq_bytecodes,
-                    report_decoders,
-                    &mut save,
-                    cli.stats_every,
-                );
-            }
-            #[cfg(not(feature = "serial"))]
-            {
-                eprintln!(
-                    "--serial {path} 需要以 `serial` feature 编译 \
-                     (cargo run -p rseq-cli --features serial -- ... --serial ...)"
-                );
-                std::process::exit(2);
+        if let Some(endpoint) = cli.endpoint() {
+            let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
+                eprintln!("{err}");
+                std::process::exit(1);
+            });
+            match endpoint {
+                Endpoint::Serial(path) => {
+                    #[cfg(feature = "serial")]
+                    {
+                        run_over_serial(
+                            path,
+                            cli.baud,
+                            &bytecode,
+                            &irq_bytecodes,
+                            report_decoders,
+                            &mut save,
+                            cli.stats_every,
+                        );
+                    }
+                    #[cfg(not(feature = "serial"))]
+                    {
+                        eprintln!(
+                            "--serial {path} 需要以 `serial` feature 编译 \
+                             (cargo run -p rseq-cli --features serial -- ... --serial ...)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                Endpoint::Tcp(addr) => {
+                    run_over_tcp(
+                        addr,
+                        &bytecode,
+                        &irq_bytecodes,
+                        report_decoders,
+                        &mut save,
+                        cli.stats_every,
+                    );
+                }
             }
         }
     }
@@ -558,10 +616,6 @@ fn run_over_serial(
     save: &mut SaveSink,
     stats_every: u64,
 ) {
-    use rseq::link::HostLink;
-    use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
-
-    println!("\nDispatching to MCU over serial ({path} @ {baud} baud)...");
     let transport = match rseq_link::SerialTransport::open(path, baud) {
         Ok(t) => t,
         Err(e) => {
@@ -569,6 +623,56 @@ fn run_over_serial(
             std::process::exit(1);
         }
     };
+    run_over_transport(
+        &Endpoint::Serial(path).label(baud),
+        transport,
+        bytecode,
+        irq_bytecodes,
+        report_decoders,
+        save,
+        stats_every,
+    );
+}
+
+fn run_over_tcp(
+    addr: &str,
+    bytecode: &[u8],
+    irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
+    let transport = match rseq_link::TcpTransport::connect(addr) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open tcp {addr} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    run_over_transport(
+        &Endpoint::Tcp(addr).label(0),
+        transport,
+        bytecode,
+        irq_bytecodes,
+        report_decoders,
+        save,
+        stats_every,
+    );
+}
+
+fn run_over_transport<T: rseq_link::Transport>(
+    label: &str,
+    transport: T,
+    bytecode: &[u8],
+    irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
+    use rseq::link::HostLink;
+    use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
+
+    println!("\nDispatching to MCU over {label}...");
     let mut host = HostLink::new(transport);
     host.set_exec_timeout(std::time::Duration::from_secs(30));
 
@@ -602,16 +706,61 @@ fn run_over_serial(
 }
 
 #[cfg(feature = "serial")]
-fn run_watch(
+fn run_watch_serial(
     path: &str,
     baud: u32,
     report_decoders: ReportDecoderRegistry,
     save: &mut SaveSink,
     stats_every: u64,
 ) {
+    let transport = match rseq_link::SerialTransport::open_observing(path, baud) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open serial {path} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    run_watch_transport(
+        &Endpoint::Serial(path).label(baud),
+        transport,
+        report_decoders,
+        save,
+        stats_every,
+    );
+}
+
+fn run_watch_tcp(
+    addr: &str,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
+    let transport = match rseq_link::TcpTransport::connect_observing(addr) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open tcp {addr} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    run_watch_transport(
+        &Endpoint::Tcp(addr).label(0),
+        transport,
+        report_decoders,
+        save,
+        stats_every,
+    );
+}
+
+fn run_watch_transport<T: rseq_link::Transport>(
+    label: &str,
+    transport: T,
+    report_decoders: ReportDecoderRegistry,
+    save: &mut SaveSink,
+    stats_every: u64,
+) {
     use rseq::link::HostLink;
 
-    println!("\nWatching MCU reports over serial ({path} @ {baud} baud)...");
+    println!("\nWatching MCU reports over {label}...");
     if !report_decoders.is_empty() {
         println!(
             "Loaded {} report decoder(s) from local DSL metadata.",
@@ -620,22 +769,12 @@ fn run_watch(
     }
     println!("No LOAD/EXEC/PING frames will be sent. Press Ctrl-C to stop.");
 
-    let transport = match rseq_link::SerialTransport::open_observing(path, baud) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("open serial {path} failed: {e}");
-            std::process::exit(1);
-        }
-    };
     let mut host = HostLink::new(transport);
     observe_reports_forever(&mut host, &report_decoders, save, stats_every);
 }
 
 #[cfg(feature = "serial")]
-fn run_control(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
-    use rseq::link::HostLink;
-
-    println!("\nSending control frame(s) over serial ({path} @ {baud} baud)...");
+fn run_control_serial(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
     let transport = match rseq_link::SerialTransport::open(path, baud) {
         Ok(t) => t,
         Err(e) => {
@@ -643,6 +782,42 @@ fn run_control(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
             std::process::exit(1);
         }
     };
+    run_control_transport(
+        &Endpoint::Serial(path).label(baud),
+        transport,
+        stop,
+        reset_mcu,
+        ping,
+    );
+}
+
+fn run_control_tcp(addr: &str, stop: bool, reset_mcu: bool, ping: bool) {
+    let transport = match rseq_link::TcpTransport::connect(addr) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("open tcp {addr} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    run_control_transport(
+        &Endpoint::Tcp(addr).label(0),
+        transport,
+        stop,
+        reset_mcu,
+        ping,
+    );
+}
+
+fn run_control_transport<T: rseq_link::Transport>(
+    label: &str,
+    transport: T,
+    stop: bool,
+    reset_mcu: bool,
+    ping: bool,
+) {
+    use rseq::link::HostLink;
+
+    println!("\nSending control frame(s) over {label}...");
     let mut host = HostLink::new(transport);
 
     if ping {
@@ -668,7 +843,6 @@ fn run_control(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
     }
 }
 
-#[cfg(feature = "serial")]
 fn observe_reports_forever<T: rseq_link::Transport>(
     host: &mut rseq::link::HostLink<T>,
     report_decoders: &ReportDecoderRegistry,

@@ -3,7 +3,7 @@
 Register Sequence **传输层**:主机 ↔ MCU 之间的二进制帧协议与可移植的总线观测抽象。
 
 - **协议核心 `no_std`**:帧编解码、CRC32、Trace 载荷、`TracingBus`、`Transport`/`LinkTx` trait,不依赖堆分配,可直接用于 MCU。
-- **可选 `std`**:进程内回环管道 `MockTransport`(联调与单元测试)。
+- **可选 `std`**:进程内回环管道 `MockTransport`(联调与单元测试),以及 TCP 字节流 `TcpTransport`。
 - **可选 `serial`**:串口实现 `SerialTransport`(依赖 `serialport`)。
 
 > 主机侧高级驱动 `HostLink` 在 [`rseq`](../rseq) crate;进程内模拟 MCU `mcu_loop` 在 [`rseq-mcu-sim`](../rseq-mcu-sim) crate。本 crate 只负责"线缆约定 + 可移植原语",不包含业务编排。
@@ -209,14 +209,38 @@ use rseq_link::crc32::crc32;
 | feature | 启用 | 典型场景 |
 |---------|------|----------|
 | (默认,空) | no_std 核心(帧/CRC/Trace/TracingBus/Trait) | MCU |
-| `std` | + `MockTransport` + `LinkError: std::error::Error` | 主机 / 仿真 / 测试 |
+| `std` | + `MockTransport` + `TcpTransport` + `LinkError: std::error::Error` | 主机 / 仿真 / TCP 转发 |
 | `serial` | + `SerialTransport`(依赖 `serialport`) | 主机串口下发 |
 
 ---
 
 ## 6. 用法
 
-### 6.1 主机端(经 `rseq::link::HostLink`)
+### 6.1 传输端
+
+本地串口:
+
+```bash
+cargo run -p rseq-cli -- --serial /dev/cu.usbmodem314201 --baud 115200 -f examples/qmi8660_fifo.rseq
+```
+
+远端 CDC/UART 透明转发为 TCP 时,远端机器负责真实串口参数,本机只连 TCP 字节流:
+
+```bash
+# 远端机器示例
+python3 skills/serial/scripts/serial_tcp_forward.py --serial /dev/ttyACM0 --baud 115200 --listen 0.0.0.0:5657
+
+# 或使用 socat
+socat -d -d TCP-LISTEN:5657,reuseaddr,fork FILE:/dev/ttyACM0,raw,b115200,cs8,-parenb,-cstopb
+
+# 本机
+cargo run -p rseq-cli -- --tcp 10.2.8.42:5657 -f examples/qmi8660_fifo.rseq
+cargo run -p rseq-cli -- --watch --tcp 10.2.8.42:5657 -f examples/qmi8660_fifo.rseq
+```
+
+TCP 只是透明字节流,帧协议仍然是本 crate 定义的 rseq-link 协议。
+
+### 6.2 主机端(经 `rseq::link::HostLink`)
 
 `HostLink` 封装了第 3 节的锁步时序,见 [`rseq`](../rseq) crate:
 
@@ -230,7 +254,7 @@ host.ping()?;                     // → Pong
 host.stop_reports()?;             // → Ack, clear background report stream
 ```
 
-### 6.2 MCU 端(经 `rseq-mcu-sim::mcu_loop`)
+### 6.3 MCU 端(经 `rseq-mcu-sim::mcu_loop`)
 
 参考实现见 [`rseq-mcu-sim`](../rseq-mcu-sim);核心就是把 `Bus` 包进 `TracingBus` 跑 `Vm`:
 

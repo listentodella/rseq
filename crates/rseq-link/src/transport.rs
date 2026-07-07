@@ -3,6 +3,7 @@
 //! - [`Transport`] trait:主机驱动、回环仿真、真实 MCU UART 共同实现的最小接口。
 //! - [`MockTransport`]:进程内双工管道,用于测试与 `--self-test`(需 `std` feature)。
 //! - [`SerialTransport`]:串口实现(需 `serial` feature)。
+//! - [`TcpTransport`]:TCP 字节流实现(需 `std` feature)。
 
 use crate::error::LinkError;
 
@@ -29,6 +30,8 @@ impl<T: Transport + ?Sized> Transport for &mut T {
 // ── 进程内双工管道(std) ──────────────────────────────────────
 #[cfg(feature = "std")]
 pub use self::mock::MockTransport;
+#[cfg(feature = "std")]
+pub use self::tcp::TcpTransport;
 
 #[cfg(feature = "std")]
 mod mock {
@@ -75,6 +78,88 @@ mod mock {
             let mut q = self.tx.lock().unwrap();
             q.extend(data);
             Ok(())
+        }
+    }
+}
+
+// ── TCP 字节流实现(std) ─────────────────────────────────────
+#[cfg(feature = "std")]
+mod tcp {
+    use super::{LinkError, Transport};
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    /// TCP 字节流传输实现。
+    ///
+    /// 适用于远端机器把 USB CDC/UART 端口转成 TCP 字节流的场景。上层仍然使用
+    /// rseq-link 帧协议；TCP 端只负责透明转发字节。
+    pub struct TcpTransport {
+        stream: TcpStream,
+    }
+
+    impl TcpTransport {
+        /// 连接到 `host:port`，并设置短读超时，便于 `HostLink` 等待 Trace 时轮询截止时间。
+        pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, LinkError> {
+            let mut last_error = LinkError::Io;
+            let addrs = addr.to_socket_addrs().map_err(|_| LinkError::Io)?;
+            for socket_addr in addrs {
+                match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)) {
+                    Ok(stream) => return Self::from_stream(stream),
+                    Err(_) => last_error = LinkError::Io,
+                }
+            }
+            Err(last_error)
+        }
+
+        /// 连接用于只观察已运行 MCU 的上报流。
+        ///
+        /// TCP 没有本地串口缓冲可清，因此与 [`Self::connect`] 等价。
+        pub fn connect_observing<A: ToSocketAddrs>(addr: A) -> Result<Self, LinkError> {
+            Self::connect(addr)
+        }
+
+        /// 从已经建立的 `TcpStream` 构造传输，主要供测试或自定义连接器使用。
+        pub fn from_stream(stream: TcpStream) -> Result<Self, LinkError> {
+            stream.set_nodelay(true).map_err(|_| LinkError::Io)?;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .map_err(|_| LinkError::Io)?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .map_err(|_| LinkError::Io)?;
+            Ok(Self { stream })
+        }
+    }
+
+    impl Transport for TcpTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, LinkError> {
+            match self.stream.read(buf) {
+                Ok(0) => Err(LinkError::Closed),
+                Ok(n) => Ok(n),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    Ok(0)
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    Err(LinkError::Closed)
+                }
+                Err(_) => Err(LinkError::Io),
+            }
+        }
+
+        fn write(&mut self, data: &[u8]) -> Result<(), LinkError> {
+            self.stream.write_all(data).map_err(|err| match err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof => LinkError::Closed,
+                _ => LinkError::Io,
+            })
         }
     }
 }

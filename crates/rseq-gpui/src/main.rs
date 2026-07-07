@@ -760,8 +760,11 @@ struct Cli {
     #[arg(long)]
     chip: Vec<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tcp")]
     serial: Option<String>,
+
+    #[arg(long, conflicts_with = "serial")]
+    tcp: Option<String>,
 
     #[arg(long, default_value_t = rseq_host::DEFAULT_BAUD)]
     baud: u32,
@@ -902,7 +905,7 @@ impl LinkMode {
     }
 
     fn can_connect(self) -> bool {
-        matches!(self, Self::Demo | Self::Serial)
+        matches!(self, Self::Demo | Self::Serial | Self::Tcp)
     }
 
     fn tooltip(self) -> &'static str {
@@ -911,7 +914,7 @@ impl LinkMode {
             Self::Serial => {
                 "Use an MCU over USB CDC or USB-UART with the rseq-link frame protocol."
             }
-            Self::Tcp => "Reserved for a future TCP byte-stream transport.",
+            Self::Tcp => "Use a remote CDC/UART endpoint forwarded as a TCP byte stream.",
             Self::Ble => "Reserved for a future BLE transport.",
             Self::WebSocket => "Reserved for a future WebSocket transport.",
             Self::Custom => "Reserved for project-specific transports.",
@@ -1183,6 +1186,7 @@ pub struct RseqGpui {
     active_visual_sequence: usize,
     serial_port_input: Entity<InputState>,
     serial_baud_input: Entity<InputState>,
+    tcp_addr_input: Entity<InputState>,
     serial_ports: Vec<rseq_host::SerialPortInfo>,
     skip_samples_input: Entity<InputState>,
     rseq_path_input: Entity<InputState>,
@@ -1229,11 +1233,14 @@ impl RseqGpui {
     ) -> Self {
         let link_mode = if cli.demo {
             LinkMode::Demo
+        } else if cli.tcp.is_some() {
+            LinkMode::Tcp
         } else {
             LinkMode::Serial
         };
         let serial_port_value = cli.serial.clone().unwrap_or_default();
         let serial_baud_value = cli.baud.to_string();
+        let tcp_addr_value = cli.tcp.clone().unwrap_or_default();
         let serial_ports = rseq_host::available_serial_ports();
         let auto_serial_port = (serial_port_value.is_empty() && serial_ports.len() == 1)
             .then(|| serial_ports[0].port_name.clone());
@@ -1250,6 +1257,11 @@ impl RseqGpui {
             InputState::new(window, cx)
                 .placeholder("115200")
                 .default_value(serial_baud_value)
+        });
+        let tcp_addr_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("10.2.8.42:5657")
+                .default_value(tcp_addr_value)
         });
         let skip_samples_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1352,6 +1364,7 @@ impl RseqGpui {
             active_visual_sequence: 0,
             serial_port_input,
             serial_baud_input,
+            tcp_addr_input,
             serial_ports,
             skip_samples_input,
             rseq_path_input,
@@ -1387,7 +1400,7 @@ impl RseqGpui {
             _tick,
         };
 
-        if app.cli.demo || app.cli.serial.is_some() {
+        if app.cli.demo || app.cli.serial.is_some() || app.cli.tcp.is_some() {
             app.start_session(app.default_watch_mode());
         }
 
@@ -1407,13 +1420,27 @@ impl RseqGpui {
             LinkMode::Demo => {
                 self.cli.demo = true;
                 self.cli.serial = None;
+                self.cli.tcp = None;
                 true
             }
             LinkMode::Serial => match self.resolve_serial_config(cx) {
                 Ok((port, baud)) => {
                     self.cli.demo = false;
                     self.cli.serial = Some(port);
+                    self.cli.tcp = None;
                     self.cli.baud = baud;
+                    true
+                }
+                Err(reason) => {
+                    push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                    false
+                }
+            },
+            LinkMode::Tcp => match self.resolve_tcp_config(cx) {
+                Ok(addr) => {
+                    self.cli.demo = false;
+                    self.cli.serial = None;
+                    self.cli.tcp = Some(addr);
                     true
                 }
                 Err(reason) => {
@@ -1453,6 +1480,17 @@ impl RseqGpui {
 
         let baud = parse_serial_baud(&self.serial_baud_input.read(cx).value())?;
         Ok((port, baud))
+    }
+
+    fn resolve_tcp_config(&self, cx: &Context<Self>) -> Result<String, String> {
+        let addr = self.tcp_addr_input.read(cx).value().trim().to_string();
+        if addr.is_empty() {
+            return Err("tcp endpoint is required, for example 10.2.8.42:5657".to_string());
+        }
+        if !addr.contains(':') {
+            return Err("tcp endpoint must include host:port".to_string());
+        }
+        Ok(addr)
     }
 
     fn rseq_files_from_input(&self, cx: &Context<Self>) -> Vec<PathBuf> {
@@ -2226,6 +2264,7 @@ impl RseqGpui {
         self.reset_stream_state(true);
         let demo = self.link_mode == LinkMode::Demo || self.cli.demo;
         let serial = if demo { None } else { self.cli.serial.clone() };
+        let tcp = if demo { None } else { self.cli.tcp.clone() };
         self.connected = false;
         self.session_mode = if watch {
             "watch".to_string()
@@ -2234,6 +2273,8 @@ impl RseqGpui {
         };
         self.connection_label = if demo {
             "demo".to_string()
+        } else if let Some(addr) = tcp.as_deref() {
+            addr.to_string()
         } else {
             format!(
                 "{} @ {}",
@@ -2253,6 +2294,7 @@ impl RseqGpui {
 
         let config = SessionConfig {
             serial,
+            tcp,
             baud: self.cli.baud,
             watch,
             demo,
@@ -3199,6 +3241,18 @@ impl RseqGpui {
                 .child(self.render_serial_port_dropdown(locked, cx))
                 .child(self.render_endpoint_input("Baud", &self.serial_baud_input, 82., locked, cx))
                 .child(self.render_serial_baud_dropdown(locked, cx))
+                .into_any_element(),
+            LinkMode::Tcp => h_flex()
+                .gap_1()
+                .items_center()
+                .flex_wrap()
+                .child(self.render_endpoint_input(
+                    "Host:Port",
+                    &self.tcp_addr_input,
+                    180.,
+                    locked,
+                    cx,
+                ))
                 .into_any_element(),
             mode => h_flex()
                 .h_5()

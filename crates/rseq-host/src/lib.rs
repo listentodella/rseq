@@ -1602,6 +1602,7 @@ pub enum SessionEvent {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub serial: Option<String>,
+    pub tcp: Option<String>,
     pub baud: u32,
     pub watch: bool,
     pub demo: bool,
@@ -1613,6 +1614,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             serial: None,
+            tcp: None,
             baud: DEFAULT_BAUD,
             watch: false,
             demo: true,
@@ -1646,10 +1648,23 @@ pub fn spawn_session(config: SessionConfig) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
 
-    if config.demo || config.serial.is_none() {
-        spawn_demo_session(event_tx, cmd_rx, stop.clone());
-    } else {
-        spawn_serial_session(config, event_tx, cmd_rx, stop.clone());
+    match (config.demo, config.serial.is_some(), config.tcp.is_some()) {
+        (true, _, _) | (false, false, false) => {
+            spawn_demo_session(event_tx, cmd_rx, stop.clone());
+        }
+        (false, true, true) => {
+            spawn_error_session(
+                "select only one endpoint: serial or tcp".to_string(),
+                event_tx,
+                stop.clone(),
+            );
+        }
+        (false, true, false) => {
+            spawn_serial_session(config, event_tx, cmd_rx, stop.clone());
+        }
+        (false, false, true) => {
+            spawn_tcp_session(config, event_tx, cmd_rx, stop.clone());
+        }
     }
 
     SessionHandle {
@@ -1713,6 +1728,14 @@ fn serial_port_detail(port: &rseq_link::SerialPortInfo) -> String {
         parts.push(format!("sn={serial}"));
     }
     parts.join(" ")
+}
+
+fn spawn_error_session(message: String, tx: Sender<SessionEvent>, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let _ = tx.send(SessionEvent::Error(message));
+        stop.store(true, Ordering::Relaxed);
+        let _ = tx.send(SessionEvent::Disconnected);
+    });
 }
 
 fn spawn_demo_session(
@@ -1864,39 +1887,59 @@ fn spawn_serial_session(
                 return;
             }
         };
-        let mut host = rseq::link::HostLink::new(transport);
-        let mut processor = ReportProcessor::new(config.report_decoders);
+        run_link_session(
+            label,
+            transport,
+            startup_program,
+            config.report_decoders,
+            tx,
+            cmd_rx,
+            stop,
+        );
+    });
+}
 
-        if let Some(program) = startup_program {
-            if !load_and_exec_serial_program(&mut host, &program, &mut processor, &tx) {
+fn spawn_tcp_session(
+    config: SessionConfig,
+    tx: Sender<SessionEvent>,
+    cmd_rx: Receiver<SessionCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let addr = config.tcp.expect("tcp checked by caller");
+        let startup_program = if config.watch {
+            None
+        } else {
+            config.startup_program
+        };
+        let mode = if startup_program.is_some() {
+            "load+exec"
+        } else {
+            "watch"
+        };
+        let label = format!("{addr} ({mode})");
+        let _ = tx.send(SessionEvent::Log(format!("opening tcp {label}")));
+        let transport = if startup_program.is_some() {
+            rseq_link::TcpTransport::connect(addr.as_str())
+        } else {
+            rseq_link::TcpTransport::connect_observing(addr.as_str())
+        };
+        let transport = match transport {
+            Ok(transport) => transport,
+            Err(err) => {
+                let _ = tx.send(SessionEvent::Error(format!("open tcp failed: {err}")));
                 return;
             }
-        } else {
-            let _ = tx.send(SessionEvent::Log(
-                "watch mode: no LOAD/EXEC frames will be sent".to_string(),
-            ));
-        }
-
-        let _ = tx.send(SessionEvent::Connected { label });
-        while !stop.load(Ordering::Relaxed) {
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                if matches!(cmd, SessionCommand::Shutdown) {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                handle_source_command(cmd, &mut host, &mut processor, &tx);
-            }
-
-            match host.observe_next_trace(Duration::from_millis(20)) {
-                Ok(Some(op)) => send_processed_events(processor.handle_bus_op(op), &tx),
-                Ok(None) => {}
-                Err(err) => {
-                    let _ = tx.send(SessionEvent::Error(format!("observe failed: {err}")));
-                    thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-        let _ = tx.send(SessionEvent::Disconnected);
+        };
+        run_link_session(
+            label,
+            transport,
+            startup_program,
+            config.report_decoders,
+            tx,
+            cmd_rx,
+            stop,
+        );
     });
 }
 
@@ -1913,9 +1956,52 @@ fn spawn_serial_session(
     )));
 }
 
-#[cfg(feature = "serial")]
-fn load_and_exec_serial_program(
-    host: &mut rseq::link::HostLink<rseq_link::SerialTransport>,
+fn run_link_session<T: rseq_link::Transport>(
+    label: String,
+    transport: T,
+    startup_program: Option<CompiledProgram>,
+    report_decoders: ReportDecoderRegistry,
+    tx: Sender<SessionEvent>,
+    cmd_rx: Receiver<SessionCommand>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut host = rseq::link::HostLink::new(transport);
+    let mut processor = ReportProcessor::new(report_decoders);
+
+    if let Some(program) = startup_program {
+        if !load_and_exec_program(&mut host, &program, &mut processor, &tx) {
+            return;
+        }
+    } else {
+        let _ = tx.send(SessionEvent::Log(
+            "watch mode: no LOAD/EXEC frames will be sent".to_string(),
+        ));
+    }
+
+    let _ = tx.send(SessionEvent::Connected { label });
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, SessionCommand::Shutdown) {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            handle_source_command(cmd, &mut host, &mut processor, &tx);
+        }
+
+        match host.observe_next_trace(Duration::from_millis(20)) {
+            Ok(Some(op)) => send_processed_events(processor.handle_bus_op(op), &tx),
+            Ok(None) => {}
+            Err(err) => {
+                let _ = tx.send(SessionEvent::Error(format!("observe failed: {err}")));
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    let _ = tx.send(SessionEvent::Disconnected);
+}
+
+fn load_and_exec_program<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
     program: &CompiledProgram,
     processor: &mut ReportProcessor,
     tx: &Sender<SessionEvent>,
@@ -1964,10 +2050,9 @@ fn load_and_exec_serial_program(
     }
 }
 
-#[cfg(feature = "serial")]
-fn handle_source_command(
+fn handle_source_command<T: rseq_link::Transport>(
     cmd: SessionCommand,
-    host: &mut rseq::link::HostLink<rseq_link::SerialTransport>,
+    host: &mut rseq::link::HostLink<T>,
     processor: &mut ReportProcessor,
     tx: &Sender<SessionEvent>,
 ) {

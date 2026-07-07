@@ -26,6 +26,19 @@ cargo run -p rseq-gpui --features serial -- \
   -f examples/qmi8660_fifo.rseq
 ```
 
+Use a CDC/UART port forwarded by a remote machine as a TCP byte stream:
+
+```bash
+# remote machine attached to the board
+python3 skills/serial/scripts/serial_tcp_forward.py --serial /dev/ttyACM0 --baud 115200 --listen 0.0.0.0:5657
+
+# local workstation
+cargo run -p rseq-gpui -- \
+  --tcp 10.2.8.42:5657 \
+  --chip qmi8660.yaml \
+  -f examples/qmi8660_fifo.rseq
+```
+
 Multiple `-f/--file` arguments are accepted. They are parsed as separate source
 units, keep their own relative `chip!(...)` base directories and diagnostics, and
 are compiled into one LOAD/EXEC program in the order supplied.

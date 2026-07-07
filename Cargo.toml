@@ -4,8 +4,10 @@ members = [
     "crates/rseq-vm",
     "crates/rseq-link",
     "crates/rseq",
+    "crates/rseq-host",
     "crates/rseq-cli",
     "crates/rseq-tui",
+    "crates/rseq-gpui",
     "crates/rseq-mcu-sim",
 ]
 resolver = "2"
@@ -25,3 +27,4 @@ repository = "https://github.com/listentodella/rseq"
 rseq-vm = { path = "crates/rseq-vm" }
 rseq-link = { path = "crates/rseq-link" }
 rseq = { path = "crates/rseq" }
+rseq-host = { path = "crates/rseq-host" }

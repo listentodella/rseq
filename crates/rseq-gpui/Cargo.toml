@@ -1,0 +1,33 @@
+[package]
+name = "rseq-gpui"
+description = "GPUI workstation for Register Sequence reports and register control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "rseq-gpui"
+path = "src/main.rs"
+
+[features]
+default = ["serial"]
+serial = ["rseq-host/serial", "rseq-link/serial"]
+
+[dependencies]
+rseq = { workspace = true }
+rseq-host = { workspace = true }
+rseq-link = { workspace = true, features = ["std"] }
+clap = { version = "4.6.1", features = ["derive"] }
+smol = "2"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+gpui-component = { path = "/Volumes/tp7100s/work/gpui/gpui-component/crates/ui" }
+gpui-component-assets = { path = "/Volumes/tp7100s/work/gpui/gpui-component/crates/assets" }

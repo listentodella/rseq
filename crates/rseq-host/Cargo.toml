@@ -1,0 +1,20 @@
+[package]
+name = "rseq-host"
+description = "Shared host-side runtime helpers for Register Sequence tooling"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["serial"]
+serial = ["rseq-link/serial"]
+
+[dependencies]
+rseq = { workspace = true }
+rseq-link = { workspace = true, features = ["std"] }
+rseq-vm = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+rseq-mcu-sim = { path = "../rseq-mcu-sim" }

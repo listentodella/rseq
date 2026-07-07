@@ -12,8 +12,8 @@ crate-type = ["staticlib"]
 [dependencies]
 zephyr = "0.1.0"
 log = "0.4.22"
-rseq-vm = { path = "/Volumes/tp7100s/work/rseq/crates/rseq-vm", default-features = false }
-rseq-link = { path = "/Volumes/tp7100s/work/rseq/crates/rseq-link" }
+rseq-vm = { path = "../../crates/rseq-vm", default-features = false }
+rseq-link = { path = "../../crates/rseq-link" }
 
 [profile.dev]
 opt-level = 1

@@ -2,6 +2,10 @@
 
 这是一个专注于描述i2c/spi等总线或寄存器读写的DSL仓库, 旨在提供一个简洁、易读的语法来描述和编写总线或寄存器相关的代码, 方便快速迭代与调试.  
 
+跨平台构建说明见 [BUILD.md](BUILD.md)。默认 Cargo 配置不依赖本机绝对
+路径；需要调试本地 `gpui-component` 时可使用 `.cargo/gpui-local.example.toml`
+生成自己的 `.cargo/config.toml` 覆盖。
+
 ## 多段序列与 manifest
 
 可以把一个设备的多个功能段拆到多个 `.rseq` 文件中, 再用 TOML manifest 组合运行:

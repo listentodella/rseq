@@ -36,6 +36,22 @@ Run without hardware:
 cargo run -p rseq-gpui -- --demo --chip qmi8660.yaml
 ```
 
+## Platform Notes
+
+The GPUI dependencies are public git dependencies, not machine-local path
+dependencies. On Windows 11, build from a Developer PowerShell with Visual
+Studio Build Tools and the Windows SDK installed:
+
+```powershell
+cargo check -p rseq-gpui --features serial
+```
+
+On Linux, install the X11/Wayland development packages required by GPUI before
+building. See the repository-level `BUILD.md` for platform setup and optional
+local `gpui-component` override instructions. The override is also the escape
+hatch for testing component patches before they are available from the pinned
+public commit.
+
 ## UI
 
 - Motion: live accelerometer (`m/s^2`) and gyroscope (`rad/s`) charts.

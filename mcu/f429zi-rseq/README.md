@@ -77,19 +77,21 @@ bus/address overlay: the script chooses `bus!(spi)`, `bus!(i2c, addr)`, or
 `bus_probe!(...)` at runtime.
 
 ```sh
-export ZEPHYR_BASE=/Volumes/tp7100s/work/zephyr/zephyrproject/zephyr
-export ZEPHYR_SDK_INSTALL_DIR=/Volumes/tp7100s/work/zephyr/zephyr-sdk-1.0.1
+export RSEQ_ROOT=/path/to/rseq
+export ZEPHYR_PROJECT=/path/to/zephyrproject
+export ZEPHYR_BASE=$ZEPHYR_PROJECT/zephyr
+export ZEPHYR_SDK_INSTALL_DIR=/path/to/zephyr-sdk
 export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
-source /Volumes/tp7100s/work/zephyr/zephyrproject/.venv/bin/activate
-cd /Volumes/tp7100s/work/zephyr/zephyrproject
+source $ZEPHYR_PROJECT/.venv/bin/activate
+cd $ZEPHYR_PROJECT
 ```
 
 F429ZI:
 
 ```sh
 west build -b nucleo_f429zi \
-  -s /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq \
-  -d /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq/build-f429zi \
+  -s $RSEQ_ROOT/mcu/f429zi-rseq \
+  -d $RSEQ_ROOT/mcu/f429zi-rseq/build-f429zi \
   --pristine
 ```
 
@@ -97,8 +99,8 @@ F401RE:
 
 ```sh
 west build -b nucleo_f401re \
-  -s /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq \
-  -d /Volumes/tp7100s/work/rseq/mcu/f429zi-rseq/build-f401re \
+  -s $RSEQ_ROOT/mcu/f429zi-rseq \
+  -d $RSEQ_ROOT/mcu/f429zi-rseq/build-f401re \
   --pristine
 ```
 

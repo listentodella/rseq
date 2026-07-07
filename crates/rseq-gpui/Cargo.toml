@@ -30,9 +30,15 @@ smol = "2"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
-    "x11",
-    "wayland",
     "runtime_shaders",
 ] }
-gpui-component = { path = "/Volumes/tp7100s/work/gpui/gpui-component/crates/ui" }
-gpui-component-assets = { path = "/Volumes/tp7100s/work/gpui/gpui-component/crates/assets" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "c9506e84109fb6cef4054d33766cdab5f75c04b6" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "c9506e84109fb6cef4054d33766cdab5f75c04b6" }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "runtime_shaders",
+    "x11",
+    "wayland",
+] }

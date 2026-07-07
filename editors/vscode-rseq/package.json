@@ -1,0 +1,93 @@
+{
+  "name": "rseq-vscode",
+  "displayName": "rseq",
+  "description": "Language support for Register Sequence DSL files.",
+  "version": "0.1.0",
+  "publisher": "rseq",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:rseq"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "check": "node --check extension.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "rseq",
+        "aliases": [
+          "rseq",
+          "RSEQ",
+          "Register Sequence"
+        ],
+        "extensions": [
+          ".rseq"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rseq",
+        "scopeName": "source.rseq",
+        "path": "./syntaxes/rseq.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "rseq",
+        "path": "./snippets/rseq.json"
+      }
+    ],
+    "configuration": {
+      "title": "rseq",
+      "properties": {
+        "rseq.lsp.command": {
+          "type": "string",
+          "default": "auto",
+          "markdownDescription": "`auto` uses `cargo run -q -p rseq-lsp --` inside the rseq workspace, otherwise tries `rseq-lsp`. Set an explicit command to override."
+        },
+        "rseq.lsp.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments for `rseq.lsp.command` when the command is not `auto`."
+        },
+        "rseq.lsp.cwd": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Working directory for the rseq language server. Empty means the first workspace folder. Supports `${workspaceFolder}`."
+        },
+        "rseq.lsp.chips": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Chip YAML files passed to `rseq-lsp --chip`. Files referenced by `chip!(...)` are loaded automatically even when this is empty."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "rseq.restartLanguageServer",
+        "title": "rseq: Restart Language Server"
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "chip metadata": {
+    "prefix": "chip",
+    "body": ["chip!(\"${1:qmi8660.yaml}\");"],
+    "description": "Load chip YAML metadata."
+  },
+  "bus probe": {
+    "prefix": "bus_probe",
+    "body": [
+      "bus_probe!(${1:spi}, { read: ${2:UI.WHOAMI}, expect: ${3:0x06} });"
+    ],
+    "description": "Probe the active bus with DSL-provided chip knowledge."
+  },
+  "read register": {
+    "prefix": "read",
+    "body": ["let ${1:value} = read!(${2:UI.WHOAMI}, ${3:1}, ${4:50});"],
+    "description": "Read register bytes into a variable."
+  },
+  "write field": {
+    "prefix": "writef",
+    "body": ["write!(${1:UI.REG}, { ${2:field}: ${3:1} }, ${4:50});"],
+    "description": "Write a YAML-backed register field map."
+  },
+  "irq handler": {
+    "prefix": "irq",
+    "body": [
+      "irq!(${1:int1}) {",
+      "    on(${2:fifo_watermark}) {",
+      "        ${0}",
+      "    }",
+      "}"
+    ],
+    "description": "Declare an interrupt handler."
+  },
+  "fifo report format": {
+    "prefix": "fifo_format",
+    "body": [
+      "report_format!(FIFO_RAW, i16_le, {",
+      "    fields: [${1:gx, gy, gz, ax, ay, az}],",
+      "    gyro_fields: [${2:gx, gy, gz}],",
+      "    accel_fields: [${3:ax, ay, az}],",
+      "    accel_fs_g: ${4:16},",
+      "    gyro_fs_dps: ${5:4096},",
+      "    output: ${6:physical_f32},",
+      "});"
+    ],
+    "description": "Declare FIFO_RAW i16_le report metadata."
+  }
+}

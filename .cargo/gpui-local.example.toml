@@ -1,0 +1,10 @@
+# Optional developer-only override for working against a local gpui-component
+# checkout. Copy this file to `.cargo/config.toml` and adjust the relative path.
+#
+# The checked-in Cargo.toml intentionally uses a public git dependency so the
+# repository can build on macOS, Windows, and Linux without machine-local paths.
+
+[patch."https://github.com/longbridge/gpui-component.git"]
+gpui-component = { path = "../gpui/gpui-component/crates/ui" }
+gpui-component-assets = { path = "../gpui/gpui-component/crates/assets" }
+gpui-component-macros = { path = "../gpui/gpui-component/crates/macros" }

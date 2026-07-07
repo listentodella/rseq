@@ -1,0 +1,21 @@
+[package]
+name = "rseq-lsp"
+description = "Language Server Protocol support for Register Sequence DSL"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "rseq-lsp"
+path = "src/main.rs"
+
+[dependencies]
+rseq = { workspace = true }
+rseq-host = { path = "../rseq-host", default-features = false }
+clap = { version = "4.6.1", features = ["derive"] }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tower-lsp = "0.20"
+serde_json = "1"

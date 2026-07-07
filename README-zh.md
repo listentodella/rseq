@@ -111,9 +111,35 @@ cargo run --package rseq-mcu-sim --features serial -- --serial /dev/ttyUSB1 1152
 | `rseq` | 主机编译器 + 芯片字典 + `link::HostLink`(主机驱动) + `trace::BusOp` |
 | `rseq-link` | 帧编解码 / CRC32 / `TracingBus` / `Transport`, `no_std` 核心, 可选 `std`(回环管道) 与 `serial` |
 | `rseq-cli` | 命令行: 编译 / `--execute` 回放 / `--serial` 下发 |
+| `rseq-lsp` | `.rseq` 语言服务: 诊断 / 补全 / hover, 支持 chip YAML metadata |
 | `rseq-mcu-sim` | 进程内模拟 MCU(`mcu_loop` + `--self-test`), 供联调与集成测试 |
 
 真实 MCU 移植时, 把 `rseq-link` 的 `SimBus` 换成 HAL 的 `Bus` 实现、`Transport` 换成 UART, `mcu_loop` 的协议逻辑无需改动.
+
+## LSP 编辑器提示
+
+`rseq-lsp` 提供标准 LSP stdio server, 可在编辑 `.rseq` 时获得语法诊断、
+内置宏补全、寄存器/字段/中断事件补全以及 hover 文档:
+
+```bash
+cargo run -p rseq-lsp -- --chip qmi8660.yaml
+```
+
+如果 `.rseq` 文件里已经写了 `chip!("qmi8660.yaml");`, LSP 会自动加载该
+YAML；`--chip` 适合让没有显式 `chip!` 的片段也能获得补全。更多接入示例见
+`crates/rseq-lsp/README.md`。
+
+VS Code 自动启动和语法高亮由 `editors/vscode-rseq` extension 提供。安装或
+用 Extension Development Host 运行该 extension 后，打开 `*.rseq` 文件会自动
+激活 `rseq` 语言、加载 TextMate 高亮并启动 `rseq-lsp`。
+
+```bash
+cd editors/vscode-rseq
+pnpm install
+```
+
+在当前仓库里 extension 的默认 `rseq.lsp.command = "auto"` 会启动
+`cargo run -q -p rseq-lsp --`；在外部工程中会尝试运行 PATH 里的 `rseq-lsp`。
 
 ## 中断命令
 

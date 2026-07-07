@@ -1,9 +1,13 @@
 mod plot;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use anyhow::Result as AnyhowResult;
 use clap::Parser;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -12,7 +16,10 @@ use gpui_component::{
     Sizable as _, StyledExt as _, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants as _, DropdownButton},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{
+        CompletionProvider, DocumentRangeSemanticTokensProvider, HoverProvider, Input, InputEvent,
+        InputState,
+    },
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
@@ -32,6 +39,7 @@ use rseq_host::{
 };
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 const UI_TICK: Duration = Duration::from_millis(33);
 const MAX_SAMPLES: usize = 600;
@@ -52,6 +60,572 @@ const DEFAULT_RSEQ_SOURCE: &str = r#"// New rseq script.
 
 print!("rseq sequence start");
 "#;
+
+#[derive(Clone)]
+struct RseqEditorLanguageProvider {
+    root_dir: Option<PathBuf>,
+    chips: Rc<RefCell<Vec<PathBuf>>>,
+}
+
+impl RseqEditorLanguageProvider {
+    fn new(root_dir: Option<PathBuf>, chips: Rc<RefCell<Vec<PathBuf>>>) -> Self {
+        Self { root_dir, chips }
+    }
+
+    fn analysis(&self, source: &str) -> rseq_lsp::DocumentAnalysis {
+        let chips = self.chips.borrow().clone();
+        rseq_lsp::analyze_document(
+            source,
+            self.root_dir.as_deref(),
+            self.root_dir.as_deref(),
+            &chips,
+        )
+    }
+
+    fn completion_items(&self, source: &str, offset: usize) -> Vec<lsp_types::CompletionItem> {
+        let analysis = self.analysis(source);
+        rseq_lsp::completion_items_at_offset(source, offset, &analysis.facts)
+            .into_iter()
+            .filter_map(convert_rseq_lsp_type)
+            .map(rseq_gpui_completion_item)
+            .collect()
+    }
+
+    fn hover(&self, source: &str, offset: usize) -> Option<lsp_types::Hover> {
+        let analysis = self.analysis(source);
+        rseq_lsp::hover_at_offset(source, offset, &analysis.facts).and_then(convert_rseq_lsp_type)
+    }
+}
+
+fn convert_rseq_lsp_type<T, U>(value: T) -> Option<U>
+where
+    T: Serialize,
+    U: DeserializeOwned,
+{
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+impl CompletionProvider for RseqEditorLanguageProvider {
+    fn completions(
+        &self,
+        text: &gpui_component::Rope,
+        offset: usize,
+        _trigger: lsp_types::CompletionContext,
+        _window: &mut Window,
+        _cx: &mut Context<InputState>,
+    ) -> Task<AnyhowResult<lsp_types::CompletionResponse>> {
+        let source = text.to_string();
+        let items = if rseq_should_offer_completion(&source, offset) {
+            self.completion_items(&source, offset)
+        } else {
+            Vec::new()
+        };
+        Task::ready(Ok(lsp_types::CompletionResponse::Array(items)))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _offset: usize,
+        new_text: &str,
+        _cx: &mut Context<InputState>,
+    ) -> bool {
+        new_text.is_empty()
+            || new_text.chars().any(|ch| {
+                ch.is_ascii_alphanumeric()
+                    || matches!(
+                        ch,
+                        '_' | '.'
+                            | '!'
+                            | '('
+                            | '{'
+                            | ','
+                            | ';'
+                            | ')'
+                            | ']'
+                            | '}'
+                            | '\n'
+                            | '\r'
+                            | ' '
+                            | '\t'
+                    )
+            })
+    }
+}
+
+fn rseq_gpui_completion_item(mut item: lsp_types::CompletionItem) -> lsp_types::CompletionItem {
+    let label = item.label.clone();
+    if let Some(text_edit) = item.text_edit.as_mut() {
+        match text_edit {
+            lsp_types::CompletionTextEdit::Edit(edit) => edit.new_text = label.clone(),
+            lsp_types::CompletionTextEdit::InsertAndReplace(edit) => edit.new_text = label.clone(),
+        }
+    } else {
+        item.insert_text = Some(label.clone());
+    }
+    item.insert_text_format = Some(lsp_types::InsertTextFormat::PLAIN_TEXT);
+    item
+}
+
+fn rseq_should_offer_completion(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let token = rseq_completion_prefix_before(source, offset);
+    if !token.is_empty() {
+        return true;
+    }
+
+    let Some(previous) = rseq_previous_non_whitespace_char(source, offset) else {
+        return false;
+    };
+    matches!(previous, '(' | '{' | '[' | ',' | ':' | '.')
+}
+
+fn rseq_completion_prefix_before(source: &str, offset: usize) -> &str {
+    let mut start = offset.min(source.len());
+    while start > 0 {
+        let Some((idx, ch)) = source[..start].char_indices().next_back() else {
+            break;
+        };
+        if rseq_is_ident_continue(ch) {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+    &source[start..offset.min(source.len())]
+}
+
+fn rseq_previous_non_whitespace_char(source: &str, offset: usize) -> Option<char> {
+    source[..offset.min(source.len())]
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+}
+
+impl HoverProvider for RseqEditorLanguageProvider {
+    fn hover(
+        &self,
+        text: &gpui_component::Rope,
+        offset: usize,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<AnyhowResult<Option<lsp_types::Hover>>> {
+        let source = text.to_string();
+        Task::ready(Ok(self.hover(&source, offset)))
+    }
+}
+
+impl DocumentRangeSemanticTokensProvider for RseqEditorLanguageProvider {
+    fn legend(&self) -> lsp_types::SemanticTokensLegend {
+        lsp_types::SemanticTokensLegend {
+            token_types: RSEQ_SEMANTIC_TOKEN_TYPES
+                .iter()
+                .map(|name| lsp_types::SemanticTokenType::from((*name).to_string()))
+                .collect(),
+            token_modifiers: vec![],
+        }
+    }
+
+    fn semantic_tokens(
+        &self,
+        text: &gpui_component::Rope,
+        range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<AnyhowResult<lsp_types::SemanticTokens>> {
+        let source = text.to_string();
+        let analysis = self.analysis(&source);
+        Task::ready(Ok(rseq_semantic_tokens(&source, range, &analysis.facts)))
+    }
+}
+
+const RSEQ_SEMANTIC_TOKEN_TYPES: &[&str] = &[
+    "comment",
+    "string",
+    "number",
+    "keyword",
+    "function",
+    "type",
+    "property",
+    "constant",
+    "variable",
+    "operator",
+    "punctuation",
+    "label",
+];
+
+const RSEQ_FUNCTIONS: &[&str] = &[
+    "chip!",
+    "bus!",
+    "bus_probe!",
+    "read!",
+    "write!",
+    "update!",
+    "irq!",
+    "wait!",
+    "repeat!",
+    "print!",
+    "report!",
+    "report_format!",
+];
+
+const RSEQ_KEYWORDS: &[&str] = &["let", "if", "else", "on"];
+const RSEQ_TYPES: &[&str] = &[
+    "spi",
+    "i2c",
+    "i3c",
+    "i16_le",
+    "qmi8660_fifo6",
+    "physical_f32",
+    "raw_i16",
+];
+const RSEQ_PROPERTIES: &[&str] = &[
+    "fields",
+    "gyro_fields",
+    "accel_fields",
+    "temp_field",
+    "accel_fs_g",
+    "gyro_fs_dps",
+    "temp_lsb_per_c",
+    "temp_offset_c",
+    "output",
+];
+const RSEQ_CONSTANTS: &[&str] = &["FIFO_RAW", "AMD", "SMD", "DRDY"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RseqSemanticKind {
+    Comment,
+    String,
+    Number,
+    Keyword,
+    Function,
+    Type,
+    Property,
+    Constant,
+    Variable,
+    Operator,
+    Punctuation,
+    Label,
+}
+
+impl RseqSemanticKind {
+    fn token_type(self) -> u32 {
+        match self {
+            Self::Comment => 0,
+            Self::String => 1,
+            Self::Number => 2,
+            Self::Keyword => 3,
+            Self::Function => 4,
+            Self::Type => 5,
+            Self::Property => 6,
+            Self::Constant => 7,
+            Self::Variable => 8,
+            Self::Operator => 9,
+            Self::Punctuation => 10,
+            Self::Label => 11,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RseqSemanticHit {
+    range: Range<usize>,
+    kind: RseqSemanticKind,
+}
+
+#[derive(Debug, Default)]
+struct RseqSemanticSymbols {
+    pages: BTreeSet<String>,
+    registers: BTreeSet<String>,
+    fields: BTreeSet<String>,
+    events: BTreeSet<String>,
+}
+
+impl RseqSemanticSymbols {
+    fn from_facts(facts: &rseq_lsp::LanguageFacts) -> Self {
+        let mut symbols = Self::default();
+        symbols.pages.extend(facts.pages.iter().cloned());
+        for register in &facts.registers {
+            symbols.registers.insert(register.name.clone());
+            symbols
+                .registers
+                .insert(format!("{}.{}", register.page, register.name));
+        }
+        for field in &facts.fields {
+            symbols.fields.insert(field.name.clone());
+            symbols
+                .fields
+                .insert(format!("{}.{}.{}", field.page, field.register, field.name));
+        }
+        for event in &facts.events {
+            symbols.events.insert(event.name.clone());
+        }
+        symbols
+    }
+
+    fn classify_ident(&self, token: &str) -> RseqSemanticKind {
+        if RSEQ_FUNCTIONS.contains(&token) {
+            RseqSemanticKind::Function
+        } else if RSEQ_KEYWORDS.contains(&token) {
+            RseqSemanticKind::Keyword
+        } else if RSEQ_TYPES.contains(&token) || self.pages.contains(token) {
+            RseqSemanticKind::Type
+        } else if RSEQ_CONSTANTS.contains(&token) {
+            RseqSemanticKind::Constant
+        } else if RSEQ_PROPERTIES.contains(&token)
+            || self.registers.contains(token)
+            || self.fields.contains(token)
+        {
+            RseqSemanticKind::Property
+        } else if self.events.contains(token) {
+            RseqSemanticKind::Label
+        } else {
+            RseqSemanticKind::Variable
+        }
+    }
+}
+
+fn rseq_semantic_tokens(
+    source: &str,
+    range: Range<usize>,
+    facts: &rseq_lsp::LanguageFacts,
+) -> lsp_types::SemanticTokens {
+    let hits = rseq_semantic_hits(source, range, facts);
+    let mut data = Vec::with_capacity(hits.len());
+    let mut previous_line = 0u32;
+    let mut previous_character = 0u32;
+
+    for hit in hits {
+        let (line, character) = rseq_line_character(source, hit.range.start);
+        let length = source[hit.range.clone()].chars().count() as u32;
+        if length == 0 {
+            continue;
+        }
+        let delta_line = line.saturating_sub(previous_line);
+        let delta_start = if delta_line == 0 {
+            character.saturating_sub(previous_character)
+        } else {
+            character
+        };
+        data.push(lsp_types::SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type: hit.kind.token_type(),
+            token_modifiers_bitset: 0,
+        });
+        previous_line = line;
+        previous_character = character;
+    }
+
+    lsp_types::SemanticTokens {
+        result_id: None,
+        data,
+    }
+}
+
+fn rseq_semantic_hits(
+    source: &str,
+    range: Range<usize>,
+    facts: &rseq_lsp::LanguageFacts,
+) -> Vec<RseqSemanticHit> {
+    let symbols = RseqSemanticSymbols::from_facts(facts);
+    let mut hits = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < source.len() {
+        let Some(ch) = source[offset..].chars().next() else {
+            break;
+        };
+
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if source[offset..].starts_with("//") {
+            let end = source[offset..]
+                .find('\n')
+                .map(|line_end| offset + line_end)
+                .unwrap_or(source.len());
+            rseq_push_semantic_hit(&mut hits, offset..end, RseqSemanticKind::Comment, &range);
+            offset = end;
+            continue;
+        }
+
+        if ch == '"' {
+            let end = rseq_scan_string(source, offset);
+            rseq_push_semantic_hit(&mut hits, offset..end, RseqSemanticKind::String, &range);
+            offset = end;
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let end = rseq_scan_number(source, offset);
+            rseq_push_semantic_hit(&mut hits, offset..end, RseqSemanticKind::Number, &range);
+            offset = end;
+            continue;
+        }
+
+        if rseq_is_ident_start(ch) {
+            let end = rseq_scan_ident(source, offset);
+            let token = &source[offset..end];
+            rseq_push_semantic_hit(
+                &mut hits,
+                offset..end,
+                symbols.classify_ident(token),
+                &range,
+            );
+            offset = end;
+            continue;
+        }
+
+        if rseq_is_punctuation(ch) {
+            let end = offset + ch.len_utf8();
+            rseq_push_semantic_hit(
+                &mut hits,
+                offset..end,
+                RseqSemanticKind::Punctuation,
+                &range,
+            );
+            offset = end;
+            continue;
+        }
+
+        if rseq_is_operator(ch) {
+            let end = rseq_scan_operator(source, offset);
+            rseq_push_semantic_hit(&mut hits, offset..end, RseqSemanticKind::Operator, &range);
+            offset = end;
+            continue;
+        }
+
+        offset += ch.len_utf8();
+    }
+
+    hits
+}
+
+fn rseq_push_semantic_hit(
+    hits: &mut Vec<RseqSemanticHit>,
+    token_range: Range<usize>,
+    kind: RseqSemanticKind,
+    requested_range: &Range<usize>,
+) {
+    if token_range.start >= token_range.end
+        || token_range.end <= requested_range.start
+        || token_range.start >= requested_range.end
+    {
+        return;
+    }
+    hits.push(RseqSemanticHit {
+        range: token_range,
+        kind,
+    });
+}
+
+fn rseq_scan_string(source: &str, start: usize) -> usize {
+    let mut escaped = false;
+    let mut offset = start + 1;
+    while offset < source.len() {
+        let Some(ch) = source[offset..].chars().next() else {
+            break;
+        };
+        offset += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => break,
+            '\n' => break,
+            _ => {}
+        }
+    }
+    offset
+}
+
+fn rseq_scan_number(source: &str, start: usize) -> usize {
+    let mut offset = start;
+    while offset < source.len() {
+        let Some(ch) = source[offset..].chars().next() else {
+            break;
+        };
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            offset += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn rseq_scan_ident(source: &str, start: usize) -> usize {
+    let mut offset = start;
+    while offset < source.len() {
+        let Some(ch) = source[offset..].chars().next() else {
+            break;
+        };
+        if rseq_is_ident_continue(ch) {
+            offset += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn rseq_scan_operator(source: &str, start: usize) -> usize {
+    let mut offset = start;
+    while offset < source.len() {
+        let Some(ch) = source[offset..].chars().next() else {
+            break;
+        };
+        if rseq_is_operator(ch) {
+            offset += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn rseq_is_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn rseq_is_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '!')
+}
+
+fn rseq_is_punctuation(ch: char) -> bool {
+    matches!(ch, '{' | '}' | '(' | ')' | '[' | ']' | ',' | ':' | ';')
+}
+
+fn rseq_is_operator(ch: char) -> bool {
+    matches!(
+        ch,
+        '=' | '|' | '&' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '^' | '!'
+    )
+}
+
+fn rseq_line_character(source: &str, offset: usize) -> (u32, u32) {
+    let offset = offset.min(source.len());
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+    let character = source[line_start..offset].chars().count() as u32;
+    (line, character)
+}
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = rseq_gpui, no_json)]
@@ -528,6 +1102,7 @@ pub struct RseqGpui {
     rseq_path_input: Entity<InputState>,
     chip_path_input: Entity<InputState>,
     sequence_editor: Entity<InputState>,
+    sequence_lsp_chips: Rc<RefCell<Vec<PathBuf>>>,
     inline_write_input: Entity<InputState>,
     write_input: Entity<InputState>,
     samples: VecDeque<MotionSample>,
@@ -605,15 +1180,24 @@ impl RseqGpui {
                 .placeholder("qmi8660.yaml or from chip!(...)")
                 .default_value(chip_path_value)
         });
+        let sequence_lsp_chips = Rc::new(RefCell::new(cli.chip.clone()));
+        let sequence_lsp_provider = Rc::new(RseqEditorLanguageProvider::new(
+            std::env::current_dir().ok(),
+            sequence_lsp_chips.clone(),
+        ));
         let sequence_editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("rust")
+            let mut input = InputState::new(window, cx)
+                .code_editor("text")
                 .soft_wrap(false)
                 .line_number(true)
                 .scroll_beyond_last_line(Some(3))
                 .cursor_surrounding_lines(Some(1))
                 .placeholder("write rseq here")
-                .default_value(sequence_text)
+                .default_value(sequence_text);
+            input.lsp.completion_provider = Some(sequence_lsp_provider.clone());
+            input.lsp.hover_provider = Some(sequence_lsp_provider.clone());
+            input.lsp.semantic_tokens_provider = Some(sequence_lsp_provider.clone());
+            input
         });
         let inline_write_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -641,6 +1225,7 @@ impl RseqGpui {
                 if matches!(event, InputEvent::Change) {
                     this.sequence_dirty = true;
                     this.sequence_status = "modified".to_string();
+                    this.refresh_sequence_editor_diagnostics(cx);
                     cx.notify();
                 }
             },
@@ -687,6 +1272,7 @@ impl RseqGpui {
             rseq_path_input,
             chip_path_input,
             sequence_editor,
+            sequence_lsp_chips,
             inline_write_input,
             write_input,
             samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -789,7 +1375,45 @@ impl RseqGpui {
     }
 
     fn chip_files_from_input(&self, cx: &Context<Self>) -> Vec<PathBuf> {
-        parse_path_list(&self.chip_path_input.read(cx).value())
+        let chips = parse_path_list(&self.chip_path_input.read(cx).value());
+        *self.sequence_lsp_chips.borrow_mut() = chips.clone();
+        chips
+    }
+
+    fn refresh_sequence_editor_diagnostics(&self, cx: &mut Context<Self>) {
+        let source = self.sequence_source_from_editor(cx);
+        let chips = self.chip_files_from_input(cx);
+        let analysis = rseq_lsp::analyze_document(
+            &source.source,
+            source.base_dir.as_deref(),
+            std::env::current_dir().ok().as_deref(),
+            &chips,
+        );
+        self.sequence_editor.update(cx, |input, cx| {
+            let text = input.text().clone();
+            if let Some(diagnostics) = input.diagnostics_mut() {
+                diagnostics.reset(&text);
+                diagnostics.extend(analysis.diagnostics.into_iter().map(|diagnostic| {
+                    lsp_types::Diagnostic {
+                        range: lsp_types::Range::new(
+                            lsp_types::Position::new(
+                                diagnostic.range.start.line,
+                                diagnostic.range.start.character,
+                            ),
+                            lsp_types::Position::new(
+                                diagnostic.range.end.line,
+                                diagnostic.range.end.character,
+                            ),
+                        ),
+                        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                        source: diagnostic.source,
+                        message: diagnostic.message,
+                        ..Default::default()
+                    }
+                }));
+            }
+            cx.notify();
+        });
     }
 
     fn reload_workspace_from_inputs(&mut self, compile_program: bool, cx: &Context<Self>) -> bool {
@@ -6619,6 +7243,136 @@ mod tests {
             no_dump_reason: String::new(),
             fields: Vec::new(),
         }
+    }
+
+    fn test_language_facts() -> rseq_lsp::LanguageFacts {
+        rseq_lsp::LanguageFacts {
+            pages: vec!["UI".to_string()],
+            registers: vec![rseq_lsp::RegisterFact {
+                page: "UI".to_string(),
+                name: "FIFO_DATA".to_string(),
+                addr: 0x30,
+                access: "RO".to_string(),
+                width: 1,
+                desc: String::new(),
+                no_dump: true,
+                fields: Vec::new(),
+            }],
+            fields: vec![rseq_lsp::FieldFact {
+                page: "UI".to_string(),
+                register: "FIFO_STATUSH".to_string(),
+                name: "fifo_wtm".to_string(),
+                bit_hi: 6,
+                bit_lo: 6,
+                desc: String::new(),
+                event: Some("fifo_watermark".to_string()),
+            }],
+            events: vec![rseq_lsp::EventFact {
+                name: "fifo_watermark".to_string(),
+                page: "UI".to_string(),
+                register: "FIFO_STATUSH".to_string(),
+                field: "fifo_wtm".to_string(),
+                desc: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn semantic_labels(
+        source: &str,
+        facts: &rseq_lsp::LanguageFacts,
+    ) -> Vec<(String, RseqSemanticKind)> {
+        rseq_semantic_hits(source, 0..source.len(), facts)
+            .into_iter()
+            .map(|hit| (source[hit.range].to_string(), hit.kind))
+            .collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_gpui_completion_items_insert_plain_labels_not_snippets() {
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(0, 0),
+            lsp_types::Position::new(0, 5),
+        );
+        let item = rseq_gpui_completion_item(lsp_types::CompletionItem {
+            label: "write!".to_string(),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range,
+                new_text: "write!(${1:REG}, ${2:[0x00]}, ${3:50});".to_string(),
+            })),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            item.insert_text_format,
+            Some(lsp_types::InsertTextFormat::PLAIN_TEXT)
+        );
+        let Some(lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit else {
+            panic!("expected edit");
+        };
+        assert_eq!(edit.new_text, "write!");
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_completion_offer_state_avoids_finished_statements() {
+        assert!(rseq_should_offer_completion("wri", 3));
+        assert!(rseq_should_offer_completion("read!(", 6));
+        assert!(!rseq_should_offer_completion("read!(UI.FIFO_DATA, 1);", 23));
+        assert!(!rseq_should_offer_completion("let data = ", 11));
+        assert!(!rseq_should_offer_completion("\n    ", 5));
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_semantic_highlight_marks_dsl_and_chip_symbols() {
+        let facts = test_language_facts();
+        let source = r#"
+            // irq handler
+            irq!(int1) {
+                on(fifo_watermark) {
+                    let data = read!(UI.FIFO_DATA, 0x0e);
+                    report!(FIFO_RAW, data);
+                }
+            }
+        "#;
+        let labels = semantic_labels(source, &facts);
+
+        assert!(labels.contains(&("// irq handler".to_string(), RseqSemanticKind::Comment)));
+        assert!(labels.contains(&("irq!".to_string(), RseqSemanticKind::Function)));
+        assert!(labels.contains(&("on".to_string(), RseqSemanticKind::Keyword)));
+        assert!(labels.contains(&("fifo_watermark".to_string(), RseqSemanticKind::Label)));
+        assert!(labels.contains(&("read!".to_string(), RseqSemanticKind::Function)));
+        assert!(labels.contains(&("UI.FIFO_DATA".to_string(), RseqSemanticKind::Property)));
+        assert!(labels.contains(&("0x0e".to_string(), RseqSemanticKind::Number)));
+        assert!(labels.contains(&("FIFO_RAW".to_string(), RseqSemanticKind::Constant)));
+        assert!(labels.contains(&("data".to_string(), RseqSemanticKind::Variable)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn rseq_semantic_highlight_ignores_commands_inside_strings_and_comments() {
+        let facts = test_language_facts();
+        let source =
+            "print!(\"read!(UI.FIFO_DATA)\"); // write!(UI.FIFO_DATA)\nread!(UI.FIFO_DATA, 1);";
+        let labels = semantic_labels(source, &facts);
+        let read_functions = labels
+            .iter()
+            .filter(|(label, kind)| label == "read!" && *kind == RseqSemanticKind::Function)
+            .count();
+        let register_refs = labels
+            .iter()
+            .filter(|(label, kind)| label == "UI.FIFO_DATA" && *kind == RseqSemanticKind::Property)
+            .count();
+
+        assert!(labels.contains(&(
+            "\"read!(UI.FIFO_DATA)\"".to_string(),
+            RseqSemanticKind::String
+        )));
+        assert!(labels.contains(&(
+            "// write!(UI.FIFO_DATA)".to_string(),
+            RseqSemanticKind::Comment
+        )));
+        assert_eq!(read_functions, 1);
+        assert_eq!(register_refs, 1);
     }
 
     #[::core::prelude::v1::test]

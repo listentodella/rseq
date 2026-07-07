@@ -8,6 +8,7 @@ members = [
     "crates/rseq-cli",
     "crates/rseq-tui",
     "crates/rseq-gpui",
+    "crates/rseq-lsp",
     "crates/rseq-mcu-sim",
 ]
 resolver = "2"

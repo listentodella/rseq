@@ -81,7 +81,7 @@ mod mock {
 
 // ── 串口实现(serial feature) ─────────────────────────────────
 #[cfg(feature = "serial")]
-pub use self::serial::SerialTransport;
+pub use self::serial::{SerialPortInfo, SerialTransport};
 
 #[cfg(feature = "serial")]
 mod serial {
@@ -89,6 +89,18 @@ mod serial {
     use serialport::{ClearBuffer, SerialPort};
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    /// Host-visible serial port candidate for connection UIs.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SerialPortInfo {
+        pub port_name: String,
+        pub port_type: String,
+        pub manufacturer: Option<String>,
+        pub product: Option<String>,
+        pub serial_number: Option<String>,
+        pub vid: Option<u16>,
+        pub pid: Option<u16>,
+    }
 
     /// 串口传输实现,包装 `serialport` 的 `Box<dyn SerialPort>`。
     pub struct SerialTransport {
@@ -110,6 +122,13 @@ mod serial {
             Self::open_configured(path, baud, false)
         }
 
+        /// 枚举本机可见串口,供 CLI/TUI/GUI 选择连接端口。
+        pub fn available_ports() -> Vec<SerialPortInfo> {
+            serialport::available_ports()
+                .map(|ports| ports.into_iter().map(serial_port_info).collect())
+                .unwrap_or_default()
+        }
+
         fn open_configured(path: &str, baud: u32, clear_buffers: bool) -> Result<Self, LinkError> {
             let mut port = serialport::new(path, baud)
                 .timeout(Duration::from_millis(100))
@@ -121,6 +140,36 @@ mod serial {
                 let _ = port.clear(ClearBuffer::All);
             }
             Ok(Self { port })
+        }
+    }
+
+    fn serial_port_info(info: serialport::SerialPortInfo) -> SerialPortInfo {
+        let mut out = SerialPortInfo {
+            port_name: info.port_name,
+            port_type: serial_port_type_label(&info.port_type).to_string(),
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+            vid: None,
+            pid: None,
+        };
+
+        if let serialport::SerialPortType::UsbPort(usb) = info.port_type {
+            out.manufacturer = usb.manufacturer;
+            out.product = usb.product;
+            out.serial_number = usb.serial_number;
+            out.vid = Some(usb.vid);
+            out.pid = Some(usb.pid);
+        }
+        out
+    }
+
+    fn serial_port_type_label(port_type: &serialport::SerialPortType) -> &'static str {
+        match port_type {
+            serialport::SerialPortType::UsbPort(_) => "USB",
+            serialport::SerialPortType::BluetoothPort => "Bluetooth",
+            serialport::SerialPortType::PciPort => "PCI",
+            serialport::SerialPortType::Unknown => "Serial",
         }
     }
 

@@ -21,6 +21,13 @@ pub const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 pub const DEFAULT_BAUD: u32 = 115_200;
 pub const MAX_TEXT_LINES: usize = 512;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialPortInfo {
+    pub port_name: String,
+    pub label: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostMetadata {
     pub report_decoders: ReportDecoderRegistry,
@@ -1462,6 +1469,62 @@ pub fn spawn_session(config: SessionConfig) -> SessionHandle {
         events: event_rx,
         stop,
     }
+}
+
+#[cfg(feature = "serial")]
+pub fn available_serial_ports() -> Vec<SerialPortInfo> {
+    rseq_link::SerialTransport::available_ports()
+        .into_iter()
+        .map(|port| {
+            let label = serial_port_label(&port);
+            let detail = serial_port_detail(&port);
+            SerialPortInfo {
+                port_name: port.port_name,
+                label,
+                detail,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "serial"))]
+pub fn available_serial_ports() -> Vec<SerialPortInfo> {
+    Vec::new()
+}
+
+#[cfg(feature = "serial")]
+fn serial_port_label(port: &rseq_link::SerialPortInfo) -> String {
+    let name = Path::new(&port.port_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&port.port_name);
+    match port.product.as_deref() {
+        Some(product) if !product.is_empty() => format!("{name} - {product}"),
+        _ => name.to_string(),
+    }
+}
+
+#[cfg(feature = "serial")]
+fn serial_port_detail(port: &rseq_link::SerialPortInfo) -> String {
+    let mut parts = vec![port.port_type.clone()];
+    if let (Some(vid), Some(pid)) = (port.vid, port.pid) {
+        parts.push(format!("{vid:04x}:{pid:04x}"));
+    }
+    if let Some(manufacturer) = port
+        .manufacturer
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(manufacturer.to_string());
+    }
+    if let Some(serial) = port
+        .serial_number
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("sn={serial}"));
+    }
+    parts.join(" ")
 }
 
 fn spawn_demo_session(

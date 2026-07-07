@@ -21,6 +21,7 @@ rseq = { workspace = true }
 rseq-host = { workspace = true }
 rseq-link = { workspace = true, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 smol = "2"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [

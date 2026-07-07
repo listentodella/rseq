@@ -39,6 +39,6 @@ pub use wire::{
 
 #[cfg(feature = "std")]
 pub use transport::MockTransport;
-#[cfg(feature = "serial")]
-pub use transport::SerialTransport;
 pub use transport::Transport;
+#[cfg(feature = "serial")]
+pub use transport::{SerialPortInfo, SerialTransport};

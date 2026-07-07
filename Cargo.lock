@@ -5834,6 +5834,7 @@ dependencies = [
  "rseq",
  "rseq-host",
  "rseq-link",
+ "serde",
  "smol",
 ]
 

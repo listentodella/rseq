@@ -10,7 +10,7 @@ use gpui::*;
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Root, Selectable as _, Sizable as _,
     StyledExt as _, Theme, ThemeMode, TitleBar,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonVariants as _, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
@@ -28,6 +28,7 @@ use rseq_host::{
     SessionHandle, compile_rseq_files, compile_rseq_sources, hex_bytes, load_host_metadata,
     load_host_metadata_from_sources, parse_register_write_bytes, push_bounded,
 };
+use serde::Deserialize;
 
 const UI_TICK: Duration = Duration::from_millis(33);
 const MAX_SAMPLES: usize = 600;
@@ -35,11 +36,26 @@ const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
 const MAX_HISTORY_BARS: usize = 120;
 const REGISTER_DUMP_BATCH_MAX_LEN: usize = rseq_link::wire::CONTROL_MAX_READ_LEN;
+const COMMON_SERIAL_BAUDS: [u32; 10] = [
+    9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000,
+];
 const DEFAULT_RSEQ_SOURCE: &str = r#"// New rseq script.
 // Pick a chip YAML in the Sequences sidebar or add chip!("chip.yaml") here.
 
 print!("rseq sequence start");
 "#;
+
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = rseq_gpui, no_json)]
+struct SelectLinkModeAction(usize);
+
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = rseq_gpui, no_json)]
+struct SelectSerialPortAction(String);
+
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = rseq_gpui, no_json)]
+struct SelectSerialBaudAction(u32);
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "GPUI workstation for rseq MCU reports")]
@@ -61,6 +77,70 @@ struct Cli {
 
     #[arg(long, alias = "observe-only", alias = "rx-only")]
     watch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkMode {
+    Demo,
+    Serial,
+    Tcp,
+    Ble,
+    WebSocket,
+    Custom,
+}
+
+impl LinkMode {
+    const ALL: [Self; 6] = [
+        Self::Demo,
+        Self::Serial,
+        Self::Tcp,
+        Self::Ble,
+        Self::WebSocket,
+        Self::Custom,
+    ];
+
+    fn id(self) -> usize {
+        match self {
+            Self::Demo => 0,
+            Self::Serial => 1,
+            Self::Tcp => 2,
+            Self::Ble => 3,
+            Self::WebSocket => 4,
+            Self::Custom => 5,
+        }
+    }
+
+    fn from_id(id: usize) -> Option<Self> {
+        Self::ALL.iter().copied().find(|mode| mode.id() == id)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Demo => "Demo",
+            Self::Serial => "Serial",
+            Self::Tcp => "TCP",
+            Self::Ble => "BLE",
+            Self::WebSocket => "WebSocket",
+            Self::Custom => "Custom",
+        }
+    }
+
+    fn can_connect(self) -> bool {
+        matches!(self, Self::Demo | Self::Serial)
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Demo => "Run the built-in simulated report stream.",
+            Self::Serial => {
+                "Use an MCU over USB CDC or USB-UART with the rseq-link frame protocol."
+            }
+            Self::Tcp => "Reserved for a future TCP byte-stream transport.",
+            Self::Ble => "Reserved for a future BLE transport.",
+            Self::WebSocket => "Reserved for a future WebSocket transport.",
+            Self::Custom => "Reserved for project-specific transports.",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -297,6 +377,7 @@ pub struct RseqGpui {
     metadata: HostMetadata,
     startup_program: Option<rseq::CompiledProgram>,
     compile_status: String,
+    link_mode: LinkMode,
     session: Option<SessionHandle>,
     selected_tab: PanelTab,
     selected_register_addr: u32,
@@ -309,6 +390,9 @@ pub struct RseqGpui {
     sequence_view_mode: SequenceViewMode,
     visual_sequences: Vec<VisualSequence>,
     active_visual_sequence: usize,
+    serial_port_input: Entity<InputState>,
+    serial_baud_input: Entity<InputState>,
+    serial_ports: Vec<rseq_host::SerialPortInfo>,
     rseq_path_input: Entity<InputState>,
     chip_path_input: Entity<InputState>,
     sequence_editor: Entity<InputState>,
@@ -338,10 +422,30 @@ impl RseqGpui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let link_mode = if cli.demo {
+            LinkMode::Demo
+        } else {
+            LinkMode::Serial
+        };
+        let serial_port_value = cli.serial.clone().unwrap_or_default();
+        let serial_baud_value = cli.baud.to_string();
+        let serial_ports = rseq_host::available_serial_ports();
+        let auto_serial_port = (serial_port_value.is_empty() && serial_ports.len() == 1)
+            .then(|| serial_ports[0].port_name.clone());
         let rseq_path_value = path_list_value(&cli.file);
         let chip_path_value = path_list_value(&cli.chip);
         let (sequence_path, sequence_text, sequence_status) = initial_sequence_source(&cli.file);
         let visual_sequences = visual_sequences_from_source(&sequence_text, window, cx);
+        let serial_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/dev/cu.usbmodem...")
+                .default_value(auto_serial_port.clone().unwrap_or(serial_port_value))
+        });
+        let serial_baud_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("115200")
+                .default_value(serial_baud_value)
+        });
         let rseq_path_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("examples/qmi8660_fifo.rseq")
@@ -414,6 +518,7 @@ impl RseqGpui {
             metadata,
             startup_program,
             compile_status,
+            link_mode,
             session: None,
             selected_tab: PanelTab::Motion,
             selected_register_addr: 0,
@@ -426,6 +531,9 @@ impl RseqGpui {
             sequence_view_mode: SequenceViewMode::Text,
             visual_sequences,
             active_visual_sequence: 0,
+            serial_port_input,
+            serial_baud_input,
+            serial_ports,
             rseq_path_input,
             chip_path_input,
             sequence_editor,
@@ -459,6 +567,59 @@ impl RseqGpui {
 
     fn input_default_watch_mode(&self, cx: &Context<Self>) -> bool {
         self.cli.watch || self.rseq_files_from_input(cx).is_empty()
+    }
+
+    fn prepare_connection_config(&mut self, cx: &Context<Self>) -> bool {
+        match self.link_mode {
+            LinkMode::Demo => {
+                self.cli.demo = true;
+                self.cli.serial = None;
+                true
+            }
+            LinkMode::Serial => match self.resolve_serial_config(cx) {
+                Ok((port, baud)) => {
+                    self.cli.demo = false;
+                    self.cli.serial = Some(port);
+                    self.cli.baud = baud;
+                    true
+                }
+                Err(reason) => {
+                    push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                    false
+                }
+            },
+            mode => {
+                push_bounded(
+                    &mut self.logs,
+                    format!("{} transport is not implemented yet", mode.label()),
+                    MAX_TEXT_LINES,
+                );
+                false
+            }
+        }
+    }
+
+    fn resolve_serial_config(&mut self, cx: &Context<Self>) -> Result<(String, u32), String> {
+        let mut port = self.serial_port_input.read(cx).value().trim().to_string();
+        if port.is_empty() {
+            self.serial_ports = rseq_host::available_serial_ports();
+            match self.serial_ports.len() {
+                0 => return Err("no serial ports found".to_string()),
+                1 => port = self.serial_ports[0].port_name.clone(),
+                _ => {
+                    let ports = self
+                        .serial_ports
+                        .iter()
+                        .map(|port| port.port_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!("select a serial port first: {ports}"));
+                }
+            }
+        }
+
+        let baud = parse_serial_baud(&self.serial_baud_input.read(cx).value())?;
+        Ok((port, baud))
     }
 
     fn rseq_files_from_input(&self, cx: &Context<Self>) -> Vec<PathBuf> {
@@ -561,6 +722,9 @@ impl RseqGpui {
     }
 
     fn connect_from_inputs(&mut self, cx: &Context<Self>) {
+        if !self.prepare_connection_config(cx) {
+            return;
+        }
         let watch = self.input_default_watch_mode(cx);
         if self.reload_workspace_from_inputs(!watch, cx) {
             self.start_session(watch);
@@ -568,6 +732,9 @@ impl RseqGpui {
     }
 
     fn load_and_run_from_inputs(&mut self, cx: &Context<Self>) {
+        if !self.prepare_connection_config(cx) {
+            return;
+        }
         if !self.reload_workspace_from_inputs(true, cx) {
             return;
         }
@@ -583,6 +750,9 @@ impl RseqGpui {
     }
 
     fn watch_from_inputs(&mut self, cx: &Context<Self>) {
+        if !self.prepare_connection_config(cx) {
+            return;
+        }
         if self.reload_workspace_from_inputs(false, cx) {
             self.start_session(true);
         }
@@ -590,6 +760,9 @@ impl RseqGpui {
 
     fn connect_from_current_source(&mut self, cx: &Context<Self>) {
         if self.use_sequence_editor_source(cx) {
+            if !self.prepare_connection_config(cx) {
+                return;
+            }
             let watch = self.cli.watch || !self.current_view_has_source(cx);
             if self.reload_workspace_from_sequence_editor(!watch, cx) {
                 self.start_session(watch);
@@ -609,6 +782,9 @@ impl RseqGpui {
 
     fn watch_from_current_source(&mut self, cx: &Context<Self>) {
         if self.use_sequence_editor_source(cx) {
+            if !self.prepare_connection_config(cx) {
+                return;
+            }
             if self.reload_workspace_from_sequence_editor(false, cx) {
                 self.start_session(true);
             }
@@ -618,6 +794,9 @@ impl RseqGpui {
     }
 
     fn load_and_run_sequence_editor(&mut self, cx: &Context<Self>) {
+        if !self.prepare_connection_config(cx) {
+            return;
+        }
         if !self.current_view_has_source(cx) {
             push_bounded(
                 &mut self.logs,
@@ -933,18 +1112,20 @@ impl RseqGpui {
             session.stop();
         }
 
+        let demo = self.link_mode == LinkMode::Demo || self.cli.demo;
+        let serial = if demo { None } else { self.cli.serial.clone() };
         self.connected = false;
         self.session_mode = if watch {
             "watch".to_string()
         } else {
             "load/run".to_string()
         };
-        self.connection_label = if self.cli.demo || self.cli.serial.is_none() {
+        self.connection_label = if demo {
             "demo".to_string()
         } else {
             format!(
                 "{} @ {}",
-                self.cli.serial.as_deref().unwrap_or("<none>"),
+                serial.as_deref().unwrap_or("<none>"),
                 self.cli.baud
             )
         };
@@ -959,10 +1140,10 @@ impl RseqGpui {
         );
 
         let config = SessionConfig {
-            serial: self.cli.serial.clone(),
+            serial,
             baud: self.cli.baud,
             watch,
-            demo: self.cli.demo || self.cli.serial.is_none(),
+            demo,
             startup_program: (!watch).then(|| self.startup_program.clone()).flatten(),
             report_decoders: self.metadata.report_decoders.clone(),
         };
@@ -1361,110 +1542,352 @@ impl RseqGpui {
         data
     }
 
+    fn set_link_mode(&mut self, mode: LinkMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_some() {
+            push_bounded(
+                &mut self.logs,
+                "disconnect before changing link mode".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+
+        self.link_mode = mode;
+        self.cli.demo = mode == LinkMode::Demo;
+        if mode == LinkMode::Serial {
+            self.refresh_serial_ports(window, cx);
+        } else {
+            push_bounded(
+                &mut self.logs,
+                format!("selected {} link", mode.label()),
+                MAX_TEXT_LINES,
+            );
+        }
+    }
+
+    fn refresh_serial_ports(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.serial_ports = rseq_host::available_serial_ports();
+        match self.serial_ports.len() {
+            0 => push_bounded(
+                &mut self.logs,
+                "no serial ports found".to_string(),
+                MAX_TEXT_LINES,
+            ),
+            1 => {
+                let port = self.serial_ports[0].port_name.clone();
+                if self.serial_port_input.read(cx).value().trim().is_empty() {
+                    self.serial_port_input.update(cx, |input, cx| {
+                        input.set_value(port.clone(), window, cx);
+                    });
+                }
+                push_bounded(
+                    &mut self.logs,
+                    format!("found 1 serial port: {port}"),
+                    MAX_TEXT_LINES,
+                );
+            }
+            count => {
+                push_bounded(
+                    &mut self.logs,
+                    format!("found {count} serial ports; choose one from Ports"),
+                    MAX_TEXT_LINES,
+                );
+            }
+        }
+    }
+
+    fn select_serial_port(&mut self, port: String, window: &mut Window, cx: &mut Context<Self>) {
+        if port.is_empty() {
+            return;
+        }
+        self.serial_port_input.update(cx, |input, cx| {
+            input.set_value(port.clone(), window, cx);
+        });
+        push_bounded(
+            &mut self.logs,
+            format!("selected serial port {port}"),
+            MAX_TEXT_LINES,
+        );
+    }
+
+    fn select_serial_baud(&mut self, baud: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.serial_baud_input.update(cx, |input, cx| {
+            input.set_value(baud.to_string(), window, cx);
+        });
+        push_bounded(
+            &mut self.logs,
+            format!("selected serial baud {baud}"),
+            MAX_TEXT_LINES,
+        );
+    }
+
+    fn render_link_mode_picker(&self, locked: bool, cx: &Context<Self>) -> impl IntoElement {
+        let current = self.link_mode;
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Link"),
+            )
+            .child(
+                DropdownButton::new("link-mode-dropdown")
+                    .xsmall()
+                    .button(Button::new("link-mode-button").label(current.label()))
+                    .disabled(locked)
+                    .tooltip(current.tooltip())
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                        LinkMode::ALL.iter().copied().fold(menu, |menu, mode| {
+                            menu.menu_with_check(
+                                mode.label(),
+                                current == mode,
+                                Box::new(SelectLinkModeAction(mode.id())),
+                            )
+                        })
+                    }),
+            )
+    }
+
+    fn render_endpoint_input(
+        &self,
+        label: &str,
+        input: &Entity<InputState>,
+        width: f32,
+        disabled: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .w(px(width))
+                    .child(Input::new(input).xsmall().disabled(disabled)),
+            )
+    }
+
+    fn render_serial_port_dropdown(&self, locked: bool, cx: &Context<Self>) -> impl IntoElement {
+        let selected_port = self.serial_port_input.read(cx).value().to_string();
+        let ports = self.serial_ports.clone();
+        let label = if ports.is_empty() {
+            "Ports".to_string()
+        } else {
+            format!("Ports ({})", ports.len())
+        };
+
+        DropdownButton::new("serial-port-dropdown")
+            .xsmall()
+            .button(
+                Button::new("serial-port-button").label(label).on_click(
+                    cx.listener(|this, _, window, cx| this.refresh_serial_ports(window, cx)),
+                ),
+            )
+            .disabled(locked)
+            .tooltip("Scan local serial ports or choose a scanned port")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                if ports.is_empty() {
+                    menu.menu_with_check_and_disabled(
+                        "No scanned ports",
+                        false,
+                        Box::new(SelectSerialPortAction(String::new())),
+                        true,
+                    )
+                } else {
+                    ports.iter().fold(menu, |menu, port| {
+                        menu.menu_with_check(
+                            serial_port_menu_label(port),
+                            selected_port == port.port_name,
+                            Box::new(SelectSerialPortAction(port.port_name.clone())),
+                        )
+                    })
+                }
+            })
+    }
+
+    fn render_serial_baud_dropdown(&self, locked: bool, cx: &Context<Self>) -> impl IntoElement {
+        let selected_baud = self
+            .serial_baud_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .ok();
+
+        DropdownButton::new("serial-baud-dropdown")
+            .xsmall()
+            .button(Button::new("serial-baud-button").label("Rates"))
+            .disabled(locked)
+            .tooltip("Choose a common serial baud rate")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                COMMON_SERIAL_BAUDS.iter().fold(menu, |menu, baud| {
+                    menu.menu_with_check(
+                        baud.to_string(),
+                        selected_baud == Some(*baud),
+                        Box::new(SelectSerialBaudAction(*baud)),
+                    )
+                })
+            })
+    }
+
+    fn render_link_endpoint(&self, locked: bool, cx: &Context<Self>) -> AnyElement {
+        match self.link_mode {
+            LinkMode::Demo => h_flex()
+                .h_5()
+                .items_center()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("No endpoint required")
+                .into_any_element(),
+            LinkMode::Serial => h_flex()
+                .gap_1()
+                .items_center()
+                .flex_wrap()
+                .child(self.render_endpoint_input(
+                    "Port",
+                    &self.serial_port_input,
+                    190.,
+                    locked,
+                    cx,
+                ))
+                .child(self.render_serial_port_dropdown(locked, cx))
+                .child(self.render_endpoint_input("Baud", &self.serial_baud_input, 82., locked, cx))
+                .child(self.render_serial_baud_dropdown(locked, cx))
+                .into_any_element(),
+            mode => h_flex()
+                .h_5()
+                .items_center()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{} transport is a reserved slot", mode.label()))
+                .into_any_element(),
+        }
+    }
+
     fn render_connection_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let has_startup_source = self.has_startup_source(cx);
-        h_flex()
+        let locked = self.session.is_some();
+        let can_connect = self.link_mode.can_connect();
+        v_flex()
             .gap_2()
             .p_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            .justify_between()
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(status_dot(self.connected, cx))
+                    .gap_3()
+                    .justify_between()
+                    .flex_wrap()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(self.connection_label.clone()),
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .items_center()
+                            .child(status_dot(self.connected, cx))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(self.connection_label.clone()),
+                            )
+                            .child(self.render_link_mode_picker(locked, cx))
+                            .child(self.render_link_endpoint(locked, cx))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "reports={} dropped={} dt={}",
+                                        self.health.total_reports,
+                                        self.health.dropped_frames,
+                                        self.health
+                                            .last_dt_us
+                                            .map(|dt| format!("{dt}us"))
+                                            .unwrap_or_else(|| "-".to_string())
+                                    )),
+                            ),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "reports={} dropped={} dt={}",
-                                self.health.total_reports,
-                                self.health.dropped_frames,
-                                self.health
-                                    .last_dt_us
-                                    .map(|dt| format!("{dt}us"))
-                                    .unwrap_or_else(|| "-".to_string())
-                            )),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("connect")
-                            .small()
-                            .label("Connect")
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.connect_from_current_source(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("load-run")
-                            .small()
-                            .primary()
-                            .label("Load & Run")
-                            .disabled(!has_startup_source)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.load_and_run_from_current_source(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("watch")
-                            .small()
-                            .label("Watch")
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.watch_from_current_source(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("ping")
-                            .small()
-                            .label("Ping")
-                            .disabled(!self.connected)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.send_command(SessionCommand::Ping);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("stop-reports")
-                            .small()
-                            .label("Stop")
-                            .disabled(!self.connected)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.send_command(SessionCommand::StopReports);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("reset-mcu")
-                            .small()
-                            .label("Reset")
-                            .disabled(!self.connected)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.send_command(SessionCommand::ResetMcu);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("disconnect")
-                            .small()
-                            .label("Disconnect")
-                            .disabled(self.session.is_none())
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.stop_session();
-                                cx.notify();
-                            })),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("connect")
+                                    .small()
+                                    .label("Connect")
+                                    .disabled(!can_connect)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.connect_from_current_source(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("load-run")
+                                    .small()
+                                    .primary()
+                                    .label("Load & Run")
+                                    .disabled(!has_startup_source || !can_connect)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.load_and_run_from_current_source(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("watch")
+                                    .small()
+                                    .label("Watch")
+                                    .disabled(!can_connect)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.watch_from_current_source(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("ping")
+                                    .small()
+                                    .label("Ping")
+                                    .disabled(!self.connected)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.send_command(SessionCommand::Ping);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("stop-reports")
+                                    .small()
+                                    .label("Stop")
+                                    .disabled(!self.connected)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.send_command(SessionCommand::StopReports);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("reset-mcu")
+                                    .small()
+                                    .label("Reset")
+                                    .disabled(!self.connected)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.send_command(SessionCommand::ResetMcu);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("disconnect")
+                                    .small()
+                                    .label("Disconnect")
+                                    .disabled(self.session.is_none())
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.stop_session();
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
     }
@@ -3641,6 +4064,27 @@ impl Render for RseqGpui {
 
         v_flex()
             .size_full()
+            .key_context("RseqGpui")
+            .on_action(
+                cx.listener(|this, action: &SelectLinkModeAction, window, cx| {
+                    if let Some(mode) = LinkMode::from_id(action.0) {
+                        this.set_link_mode(mode, window, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &SelectSerialPortAction, window, cx| {
+                    this.select_serial_port(action.0.clone(), window, cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &SelectSerialBaudAction, window, cx| {
+                    this.select_serial_baud(action.0, window, cx);
+                    cx.notify();
+                }),
+            )
             .bg(cx.theme().background)
             .child(
                 TitleBar::new().child(
@@ -4811,6 +5255,25 @@ fn display_path_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn parse_serial_baud(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("serial baud is required".to_string());
+    }
+    match trimmed.parse::<u32>() {
+        Ok(baud) if baud > 0 => Ok(baud),
+        _ => Err(format!("invalid serial baud: {trimmed}")),
+    }
+}
+
+fn serial_port_menu_label(port: &rseq_host::SerialPortInfo) -> String {
+    if port.detail.is_empty() {
+        port.label.clone()
+    } else {
+        format!("{} ({})", port.label, port.detail)
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let loaded = load_startup(&cli);
@@ -4980,6 +5443,34 @@ mod tests {
                     len: 2,
                 },
             ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn parse_serial_baud_rejects_empty_zero_and_text() {
+        assert_eq!(parse_serial_baud("115200").unwrap(), 115_200);
+        assert!(parse_serial_baud("").is_err());
+        assert!(parse_serial_baud("0").is_err());
+        assert!(parse_serial_baud("fast").is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn serial_port_menu_label_includes_detail_when_present() {
+        let plain = rseq_host::SerialPortInfo {
+            port_name: "/dev/cu.usbmodem1".to_string(),
+            label: "cu.usbmodem1".to_string(),
+            detail: String::new(),
+        };
+        assert_eq!(serial_port_menu_label(&plain), "cu.usbmodem1");
+
+        let detailed = rseq_host::SerialPortInfo {
+            port_name: "/dev/cu.usbmodem2".to_string(),
+            label: "cu.usbmodem2 - STLINK".to_string(),
+            detail: "USB 0483:374b STMicroelectronics".to_string(),
+        };
+        assert_eq!(
+            serial_port_menu_label(&detailed),
+            "cu.usbmodem2 - STLINK (USB 0483:374b STMicroelectronics)"
         );
     }
 

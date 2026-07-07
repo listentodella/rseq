@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust MCU DSL"
+  short_description: "Build Rust DSLs that run on MCUs"
+  default_prompt: "Use $rust-mcu-dsl to design a Rust DSL and MCU runtime for my embedded workflow."

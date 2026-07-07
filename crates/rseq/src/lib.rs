@@ -183,7 +183,7 @@ enum Token<'a> {
     })]
     String(String),
 
-    #[regex(r"[ \t\f\n]+", logos::skip)]
+    #[regex(r"[ \t\f\r\n]+", logos::skip)]
     Whitespace,
 
     #[regex(r"//[^\n]*", logos::skip, allow_greedy = true)]
@@ -3229,6 +3229,17 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         assert_eq!(program.stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_windows_crlf_newlines() {
+        let src = "chip!(\"qmi8660.yaml\");\r\n// comment\r\nwrite!(UI.WHOAMI, 0x06);\r\n";
+        let program = parse(src).unwrap();
+        assert_eq!(program.stmts.len(), 2);
+        assert!(matches!(
+            &program.stmts[0],
+            Stmt::Chip { path } if path == "qmi8660.yaml"
+        ));
     }
 
     #[test]

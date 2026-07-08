@@ -15,6 +15,7 @@ use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, Icon, IconName, Root, Selectable as _,
     Sizable as _, StyledExt as _, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants as _, DropdownButton},
+    checkbox::Checkbox,
     h_flex,
     input::{
         CompletionProvider, DocumentRangeSemanticTokensProvider, HoverProvider, Input, InputEvent,
@@ -52,6 +53,7 @@ const MAX_CAPTURE_RECORDS: usize = 200_000;
 const CHART_ZOOM_MIN: f32 = 0.25;
 const CHART_ZOOM_MAX: f32 = 8.0;
 const CHART_WHEEL_ZOOM_STEP: f32 = 1.12;
+const MOTION_AXIS_LABELS: [&str; 3] = ["x", "y", "z"];
 const COMMON_SERIAL_BAUDS: [u32; 10] = [
     9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000,
 ];
@@ -1198,6 +1200,7 @@ pub struct RseqGpui {
     samples: VecDeque<MotionSample>,
     sample_skip_count: usize,
     sample_skip_remaining: usize,
+    motion_axis_visible: [bool; 3],
     history_bars: VecDeque<HistoryBar>,
     history_bucket: Option<HistoryBucket>,
     acc_chart_range: Option<ChartRange>,
@@ -1376,6 +1379,7 @@ impl RseqGpui {
             samples: VecDeque::with_capacity(MAX_SAMPLES),
             sample_skip_count: 0,
             sample_skip_remaining: 0,
+            motion_axis_visible: [true; 3],
             history_bars: VecDeque::with_capacity(MAX_HISTORY_BARS),
             history_bucket: None,
             acc_chart_range: None,
@@ -2627,6 +2631,15 @@ impl RseqGpui {
         [cx.theme().red, cx.theme().green, cx.theme().blue]
     }
 
+    fn set_motion_axis_visible(&mut self, axis: usize, visible: bool) {
+        let Some(axis_visible) = self.motion_axis_visible.get_mut(axis) else {
+            return;
+        };
+        *axis_visible = visible;
+        self.acc_chart_range = None;
+        self.gyro_chart_range = None;
+    }
+
     fn reset_stream_state(&mut self, clear_capture: bool) {
         self.samples.clear();
         self.history_bars.clear();
@@ -2793,7 +2806,7 @@ impl RseqGpui {
         min_span: f32,
     ) -> ChartRange {
         self.chart_range(series)
-            .unwrap_or_else(|| auto_chart_range(data, min_span))
+            .unwrap_or_else(|| auto_chart_range_for_axes(data, min_span, self.motion_axis_visible))
     }
 
     fn chart_display_x_range(&self, series: MotionSeries, data_len: usize) -> ChartXRange {
@@ -2802,7 +2815,7 @@ impl RseqGpui {
     }
 
     fn chart_display_zoom(&self, series: MotionSeries, data: &[Vec3], min_span: f32) -> f32 {
-        let auto = auto_chart_range(data, min_span);
+        let auto = auto_chart_range_for_axes(data, min_span, self.motion_axis_visible);
         let range = self.chart_display_range(series, data, min_span);
         (auto.span() / range.span()).clamp(CHART_ZOOM_MIN, CHART_ZOOM_MAX)
     }
@@ -2817,7 +2830,7 @@ impl RseqGpui {
     ) {
         let delta = event.delta.pixel_delta(window.line_height());
         let data = self.series_data(series);
-        let auto = auto_chart_range(&data, min_span);
+        let auto = auto_chart_range_for_axes(&data, min_span, self.motion_axis_visible);
         let current = self.chart_range(series).unwrap_or(auto);
         let y_fraction = self
             .chart_bounds(series)
@@ -2861,7 +2874,7 @@ impl RseqGpui {
         }
 
         let data = self.series_data(series);
-        let auto_y = auto_chart_range(&data, min_span);
+        let auto_y = auto_chart_range_for_axes(&data, min_span, self.motion_axis_visible);
         let auto_x = auto_chart_x_range(data.len());
         self.chart_drag = Some(ChartDragState {
             series,
@@ -3268,6 +3281,9 @@ impl RseqGpui {
         let has_startup_source = self.has_startup_source(cx);
         let locked = self.session.is_some();
         let can_connect = self.link_mode.can_connect();
+        let watch_active = self.session_mode == "watch";
+        let load_run_active = self.session_mode == "load/run";
+        let connected_active = self.connected && !watch_active && !load_run_active;
         v_flex()
             .gap_2()
             .p_2()
@@ -3313,7 +3329,9 @@ impl RseqGpui {
                             .child(
                                 Button::new("connect")
                                     .small()
+                                    .success()
                                     .label("Connect")
+                                    .selected(connected_active)
                                     .disabled(!can_connect)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.connect_from_current_source(cx);
@@ -3325,6 +3343,7 @@ impl RseqGpui {
                                     .small()
                                     .primary()
                                     .label("Load & Run")
+                                    .selected(load_run_active)
                                     .disabled(!has_startup_source || !can_connect)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.load_and_run_from_current_source(cx);
@@ -3334,7 +3353,9 @@ impl RseqGpui {
                             .child(
                                 Button::new("watch")
                                     .small()
+                                    .info()
                                     .label("Watch")
+                                    .selected(watch_active)
                                     .disabled(!can_connect)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.watch_from_current_source(cx);
@@ -3394,12 +3415,13 @@ impl RseqGpui {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = Self::axis_colors(cx);
+        let visible_axes = self.motion_axis_visible;
+        let any_axis_visible = visible_axes.iter().any(|visible| *visible);
         let latest = data.last().copied().unwrap_or([0.0; 3]);
         let stats = axis_stddev(&data);
         let range = self.chart_display_range(series, &data, min_span);
         let x_range = self.chart_display_x_range(series, data.len());
         let zoom = self.chart_display_zoom(series, &data, min_span);
-        let labels = ["x", "y", "z"];
         let view = cx.entity();
         v_flex()
             .flex_1()
@@ -3419,7 +3441,7 @@ impl RseqGpui {
                     .child(
                         h_flex()
                             .gap_3()
-                            .children((0..3).map(|idx| {
+                            .children((0..3).filter(move |idx| visible_axes[*idx]).map(|idx| {
                                 h_flex()
                                     .gap_1()
                                     .child(div().size_2().rounded_full().bg(colors[idx]))
@@ -3429,10 +3451,18 @@ impl RseqGpui {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!(
                                                 "{} {:+.2} σ{:.2}",
-                                                labels[idx], latest[idx], stats[idx]
+                                                MOTION_AXIS_LABELS[idx], latest[idx], stats[idx]
                                             )),
                                     )
                             }))
+                            .when(!any_axis_visible, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("all axes hidden"),
+                                )
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -3490,9 +3520,10 @@ impl RseqGpui {
                             this.zoom_chart_from_wheel(series, min_span, event, window, cx);
                         },
                     ))
-                    .child(TripleLineChart::new_with_ranges(
+                    .child(TripleLineChart::new_with_ranges_and_axes(
                         data,
                         colors,
+                        visible_axes,
                         x_range.x_min,
                         x_range.x_max,
                         range.y_min,
@@ -3592,7 +3623,8 @@ impl RseqGpui {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = Self::axis_colors(cx);
-        let labels = ["x", "y", "z"];
+        let visible_axes = self.motion_axis_visible;
+        let any_axis_visible = visible_axes.iter().any(|visible| *visible);
         let latest = data.last().copied();
         let view = cx.entity();
 
@@ -3607,20 +3639,35 @@ impl RseqGpui {
                     .px_2()
                     .pb_1()
                     .child(div().text_xs().font_semibold().child(title.to_string()))
-                    .child(h_flex().gap_2().children((0..3).map(|idx| {
-                        let range = latest
-                            .map(|bucket| bucket[idx].high - bucket[idx].low)
-                            .unwrap_or(0.0);
+                    .child(
                         h_flex()
-                            .gap_1()
-                            .child(div().size_2().rounded_full().bg(colors[idx]))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{} d{:.2}", labels[idx], range)),
-                            )
-                    }))),
+                            .gap_2()
+                            .children((0..3).filter(move |idx| visible_axes[*idx]).map(|idx| {
+                                let range = latest
+                                    .map(|bucket| bucket[idx].high - bucket[idx].low)
+                                    .unwrap_or(0.0);
+                                h_flex()
+                                    .gap_1()
+                                    .child(div().size_2().rounded_full().bg(colors[idx]))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} d{:.2}",
+                                                MOTION_AXIS_LABELS[idx], range
+                                            )),
+                                    )
+                            }))
+                            .when(!any_axis_visible, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("all axes hidden"),
+                                )
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -3638,7 +3685,12 @@ impl RseqGpui {
                             }
                         }),
                     )
-                    .child(TripleOhlcChart::new(data, colors, min_span)),
+                    .child(TripleOhlcChart::new_with_axes(
+                        data,
+                        colors,
+                        visible_axes,
+                        min_span,
+                    )),
             )
     }
 
@@ -3735,6 +3787,7 @@ impl RseqGpui {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = Self::axis_colors(cx);
+        let visible_axes = self.motion_axis_visible;
         let series = view.series;
         let data = view.samples.clone();
         let min_span = match series {
@@ -3748,9 +3801,10 @@ impl RseqGpui {
             .flex_1()
             .min_h_0()
             .p_2()
-            .child(TripleLineChart::new_with_ranges(
+            .child(TripleLineChart::new_with_ranges_and_axes(
                 data,
                 colors,
+                visible_axes,
                 x_range.x_min,
                 x_range.x_max,
                 range.y_min,
@@ -3792,6 +3846,27 @@ impl RseqGpui {
             .into_any_element()
     }
 
+    fn render_axis_checkbox(&self, axis: usize, cx: &Context<Self>) -> impl IntoElement {
+        let colors = Self::axis_colors(cx);
+        let checked = self.motion_axis_visible[axis];
+        let label = MOTION_AXIS_LABELS[axis].to_uppercase();
+
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(div().size_2().rounded_full().bg(colors[axis]))
+            .child(
+                Checkbox::new(format!("motion-axis-{axis}"))
+                    .xsmall()
+                    .checked(checked)
+                    .label(label)
+                    .on_click(cx.listener(move |this, checked: &bool, _window, cx| {
+                        this.set_motion_axis_visible(axis, *checked);
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_motion_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
             .justify_between()
@@ -3818,6 +3893,23 @@ impl RseqGpui {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Axes"),
+                            )
+                            .children((0..3).map(|axis| self.render_axis_checkbox(axis, cx))),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -4566,6 +4658,8 @@ impl RseqGpui {
         let dirty = self.sequence_dirty;
         let source_ready = self.current_view_has_source(cx);
         let chips = self.chip_paths_label();
+        let watch_active = self.session_mode == "watch";
+        let load_run_active = self.session_mode == "load/run";
 
         v_flex()
             .w(px(286.))
@@ -4663,6 +4757,7 @@ impl RseqGpui {
                                     .primary()
                                     .icon(IconName::Play)
                                     .label("Load & Run")
+                                    .selected(load_run_active)
                                     .disabled(!source_ready)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.load_and_run_sequence_editor(cx);
@@ -4672,7 +4767,9 @@ impl RseqGpui {
                             .child(
                                 Button::new("sequence-watch")
                                     .xsmall()
+                                    .info()
                                     .label("Watch")
+                                    .selected(watch_active)
                                     .disabled(!source_ready)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         if this.reload_workspace_from_sequence_editor(false, cx) {
@@ -5921,10 +6018,15 @@ fn axis_stddev(data: &[Vec3]) -> Vec3 {
     [variance[0].sqrt(), variance[1].sqrt(), variance[2].sqrt()]
 }
 
-fn auto_chart_range(data: &[Vec3], min_span: f32) -> ChartRange {
+fn auto_chart_range_for_axes(data: &[Vec3], min_span: f32, visible_axes: [bool; 3]) -> ChartRange {
     let peak = data
         .iter()
-        .flat_map(|sample| sample.iter())
+        .flat_map(|sample| {
+            sample
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, value)| visible_axes[axis].then_some(value))
+        })
         .fold(0f32, |max, value| max.max(value.abs()));
     let y_abs = (peak * 1.15).max(min_span);
     ChartRange {
@@ -7793,6 +7895,14 @@ irq!(int1) {
         assert!((std[0] - 1.6329932).abs() < 0.00001);
         assert_eq!(std[1], 0.0);
         assert!((std[2] - 1.8856181).abs() < 0.00001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn auto_chart_range_uses_only_visible_axes() {
+        let data = vec![[1.0, 2.0, 1000.0], [-3.0, 4.0, -900.0]];
+        let range = auto_chart_range_for_axes(&data, 1.0, [true, true, false]);
+        assert!(range.y_max < 5.0);
+        assert_eq!(range.y_min, -range.y_max);
     }
 
     #[::core::prelude::v1::test]

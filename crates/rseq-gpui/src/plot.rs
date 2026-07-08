@@ -132,6 +132,7 @@ impl Plot for ScalarLineChart {
 pub struct TripleLineChart {
     data: Vec<Vec3>,
     colors: [Hsla; 3],
+    visible_axes: [bool; 3],
     x_min: f32,
     x_max: f32,
     y_min: f32,
@@ -139,9 +140,10 @@ pub struct TripleLineChart {
 }
 
 impl TripleLineChart {
-    pub fn new_with_ranges(
+    pub fn new_with_ranges_and_axes(
         data: Vec<Vec3>,
         colors: [Hsla; 3],
+        visible_axes: [bool; 3],
         x_min: f32,
         x_max: f32,
         y_min: f32,
@@ -160,6 +162,7 @@ impl TripleLineChart {
         Self {
             data,
             colors,
+            visible_axes,
             x_min,
             x_max,
             y_min,
@@ -187,6 +190,10 @@ impl Plot for TripleLineChart {
             .paint(&bounds, window);
 
         for axis in 0..3 {
+            if !self.visible_axes[axis] {
+                continue;
+            }
+
             let xs = x.clone();
             let ys = y.clone();
             let series = self
@@ -223,19 +230,31 @@ impl Plot for TripleLineChart {
 pub struct TripleOhlcChart {
     data: Vec<TripleOhlc>,
     colors: [Hsla; 3],
+    visible_axes: [bool; 3],
     y_abs: f32,
 }
 
 impl TripleOhlcChart {
-    pub fn new(data: Vec<TripleOhlc>, colors: [Hsla; 3], min_span: f32) -> Self {
+    pub fn new_with_axes(
+        data: Vec<TripleOhlc>,
+        colors: [Hsla; 3],
+        visible_axes: [bool; 3],
+        min_span: f32,
+    ) -> Self {
         let peak = data
             .iter()
-            .flat_map(|bucket| bucket.iter())
+            .flat_map(|bucket| {
+                bucket
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(axis, ohlc)| visible_axes[axis].then_some(ohlc))
+            })
             .fold(0f32, |max, ohlc| max.max(ohlc.peak_abs()));
         let y_abs = (peak * 1.15).max(min_span);
         Self {
             data,
             colors,
+            visible_axes,
             y_abs,
         }
     }
@@ -279,6 +298,10 @@ impl Plot for TripleOhlcChart {
             let group_center = (index as f32 + 0.5) * band_width;
 
             for axis in 0..3 {
+                if !self.visible_axes[axis] {
+                    continue;
+                }
+
                 let ohlc = bucket[axis];
                 let Some(open_y) = y.tick(&(ohlc.open as f64)) else {
                     continue;

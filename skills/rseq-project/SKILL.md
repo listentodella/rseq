@@ -9,6 +9,7 @@ Use this skill as the project entry point. When a task also matches a more speci
 
 - DSL/compiler/VM work: `../rust-mcu-dsl/SKILL.md`
 - GPUI component work: `../gpui-component/SKILL.md`
+- GPUI desktop packaging/release bundles: `../packaging/SKILL.md`
 - Serial/CDC/report observation: `../serial/SKILL.md`
 - OpenOCD/GDB debug: `../openocd/SKILL.md`
 - probe-rs or J-Link debug: `../probe-rs/SKILL.md` or `../jlink/SKILL.md`

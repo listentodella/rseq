@@ -1649,8 +1649,15 @@ pub fn spawn_session(config: SessionConfig) -> SessionHandle {
     let stop = Arc::new(AtomicBool::new(false));
 
     match (config.demo, config.serial.is_some(), config.tcp.is_some()) {
-        (true, _, _) | (false, false, false) => {
+        (true, _, _) => {
             spawn_demo_session(event_tx, cmd_rx, stop.clone());
+        }
+        (false, false, false) => {
+            spawn_error_session(
+                "select an endpoint: serial or tcp".to_string(),
+                event_tx,
+                stop.clone(),
+            );
         }
         (false, true, true) => {
             spawn_error_session(

@@ -13,6 +13,20 @@ cargo check -p rseq-gpui --features serial
 
 Serial ports are usually named `/dev/cu.usbmodem*` or `/dev/cu.usbserial*`.
 
+To create a double-clickable GPUI app bundle:
+
+```sh
+python3 scripts/package_macos_app.py
+open dist/Rseq.app
+```
+
+The canonical script also lives in the bundled packaging skill:
+`skills/packaging/scripts/package_macos_app.py`.
+
+The bundle contains the compiled `rseq-gpui` binary plus repository resources
+such as `qmi8660.yaml` and `examples/*.rseq`. A target machine does not need
+Rust, Cargo, or a separately installed GPUI environment to launch the app.
+
 ## Windows 11
 
 Install:
@@ -34,6 +48,21 @@ Serial ports are usually named `COM3`, `COM4`, etc:
 ```powershell
 cargo run -p rseq-gpui --features serial -- --serial COM3 --baud 115200 --chip qmi8660.yaml -f examples/qmi8660_fifo.rseq
 ```
+
+To create a double-clickable Windows distribution folder and zip archive:
+
+```powershell
+python scripts\package_windows_app.py
+.\dist\rseq-gpui-windows-x86_64-pc-windows-msvc\rseq-gpui.exe
+```
+
+The canonical script also lives in the bundled packaging skill:
+`skills\packaging\scripts\package_windows_app.py`.
+
+The package contains `rseq-gpui.exe`, bundled resources such as `qmi8660.yaml`
+and `examples\*.rseq`, and a `run-demo.cmd` helper. The target machine does not
+need Rust, Cargo, or a separately installed GPUI environment. Build on Windows
+from a Developer PowerShell so MSVC tools and the Windows SDK are visible.
 
 Cross-checking the Windows target from macOS is not enough by itself: some
 dependencies compile small C/ASM helpers and need MSVC tools such as `lib.exe`

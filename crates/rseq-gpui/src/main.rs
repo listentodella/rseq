@@ -2339,9 +2339,28 @@ impl RseqGpui {
         }
 
         self.reset_stream_state(true);
-        let demo = self.link_mode == LinkMode::Demo || self.cli.demo;
-        let serial = if demo { None } else { self.cli.serial.clone() };
-        let tcp = if demo { None } else { self.cli.tcp.clone() };
+        let demo = self.link_mode == LinkMode::Demo;
+        let serial = if self.link_mode == LinkMode::Serial {
+            self.cli.serial.clone()
+        } else {
+            None
+        };
+        let tcp = if self.link_mode == LinkMode::Tcp {
+            self.cli.tcp.clone()
+        } else {
+            None
+        };
+        if !demo && serial.is_none() && tcp.is_none() {
+            let message = format!(
+                "{} endpoint is not configured; choose an endpoint and press Connect/Watch again",
+                self.link_mode.label()
+            );
+            push_bounded(&mut self.logs, message, MAX_TEXT_LINES);
+            self.connected = false;
+            self.session_mode = "idle".to_string();
+            self.connection_label = "disconnected".to_string();
+            return;
+        }
         self.connected = false;
         self.session_mode = if watch {
             "watch".to_string()
@@ -4920,7 +4939,9 @@ impl RseqGpui {
                                     .selected(watch_active)
                                     .disabled(!source_ready)
                                     .on_click(cx.listener(|this, _, _window, cx| {
-                                        if this.reload_workspace_from_sequence_editor(false, cx) {
+                                        if this.prepare_connection_config(cx)
+                                            && this.reload_workspace_from_sequence_editor(false, cx)
+                                        {
                                             this.start_session(true);
                                         }
                                         cx.notify();
@@ -5250,6 +5271,9 @@ impl RseqGpui {
     }
 
     fn load_and_run_active_visual_sequence(&mut self, cx: &Context<Self>) {
+        if !self.prepare_connection_config(cx) {
+            return;
+        }
         match self.visual_source_for_active(cx) {
             Ok(source) => {
                 let loaded =
@@ -7609,6 +7633,7 @@ fn report_decoder_registry_from_sidecar(
 }
 
 fn main() {
+    enter_packaged_resources_dir();
     let cli = Cli::parse();
     let loaded = load_startup(&cli);
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
@@ -7644,6 +7669,44 @@ fn main() {
         })
         .detach();
     });
+}
+
+fn enter_packaged_resources_dir() {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(macos_dir) = exe.parent() else {
+            return;
+        };
+        if macos_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+            return;
+        }
+        let Some(contents_dir) = macos_dir.parent() else {
+            return;
+        };
+        if contents_dir.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+            return;
+        }
+        let resources_dir = contents_dir.join("Resources");
+        if resources_dir.is_dir() {
+            let _ = std::env::set_current_dir(resources_dir);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(exe_dir) = exe.parent() else {
+            return;
+        };
+        if exe_dir.join("qmi8660.yaml").is_file() || exe_dir.join("examples").is_dir() {
+            let _ = std::env::set_current_dir(exe_dir);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -65,6 +65,35 @@ local `gpui-component` override instructions. The override is also the escape
 hatch for testing component patches before they are available from the pinned
 public commit.
 
+## macOS App Bundle
+
+Create a double-clickable `.app` bundle:
+
+```bash
+python3 scripts/package_macos_app.py
+open dist/Rseq.app
+```
+
+The bundle copies `qmi8660.yaml`, `examples/*.rseq`, and related repository docs
+into `Rseq.app/Contents/Resources`. When launched by double-clicking, the app
+uses that Resources directory as its working directory, so bundled example paths
+continue to work without requiring Rust, Cargo, or a local GPUI checkout on the
+target Mac.
+
+## Windows Package
+
+Create a double-clickable Windows distribution folder and zip archive from a
+Developer PowerShell:
+
+```powershell
+python scripts\package_windows_app.py
+.\dist\rseq-gpui-windows-x86_64-pc-windows-msvc\rseq-gpui.exe
+```
+
+The package contains `rseq-gpui.exe`, bundled resources, and a `run-demo.cmd`
+helper. When launched from the packaged folder, the app uses that folder as its
+working directory so `qmi8660.yaml` and `examples\*.rseq` paths continue to work.
+
 ## UI
 
 - Motion: live accelerometer (`m/s^2`) and gyroscope (`rad/s`) charts.

@@ -1,4 +1,4 @@
-use gpui::{App, Bounds, Hsla, PathBuilder, Pixels, Window, fill, px};
+use gpui::{App, Bounds, Hsla, PathBuilder, Pixels, Window, fill, point, px};
 use gpui_component::{
     ActiveTheme,
     plot::{
@@ -9,6 +9,13 @@ use gpui_component::{
 };
 
 pub type Vec3 = [f32; 3];
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectedPoint {
+    x: f32,
+    y: f32,
+    depth: f32,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AxisOhlc {
@@ -343,6 +350,174 @@ impl Plot for TripleOhlcChart {
                     origin_point(px(axis_center + body_width / 2.), px(bottom), origin),
                 );
                 window.paint_quad(fill(body_bounds, color));
+            }
+        }
+    }
+}
+
+#[derive(IntoPlot)]
+pub struct OrientationModel {
+    roll: f32,
+    pitch: f32,
+    yaw: f32,
+    face_colors: [Hsla; 6],
+    axis_colors: [Hsla; 3],
+    edge_color: Hsla,
+    muted_color: Hsla,
+}
+
+impl OrientationModel {
+    pub fn new(
+        roll: f32,
+        pitch: f32,
+        yaw: f32,
+        face_colors: [Hsla; 6],
+        axis_colors: [Hsla; 3],
+        edge_color: Hsla,
+        muted_color: Hsla,
+    ) -> Self {
+        Self {
+            roll,
+            pitch,
+            yaw,
+            face_colors,
+            axis_colors,
+            edge_color,
+            muted_color,
+        }
+    }
+
+    fn rotate(&self, [x, y, z]: Vec3) -> Vec3 {
+        let (sr, cr) = self.roll.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+
+        let roll = [x, y * cr - z * sr, y * sr + z * cr];
+        let pitch = [
+            roll[0] * cp + roll[2] * sp,
+            roll[1],
+            -roll[0] * sp + roll[2] * cp,
+        ];
+        [
+            pitch[0] * cy - pitch[1] * sy,
+            pitch[0] * sy + pitch[1] * cy,
+            pitch[2],
+        ]
+    }
+
+    fn project(point_3d: Vec3, bounds: Bounds<Pixels>, scale: f32) -> ProjectedPoint {
+        let origin = bounds.origin;
+        let width = bounds.size.width.as_f32();
+        let height = bounds.size.height.as_f32();
+        let x = point_3d[0] - point_3d[1] * 0.42;
+        let y = -point_3d[2] + point_3d[1] * 0.32;
+
+        ProjectedPoint {
+            x: origin.x.as_f32() + width * 0.5 + x * scale,
+            y: origin.y.as_f32() + height * 0.52 + y * scale,
+            depth: point_3d[1] + point_3d[2] * 0.12,
+        }
+    }
+
+    fn rotated_projected(
+        &self,
+        point_3d: Vec3,
+        bounds: Bounds<Pixels>,
+        scale: f32,
+    ) -> ProjectedPoint {
+        Self::project(self.rotate(point_3d), bounds, scale)
+    }
+}
+
+impl Plot for OrientationModel {
+    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
+        let width = bounds.size.width.as_f32();
+        let height = bounds.size.height.as_f32();
+        if width <= 4.0 || height <= 4.0 {
+            return;
+        }
+
+        let scale = width.min(height) * 0.34;
+        let vertices = [
+            [-0.55, -0.55, -0.55],
+            [0.55, -0.55, -0.55],
+            [0.55, 0.55, -0.55],
+            [-0.55, 0.55, -0.55],
+            [-0.55, -0.55, 0.55],
+            [0.55, -0.55, 0.55],
+            [0.55, 0.55, 0.55],
+            [-0.55, 0.55, 0.55],
+        ];
+        let projected = vertices.map(|vertex| self.rotated_projected(vertex, bounds, scale));
+        let faces = [
+            ([0, 1, 2, 3], 0),
+            ([4, 7, 6, 5], 1),
+            ([0, 4, 5, 1], 2),
+            ([3, 2, 6, 7], 3),
+            ([0, 3, 7, 4], 4),
+            ([1, 5, 6, 2], 5),
+        ];
+        let mut ordered_faces = faces
+            .into_iter()
+            .map(|(indices, color_index)| {
+                let depth = indices
+                    .iter()
+                    .map(|index| projected[*index].depth)
+                    .sum::<f32>()
+                    / indices.len() as f32;
+                (depth, indices, color_index)
+            })
+            .collect::<Vec<_>>();
+        ordered_faces.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let shadow_bounds = Bounds::from_corners(
+            point(
+                px(bounds.origin.x.as_f32() + width * 0.23),
+                px(bounds.origin.y.as_f32() + height * 0.70),
+            ),
+            point(
+                px(bounds.origin.x.as_f32() + width * 0.77),
+                px(bounds.origin.y.as_f32() + height * 0.79),
+            ),
+        );
+        window.paint_quad(fill(shadow_bounds, self.muted_color.opacity(0.16)));
+
+        for (_, indices, color_index) in ordered_faces {
+            let mut fill_builder = PathBuilder::fill();
+            let first = projected[indices[0]];
+            fill_builder.move_to(point(px(first.x), px(first.y)));
+            for index in indices.iter().skip(1) {
+                let point_2d = projected[*index];
+                fill_builder.line_to(point(px(point_2d.x), px(point_2d.y)));
+            }
+            if let Ok(path) = fill_builder.build() {
+                window.paint_path(path, self.face_colors[color_index]);
+            }
+
+            let mut edge_builder = PathBuilder::stroke(px(1.0));
+            edge_builder.move_to(point(px(first.x), px(first.y)));
+            for index in indices.iter().skip(1) {
+                let point_2d = projected[*index];
+                edge_builder.line_to(point(px(point_2d.x), px(point_2d.y)));
+            }
+            edge_builder.line_to(point(px(first.x), px(first.y)));
+            if let Ok(path) = edge_builder.build() {
+                window.paint_path(path, self.edge_color.opacity(0.72));
+            }
+        }
+
+        let axis_ends = [
+            self.rotated_projected([0.95, 0.0, 0.0], bounds, scale),
+            self.rotated_projected([0.0, 0.95, 0.0], bounds, scale),
+            self.rotated_projected([0.0, 0.0, 0.95], bounds, scale),
+        ];
+        let origin = self.rotated_projected([0.0, 0.0, 0.0], bounds, scale);
+        for (axis, end) in axis_ends.into_iter().enumerate() {
+            let mut axis_builder = PathBuilder::stroke(px(2.0));
+            axis_builder.move_to(point(px(origin.x), px(origin.y)));
+            axis_builder.line_to(point(px(end.x), px(end.y)));
+            if let Ok(path) = axis_builder.build() {
+                window.paint_path(path, self.axis_colors[axis].opacity(0.86));
             }
         }
     }

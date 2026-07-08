@@ -27,8 +27,8 @@ use gpui_component::{
     v_flex,
 };
 use plot::{
-    ScalarLineChart, TripleLineChart, TripleOhlc, TripleOhlcChart, Vec3, new_triple_ohlc,
-    push_triple_ohlc,
+    OrientationModel, ScalarLineChart, TripleLineChart, TripleOhlc, TripleOhlcChart, Vec3,
+    new_triple_ohlc, push_triple_ohlc,
 };
 use rseq_host::{
     AccessKind, FieldInfo, HostMetadata, MAX_TEXT_LINES, MotionSample, RegisterCatalog,
@@ -53,6 +53,11 @@ const MAX_CAPTURE_RECORDS: usize = 200_000;
 const CHART_ZOOM_MIN: f32 = 0.25;
 const CHART_ZOOM_MAX: f32 = 8.0;
 const CHART_WHEEL_ZOOM_STEP: f32 = 1.12;
+const ATTITUDE_ACC_CORRECTION_MIN: f32 = 0.01;
+const ATTITUDE_ACC_CORRECTION_MAX: f32 = 0.08;
+const ATTITUDE_ACC_CORRECTION_SECS: f32 = 0.45;
+const ATTITUDE_DT_MAX_SECS: f32 = 0.1;
+const ATTITUDE_FALLBACK_DT_SECS: f32 = 0.01;
 const MOTION_AXIS_LABELS: [&str; 3] = ["x", "y", "z"];
 const COMMON_SERIAL_BAUDS: [u32; 10] = [
     9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000, 2_000_000,
@@ -845,6 +850,72 @@ struct ChartDragState {
     auto_x_range: ChartXRange,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttitudeEstimate {
+    roll: f32,
+    pitch: f32,
+    yaw: f32,
+    last_timestamp_us: Option<u64>,
+    initialized: bool,
+}
+
+impl Default for AttitudeEstimate {
+    fn default() -> Self {
+        Self {
+            roll: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            last_timestamp_us: None,
+            initialized: false,
+        }
+    }
+}
+
+impl AttitudeEstimate {
+    fn update(&mut self, sample: &MotionSample) {
+        let acc_angles = attitude_from_acc(motion_acc_vec3(sample));
+        if !self.initialized {
+            if let Some((roll, pitch)) = acc_angles {
+                self.roll = roll;
+                self.pitch = pitch;
+            }
+            self.yaw = 0.0;
+            self.last_timestamp_us = sample.timestamp_us;
+            self.initialized = true;
+            return;
+        }
+
+        let dt = attitude_dt_secs(self.last_timestamp_us, sample.timestamp_us)
+            .unwrap_or(ATTITUDE_FALLBACK_DT_SECS);
+        let gyro = motion_gyro_vec3(sample);
+        let predicted_roll = normalize_radians_pi(self.roll + gyro[0] * dt);
+        let predicted_pitch = normalize_radians_pi(self.pitch + gyro[1] * dt);
+        let predicted_yaw = normalize_radians_pi(self.yaw + gyro[2] * dt);
+
+        if let Some((acc_roll, acc_pitch)) = acc_angles {
+            let correction = (dt / ATTITUDE_ACC_CORRECTION_SECS)
+                .clamp(ATTITUDE_ACC_CORRECTION_MIN, ATTITUDE_ACC_CORRECTION_MAX);
+            self.roll = blend_radians(predicted_roll, acc_roll, correction);
+            self.pitch = blend_radians(predicted_pitch, acc_pitch, correction);
+        } else {
+            self.roll = predicted_roll;
+            self.pitch = predicted_pitch;
+        }
+        self.yaw = predicted_yaw;
+        if sample.timestamp_us.is_some() {
+            self.last_timestamp_us = sample.timestamp_us;
+        }
+    }
+
+    fn degrees(self) -> Vec3 {
+        [
+            self.roll.to_degrees(),
+            self.pitch.to_degrees(),
+            normalize_radians_pi(self.yaw).to_degrees(),
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HistoryBar {
     acc: TripleOhlc,
@@ -1213,6 +1284,7 @@ pub struct RseqGpui {
     acc_history_bounds: Option<Bounds<Pixels>>,
     gyro_history_bounds: Option<Bounds<Pixels>>,
     history_intraday: Option<HistoryIntradayView>,
+    attitude: AttitudeEstimate,
     show_temperature_panel: bool,
     registers: BTreeMap<u32, RegisterValue>,
     capture_records: Vec<ReportCaptureRecord>,
@@ -1392,6 +1464,7 @@ impl RseqGpui {
             acc_history_bounds: None,
             gyro_history_bounds: None,
             history_intraday: None,
+            attitude: AttitudeEstimate::default(),
             show_temperature_panel: true,
             registers: BTreeMap::new(),
             capture_records: Vec::new(),
@@ -2646,6 +2719,7 @@ impl RseqGpui {
         self.history_bucket = None;
         self.history_intraday = None;
         self.chart_drag = None;
+        self.attitude = AttitudeEstimate::default();
         self.health = ReportHealth::default();
         self.sample_skip_remaining = self.sample_skip_count;
         if clear_capture {
@@ -2681,6 +2755,7 @@ impl RseqGpui {
         self.history_bucket = None;
         self.history_intraday = None;
         self.chart_drag = None;
+        self.attitude = AttitudeEstimate::default();
         self.sample_skip_remaining = self.sample_skip_count;
         push_bounded(
             &mut self.logs,
@@ -2697,6 +2772,7 @@ impl RseqGpui {
 
         let acc = motion_acc_vec3(&sample);
         let gyro = motion_gyro_vec3(&sample);
+        self.attitude.update(&sample);
 
         if self.samples.len() == MAX_SAMPLES {
             self.samples.pop_front();
@@ -3812,6 +3888,61 @@ impl RseqGpui {
             ))
     }
 
+    fn render_orientation_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+        let axis_colors = Self::axis_colors(cx);
+        let degrees = self.attitude.degrees();
+        let face_colors = [
+            cx.theme().muted.opacity(0.58),
+            cx.theme().accent.opacity(0.40),
+            cx.theme().red.opacity(0.36),
+            cx.theme().green.opacity(0.36),
+            cx.theme().blue.opacity(0.38),
+            cx.theme().yellow.opacity(0.40),
+        ];
+
+        v_flex()
+            .w(px(282.))
+            .min_w(px(248.))
+            .h_full()
+            .flex_none()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().text_sm().font_semibold().child("RPY Cube"))
+                    .child(h_flex().gap_2().flex_wrap().children(
+                        ["R", "P", "Y"].into_iter().enumerate().map(|(idx, label)| {
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(div().size_2().rounded_full().bg(axis_colors[idx]))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{label} {:+.1} deg", degrees[idx])),
+                                )
+                        }),
+                    )),
+            )
+            .child(div().flex_1().min_h_0().p_2().child(OrientationModel::new(
+                self.attitude.roll,
+                self.attitude.pitch,
+                self.attitude.yaw,
+                face_colors,
+                axis_colors,
+                cx.theme().border,
+                cx.theme().muted_foreground,
+            )))
+    }
+
     fn render_motion(&self, cx: &Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
@@ -3820,20 +3951,37 @@ impl RseqGpui {
             .p_3()
             .gap_3()
             .child(self.render_motion_toolbar(cx))
-            .child(self.render_chart(
-                MotionSeries::Acc,
-                "Accelerometer (m/s^2)",
-                self.acc_data(),
-                12.0,
-                cx,
-            ))
-            .child(self.render_chart(
-                MotionSeries::Gyro,
-                "Gyroscope (rad/s)",
-                self.gyro_data(),
-                2.0,
-                cx,
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(320.))
+                    .gap_3()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .gap_3()
+                            .child(self.render_chart(
+                                MotionSeries::Acc,
+                                "Accelerometer (m/s^2)",
+                                self.acc_data(),
+                                12.0,
+                                cx,
+                            ))
+                            .child(self.render_chart(
+                                MotionSeries::Gyro,
+                                "Gyroscope (rad/s)",
+                                self.gyro_data(),
+                                2.0,
+                                cx,
+                            )),
+                    )
+                    .child(self.render_orientation_panel(cx)),
+            )
             .when(
                 self.has_temperature_data() && self.show_temperature_panel,
                 |this| this.child(self.render_temperature_panel(cx)),
@@ -5994,6 +6142,36 @@ fn motion_gyro_vec3(sample: &MotionSample) -> Vec3 {
     ]
 }
 
+fn attitude_dt_secs(last_timestamp_us: Option<u64>, timestamp_us: Option<u64>) -> Option<f32> {
+    let (Some(last), Some(timestamp)) = (last_timestamp_us, timestamp_us) else {
+        return None;
+    };
+    if timestamp <= last {
+        return None;
+    }
+    Some(((timestamp - last) as f32 * 0.000_001).min(ATTITUDE_DT_MAX_SECS))
+}
+
+fn attitude_from_acc(acc: Vec3) -> Option<(f32, f32)> {
+    let norm = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
+    if norm < 0.1 {
+        return None;
+    }
+
+    let roll = acc[1].atan2(acc[2]);
+    let pitch = (-acc[0]).atan2((acc[1] * acc[1] + acc[2] * acc[2]).sqrt());
+    Some((normalize_radians_pi(roll), normalize_radians_pi(pitch)))
+}
+
+fn blend_radians(current: f32, target: f32, weight: f32) -> f32 {
+    normalize_radians_pi(current + normalize_radians_pi(target - current) * weight.clamp(0.0, 1.0))
+}
+
+fn normalize_radians_pi(angle: f32) -> f32 {
+    let tau = std::f32::consts::PI * 2.0;
+    (angle + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI
+}
+
 fn axis_stddev(data: &[Vec3]) -> Vec3 {
     if data.is_empty() {
         return [0.0; 3];
@@ -7903,6 +8081,36 @@ irq!(int1) {
         let range = auto_chart_range_for_axes(&data, 1.0, [true, true, false]);
         assert!(range.y_max < 5.0);
         assert_eq!(range.y_min, -range.y_max);
+    }
+
+    #[::core::prelude::v1::test]
+    fn attitude_estimate_initializes_from_acc_and_integrates_yaw() {
+        let mut attitude = AttitudeEstimate::default();
+        attitude.update(&MotionSample {
+            timestamp_us: Some(0),
+            acc: [0.0, 0.0, 9.80665],
+            gyro: [0.0, 0.0, 0.0],
+            temp_c: None,
+        });
+        assert!(attitude.initialized);
+        assert!(attitude.roll.abs() < 0.0001);
+        assert!(attitude.pitch.abs() < 0.0001);
+
+        attitude.update(&MotionSample {
+            timestamp_us: Some(1_000_000),
+            acc: [0.0, 0.0, 9.80665],
+            gyro: [0.0, 0.0, 1.0],
+            temp_c: None,
+        });
+        assert!((attitude.yaw - ATTITUDE_DT_MAX_SECS).abs() < 0.0001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn attitude_from_acc_rejects_zero_vector() {
+        assert!(attitude_from_acc([0.0, 0.0, 0.0]).is_none());
+        let (roll, pitch) = attitude_from_acc([0.0, 9.80665, 0.0]).unwrap();
+        assert!((roll - std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+        assert!(pitch.abs() < 0.0001);
     }
 
     #[::core::prelude::v1::test]

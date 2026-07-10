@@ -3,7 +3,7 @@
 name = "rustapp"
 version = "0.1.0"
 edition = "2021"
-description = "rseq MCU firmware: rseq-link protocol over USB CDC, real IMU SPI bus"
+description = "rseq MCU firmware: rseq-link protocol over board-selected transport, real IMU buses"
 license = "Apache-2.0 or MIT"
 
 [lib]

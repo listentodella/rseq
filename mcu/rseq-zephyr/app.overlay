@@ -5,12 +5,9 @@
  * rseq MCU common overlay.
  *
  * Board-specific wiring lives in boards/<board>.overlay. Chip bus/address
- * selection is supplied by the rseq script, so this file stays transport-only.
+ * selection is supplied by the rseq script.
+ *
+ * Keep transport selection in boards/<board>.overlay via /chosen
+ * rseq,transport. This file is intentionally empty so boards without target
+ * USB device wiring are not forced to instantiate a CDC-ACM node.
  */
-
-/* USB CDC-ACM — the rseq-link transport channel. */
-&zephyr_udc0 {
-	cdc_acm_uart0: cdc_acm_uart0 {
-		compatible = "zephyr,cdc-acm-uart";
-	};
-};

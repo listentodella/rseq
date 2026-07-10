@@ -8,7 +8,18 @@
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include "../app.overlay"
 
+/* USB CDC-ACM — the rseq-link transport channel. */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
 / {
+	chosen {
+		rseq,transport = &cdc_acm_uart0;
+	};
+
 	aliases {
 		rseq-spi = &arduino_spi;
 		rseq-i2c = &arduino_i2c;

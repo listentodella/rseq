@@ -1,0 +1,27 @@
+# Copyright (c) 2026 rseq contributors
+# SPDX-License-Identifier: Apache-2.0
+
+menu "rseq MCU firmware"
+
+choice RSEQ_TRANSPORT
+	prompt "rseq-link transport"
+	default RSEQ_TRANSPORT_USB_CDC
+	help
+	  Select the byte-stream device used by the rseq-link frame protocol.
+	  Logs and shell output must not share this transport.
+
+config RSEQ_TRANSPORT_USB_CDC
+	bool "USB CDC ACM"
+	help
+	  Use the application CDC-ACM UART node as the rseq-link transport.
+
+config RSEQ_TRANSPORT_UART
+	bool "Hardware UART"
+	help
+	  Use the board-selected hardware UART as the rseq-link transport.
+
+endchoice
+
+endmenu
+
+source "Kconfig.zephyr"

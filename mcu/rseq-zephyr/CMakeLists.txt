@@ -12,6 +12,6 @@ project(rseq_nucleo)
 rust_cargo_application()
 
 target_sources(app PRIVATE
-  src/zephyr_cdc_ffi.c
+  src/zephyr_transport_ffi.c
   src/zephyr_bus_ffi.c
 )

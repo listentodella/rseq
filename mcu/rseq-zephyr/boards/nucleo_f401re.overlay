@@ -3,23 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Nucleo F401RE board wiring for the rseq generic bus bridge firmware.
- *
- * Note: the application still needs a zephyr_udc0 USB device node for the CDC
- * transport. This board overlay exposes the Arduino bus/INT wiring;
- * USB availability is determined by the upstream board/SoC devicetree.
  */
 
 #include <zephyr/dt-bindings/gpio/gpio.h>
 
-zephyr_udc0: &usbotg_fs {
-	pinctrl-0 = <&usb_otg_fs_dm_pa11 &usb_otg_fs_dp_pa12>;
-	pinctrl-names = "default";
-	status = "okay";
-};
-
 #include "../app.overlay"
 
 / {
+	chosen {
+		/delete-property/ zephyr,console;
+		/delete-property/ zephyr,shell-uart;
+		rseq,transport = &usart2;
+	};
+
 	aliases {
 		rseq-spi = &arduino_spi;
 		rseq-i2c = &arduino_i2c;
@@ -34,6 +30,10 @@ zephyr_udc0: &usbotg_fs {
 			gpios = <&gpioc 7 GPIO_ACTIVE_HIGH>;
 		};
 	};
+};
+
+&usart2 {
+	current-speed = <230400>;
 };
 
 &dma1 {

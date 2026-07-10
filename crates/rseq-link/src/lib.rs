@@ -26,7 +26,7 @@ pub mod wire;
 
 pub use error::LinkError;
 pub use frame::{Frame, FrameDecoder, FrameType, HOST_FRAME_BUF, MAX_TRACE_FRAME};
-pub use tracing_bus::{LinkTx, TracingBus};
+pub use tracing_bus::{LinkTx, ReportOnlyBus, TracingBus};
 pub use wire::{
     CONTROL_MAX_READ_LEN, CONTROL_MAX_WRITE_LEN, CONTROL_OP_BUS_READ, CONTROL_OP_BUS_WRITE,
     ControlRequestRef, ControlResultRef, ControlStatus, ExecStatus, LOAD_VERSION, LoadSegs,

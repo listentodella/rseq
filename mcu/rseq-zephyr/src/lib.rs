@@ -1,13 +1,14 @@
 //! rseq MCU firmware (Nucleo boards).
 //!
-//! Speaks the rseq-link frame protocol ([0x55 0xAA] sync + CRC32) over the USB
-//! CDC-ACM port: receives Load/Exec/Reset/Ping, sends Ack/Trace/Result/Pong.
+//! Speaks the rseq-link frame protocol ([0x55 0xAA] sync + CRC32) over the
+//! board-selected Zephyr transport: receives Load/Exec/Reset/Ping, sends
+//! Ack/Trace/Result/Pong.
 //! On Exec, the rseq VM runs the loaded bytecode against [`PhysicalBus`]
 //! (real SPI/I2C/I3C bridge FFI), and a [`TracingBus`] emits a Trace frame per
 //! bus op.
 //!
 //! no_std + alloc; the `zephyr` crate supplies the global allocator, panic
-//! handler, and log backend (logs go to USART3 / ST-Link VCP).
+//! handler, and board-selected log backend.
 
 #![no_std]
 extern crate alloc;
@@ -16,7 +17,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/* log macros bypassed — use rust_printk for console output (USART3). */
+/* log macros bypassed — use rust_printk for board-profile console output. */
 
 use rseq_link::frame::{encode_into, FrameDecoder, FrameType, OVERHEAD};
 use rseq_link::wire::{
@@ -24,7 +25,7 @@ use rseq_link::wire::{
     encode_control_bus_write_result_into, load_segments, ControlRequestRef, ControlStatus,
     ExecStatus, CONTROL_MAX_READ_LEN, CONTROL_MAX_WRITE_LEN, SEG_KIND_IRQ_INT1, SEG_KIND_MAIN,
 };
-use rseq_link::{LinkError, TracingBus, Transport};
+use rseq_link::{LinkError, ReportOnlyBus, TracingBus, Transport};
 use rseq_vm::{Bus, BusError, BusKind, Vm};
 
 // ── IRQ 处理器存储 ────────────────────────────────────────────
@@ -95,10 +96,9 @@ fn activate_staged_irq_handlers() -> usize {
 
 mod ffi {
     extern "C" {
-        pub fn rust_usb_enable() -> i32;
-        pub fn rust_uart_init() -> i32;
-        pub fn rust_uart_read(buf: *mut u8, len: usize) -> i32;
-        pub fn rust_uart_write(data: *const u8, len: usize) -> i32;
+        pub fn rust_transport_init() -> i32;
+        pub fn rust_transport_read(buf: *mut u8, len: usize) -> i32;
+        pub fn rust_transport_write(data: *const u8, len: usize) -> i32;
         pub fn rust_event_wait(timeout_ms: u32) -> i32;
         pub fn rust_uptime_us() -> u64;
         pub fn rust_kernel_delay_us(us: u32);
@@ -148,8 +148,7 @@ fn check(ret: i32) -> Result<(), i32> {
     }
 }
 
-/// Raw console output (USART3 via the C `rust_printk` FFI), independent of the
-/// log backend so bring-up diagnostics are visible even if `set_logger` fails.
+/// Raw console output via the board-selected Zephyr console/log backend.
 fn printk(s: &str) {
     unsafe { ffi::rust_printk(s.as_ptr(), s.len()) };
 }
@@ -159,20 +158,18 @@ fn report_timestamp_us() -> u64 {
 }
 
 // ============================================================================
-// Transport: rseq-link over the CDC-ACM UART FFI
+// Transport: rseq-link over the board-selected Zephyr transport FFI
 // ============================================================================
 
-/// [`Transport`] backed by the CDC-ACM UART. `read` blocks for the first byte
-/// then drains whatever is immediately available (the rseq-link lockstep
-/// protocol means at most one command is in flight at a time).
-struct CdcTransport;
+/// [`Transport`] backed by the board-selected Zephyr UART-like device.
+struct ZephyrTransport;
 
-impl Transport for CdcTransport {
+impl Transport for ZephyrTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, LinkError> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let ret = unsafe { ffi::rust_uart_read(buf.as_mut_ptr(), buf.len()) };
+        let ret = unsafe { ffi::rust_transport_read(buf.as_mut_ptr(), buf.len()) };
         if ret < 0 {
             return Err(LinkError::Io);
         }
@@ -180,7 +177,8 @@ impl Transport for CdcTransport {
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), LinkError> {
-        check(unsafe { ffi::rust_uart_write(data.as_ptr(), data.len()) }).map_err(|_| LinkError::Io)
+        check(unsafe { ffi::rust_transport_write(data.as_ptr(), data.len()) })
+            .map_err(|_| LinkError::Io)
     }
 }
 
@@ -444,7 +442,7 @@ impl Bus for PhysicalBus {
         Ok(())
     }
 
-    /// `print!("msg")`：经 `rust_printk` 输出到 USART3 控制台。
+    /// `print!("msg")`：经 `rust_printk` 输出到 board profile 选择的控制台。
     /// TracingBus 在此之上还会回传一条 Log trace 给主机 CDC。
     fn log(&mut self, msg: &str) -> Result<(), BusError> {
         unsafe { ffi::rust_printk(msg.as_ptr(), msg.len()) };
@@ -534,13 +532,9 @@ fn handle_control_frame<B: Bus, T: Transport>(
 
             let mut data = alloc::vec![0u8; len as usize];
             match bus.read(addr, &mut data) {
-                Ok(()) => send_control_read_result(
-                    transport,
-                    request_id,
-                    ControlStatus::Ok,
-                    addr,
-                    &data,
-                ),
+                Ok(()) => {
+                    send_control_read_result(transport, request_id, ControlStatus::Ok, addr, &data)
+                }
                 Err(error) => send_control_read_result(
                     transport,
                     request_id,
@@ -585,13 +579,7 @@ fn handle_control_frame<B: Bus, T: Transport>(
         None => {
             // The payload is malformed enough that request_id is unavailable.
             // Reply with id=0 so a host-side diagnostic tool can still see the failure.
-            send_control_read_result(
-                transport,
-                0,
-                ControlStatus::InvalidPayload,
-                0,
-                &[],
-            )
+            send_control_read_result(transport, 0, ControlStatus::InvalidPayload, 0, &[])
         }
     }
 }
@@ -610,9 +598,9 @@ fn run_pending_irqs<B: Bus, T: Transport>(bus: &mut B, transport: &mut T) {
 
         unsafe {
             if let Some(handler) = &IRQ_ACTIVE_HANDLERS[pin_id] {
-                let mut tracing =
-                    TracingBus::new_with_clock(&mut *bus, &mut *transport, report_timestamp_us);
-                if let Err(e) = Vm::new(&mut tracing, &handler.bytecode).run() {
+                let mut reporting =
+                    ReportOnlyBus::new_with_clock(&mut *bus, &mut *transport, report_timestamp_us);
+                if let Err(e) = Vm::new(&mut reporting, &handler.bytecode).run() {
                     printk(&alloc::format!("rseq: irq handler error: {:?}\n", e));
                 }
             }
@@ -679,10 +667,11 @@ fn mcu_loop<B: Bus, T: Transport>(
                 if poll_level_irqs() {
                     continue;
                 }
-                // Sleep until CDC RX or INT1 wakes the loop. The long timeout is
-                // only a defensive fallback; normal IRQ latency is event-driven.
+                // Sleep until transport RX or INT1 wakes the loop. The timeout
+                // is a defensive fallback for board UARTs whose RX IRQ does not
+                // wake the VM loop; normal latency is still event-driven.
                 unsafe {
-                    ffi::rust_event_wait(1000);
+                    ffi::rust_event_wait(10);
                 }
                 continue;
             }
@@ -780,7 +769,6 @@ fn mcu_loop<B: Bus, T: Transport>(
                 printk("rseq: unknown frame type\n");
             }
         }
-
     }
 }
 
@@ -795,14 +783,8 @@ pub extern "C" fn rust_main() {
     }
     printk("rseq: rust_main start\n");
 
-    let r = unsafe { ffi::rust_usb_enable() };
-    printk(&alloc::format!("rseq: rust_usb_enable={}\n", r));
-    if r != 0 {
-        return;
-    }
-
-    let r = unsafe { ffi::rust_uart_init() };
-    printk(&alloc::format!("rseq: rust_uart_init={}\n", r));
+    let r = unsafe { ffi::rust_transport_init() };
+    printk(&alloc::format!("rseq: rust_transport_init={}\n", r));
     if r != 0 {
         return;
     }
@@ -819,7 +801,7 @@ pub extern "C" fn rust_main() {
     };
 
     printk("rseq: enter mcu_loop\n");
-    if mcu_loop(CdcTransport, bus, &STOP).is_err() {
+    if mcu_loop(ZephyrTransport, bus, &STOP).is_err() {
         printk("rseq: mcu_loop error\n");
     }
 }

@@ -19,7 +19,7 @@ pub const DEFAULT_TEMP_LSB_PER_C: f64 = 1.0;
 pub const DEFAULT_TEMP_OFFSET_C: f64 = 0.0;
 pub const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
 pub const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
-pub const DEFAULT_BAUD: u32 = 115_200;
+pub const DEFAULT_BAUD: u32 = 230_400;
 pub const MAX_TEXT_LINES: usize = 512;
 pub const CAPTURE_MAGIC: &[u8] = b"RSEQCAP1\n";
 

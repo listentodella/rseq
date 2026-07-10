@@ -1330,7 +1330,7 @@ impl RseqGpui {
         });
         let serial_baud_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("115200")
+                .placeholder("230400")
                 .default_value(serial_baud_value)
         });
         let tcp_addr_input = cx.new(|cx| {

@@ -190,6 +190,7 @@ mod serial {
     /// 串口传输实现,包装 `serialport` 的 `Box<dyn SerialPort>`。
     pub struct SerialTransport {
         port: Box<dyn SerialPort>,
+        baud: u32,
     }
 
     impl SerialTransport {
@@ -224,7 +225,19 @@ mod serial {
             if clear_buffers {
                 let _ = port.clear(ClearBuffer::All);
             }
-            Ok(Self { port })
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(Self { port, baud })
+        }
+
+        fn write_chunk_delay(&self, len: usize) -> Duration {
+            let baud = self.baud.max(1) as u64;
+            let bits = (len as u64).saturating_mul(10);
+            let micros = bits
+                .saturating_mul(1_000_000)
+                .checked_div(baud)
+                .unwrap_or(0)
+                .clamp(1_000, 5_000);
+            Duration::from_micros(micros)
         }
     }
 
@@ -276,7 +289,20 @@ mod serial {
         }
 
         fn write(&mut self, data: &[u8]) -> Result<(), LinkError> {
-            self.port.write_all(data).map_err(|_| LinkError::Io)
+            const CHUNK: usize = 32;
+
+            if data.len() <= CHUNK {
+                return self.port.write_all(data).map_err(|_| LinkError::Io);
+            }
+
+            let total_chunks = data.len().div_ceil(CHUNK);
+            for (index, chunk) in data.chunks(CHUNK).enumerate() {
+                self.port.write_all(chunk).map_err(|_| LinkError::Io)?;
+                if index + 1 != total_chunks {
+                    std::thread::sleep(self.write_chunk_delay(chunk.len()));
+                }
+            }
+            Ok(())
         }
     }
 }

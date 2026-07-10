@@ -51,7 +51,7 @@ struct Cli {
     tcp: Option<String>,
 
     /// Serial baud rate.
-    #[arg(long, default_value_t = 115_200)]
+    #[arg(long, default_value_t = 230_400)]
     baud: u32,
 
     /// Force the synthetic data source. This is also the default when no endpoint is supplied.

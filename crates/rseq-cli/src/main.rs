@@ -82,8 +82,8 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     stats_every: u64,
 
-    /// 串口波特率(默认 115200)。
-    #[arg(long, default_value_t = 115_200)]
+    /// 串口波特率(默认 230400)。
+    #[arg(long, default_value_t = 230_400)]
     baud: u32,
 }
 

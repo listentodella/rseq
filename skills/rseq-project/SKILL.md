@@ -26,7 +26,7 @@ Use this skill as the project entry point. When a task also matches a more speci
 - `crates/rseq-gpui`: GPUI desktop workbench.
 - `crates/rseq-lsp`: rseq language server and editor intelligence.
 - `crates/rseq-mcu-sim`: MCU simulator/mock link tests.
-- `mcu/f429zi-rseq`: Zephyr firmware bridge.
+- `mcu/rseq-zephyr`: Zephyr firmware bridge.
 - `examples`: `.rseq` scripts and capture samples.
 - `qmi8660.yaml`: example chip metadata used by host tools.
 
@@ -105,7 +105,7 @@ For Zephyr firmware:
 
 ```bash
 source <zephyr-venv>/bin/activate
-cd mcu/f429zi-rseq
+cd mcu/rseq-zephyr
 west build -b <board-name>
 west flash
 ```

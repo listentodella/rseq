@@ -90,8 +90,8 @@ F429ZI:
 
 ```sh
 west build -b nucleo_f429zi \
-  -s $RSEQ_ROOT/mcu/f429zi-rseq \
-  -d $RSEQ_ROOT/mcu/f429zi-rseq/build-f429zi \
+  -s $RSEQ_ROOT/mcu/rseq-zephyr \
+  -d $RSEQ_ROOT/mcu/rseq-zephyr/build-f429zi \
   --pristine
 ```
 
@@ -99,8 +99,8 @@ F401RE:
 
 ```sh
 west build -b nucleo_f401re \
-  -s $RSEQ_ROOT/mcu/f429zi-rseq \
-  -d $RSEQ_ROOT/mcu/f429zi-rseq/build-f401re \
+  -s $RSEQ_ROOT/mcu/rseq-zephyr \
+  -d $RSEQ_ROOT/mcu/rseq-zephyr/build-f401re \
   --pristine
 ```
 

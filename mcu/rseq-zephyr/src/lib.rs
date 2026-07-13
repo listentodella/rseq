@@ -60,10 +60,15 @@ fn clear_irq_handlers() {
     }
 }
 
+fn clear_irq_pending() {
+    for pending in &IRQ_PENDING {
+        pending.store(false, Ordering::Release);
+    }
+}
+
 fn begin_irq_load() {
     unsafe {
         for i in 0..MAX_IRQ_HANDLERS {
-            IRQ_ACTIVE_HANDLERS[i] = None;
             IRQ_STAGED_HANDLERS[i] = None;
             IRQ_PENDING[i].store(false, Ordering::Release);
         }
@@ -85,10 +90,11 @@ fn activate_staged_irq_handlers() -> usize {
     let mut activated = 0;
     unsafe {
         for i in 0..MAX_IRQ_HANDLERS {
-            if let Some(handler) = IRQ_STAGED_HANDLERS[i].take() {
-                IRQ_ACTIVE_HANDLERS[i] = Some(handler);
+            IRQ_ACTIVE_HANDLERS[i] = IRQ_STAGED_HANDLERS[i].take();
+            if IRQ_ACTIVE_HANDLERS[i].is_some() {
                 activated += 1;
             }
+            IRQ_PENDING[i].store(false, Ordering::Release);
         }
     }
     activated
@@ -191,6 +197,8 @@ const SPI_SCRATCH: usize = 64;
 const SPI_MAX_PAYLOAD: usize = SPI_SCRATCH - 1;
 const I2C_SCRATCH: usize = 64;
 const I2C_MAX_WRITE_PAYLOAD: usize = I2C_SCRATCH - 1;
+const VM_IDLE_WAIT_MS: u32 = 10;
+const IRQ_BUSY_YIELD_MS: u32 = 1;
 
 /// rseq [`Bus`] over board-provided physical buses. The rseq DSL encodes a
 /// plain 8-bit register number as the `u32` address, so `addr & 0xff` is the
@@ -634,21 +642,18 @@ fn mcu_loop<B: Bus, T: Transport>(
     let mut read_buf = [0u8; READ_CHUNK];
     let mut inbox: VecDeque<(FrameType, Vec<u8>)> = VecDeque::new();
     let mut bytecode: Vec<u8> = Vec::new();
+    let mut staged_bytecode: Option<Vec<u8>> = None;
+    let mut reports_paused = false;
 
     printk("rseq: main loop start\n");
 
     loop {
-        poll_level_irqs();
-        run_pending_irqs(&mut bus, &mut transport);
-
         // Pull the next complete frame, responding to `stop` while waiting.
         let (ty, payload) = loop {
             if stop.load(Ordering::Relaxed) {
                 printk("rseq: stop requested\n");
                 return Ok(());
             }
-
-            run_pending_irqs(&mut bus, &mut transport);
 
             if let Some(f) = inbox.pop_front() {
                 break f;
@@ -664,14 +669,24 @@ fn mcu_loop<B: Bus, T: Transport>(
             };
 
             if n == 0 {
-                if poll_level_irqs() {
-                    continue;
+                if !reports_paused {
+                    let had_level_irq = poll_level_irqs();
+                    run_pending_irqs(&mut bus, &mut transport);
+                    if had_level_irq {
+                        // A level IRQ can stay asserted while FIFO data keeps
+                        // arriving. Yield briefly so host Pause/Load/Control
+                        // frames are not starved behind continuous reports.
+                        unsafe {
+                            ffi::rust_event_wait(IRQ_BUSY_YIELD_MS);
+                        }
+                        continue;
+                    }
                 }
                 // Sleep until transport RX or INT1 wakes the loop. The timeout
                 // is a defensive fallback for board UARTs whose RX IRQ does not
                 // wake the VM loop; normal latency is still event-driven.
                 unsafe {
-                    ffi::rust_event_wait(10);
+                    ffi::rust_event_wait(VM_IDLE_WAIT_MS);
                 }
                 continue;
             }
@@ -689,10 +704,11 @@ fn mcu_loop<B: Bus, T: Transport>(
             FrameType::Load => {
                 if let Some((_ver, segs)) = load_segments(&payload) {
                     begin_irq_load();
+                    let mut next_bytecode = Vec::new();
                     for (kind, bytes) in segs {
                         match kind {
                             SEG_KIND_MAIN => {
-                                bytecode = bytes.to_vec();
+                                next_bytecode = bytes.to_vec();
                             }
                             SEG_KIND_IRQ_INT1 => {
                                 stage_irq_handler(0, bytes);
@@ -703,6 +719,7 @@ fn mcu_loop<B: Bus, T: Transport>(
                             }
                         }
                     }
+                    staged_bytecode = Some(next_bytecode);
                 }
                 send_frame(&mut transport, FrameType::Ack, &[])?;
             }
@@ -712,23 +729,36 @@ fn mcu_loop<B: Bus, T: Transport>(
                     printk("rseq: send Ack failed\n");
                     continue;
                 }
-                let status = if bytecode.is_empty() {
+                let has_staged_bytecode = staged_bytecode.is_some();
+                let program_empty = staged_bytecode
+                    .as_ref()
+                    .map_or(bytecode.is_empty(), |program| program.is_empty());
+                let status = if program_empty {
                     ExecStatus::ProgramTooShort
                 } else {
                     // TracingBus borrows transport as LinkTx during EXEC;
                     // into_inner reclaims the bus and releases the borrow.
                     let mut tracing =
                         TracingBus::new_with_clock(bus, &mut transport, report_timestamp_us);
-                    let res = Vm::new(&mut tracing, &bytecode).run();
+                    let exec_bytecode = staged_bytecode
+                        .as_ref()
+                        .map_or(bytecode.as_slice(), |program| program.as_slice());
+                    let res = Vm::new(&mut tracing, exec_bytecode).run();
                     let (b, _) = tracing.into_inner();
                     bus = b;
                     match res {
                         Ok(()) => {
-                            let activated = activate_staged_irq_handlers();
-                            if activated != 0 {
-                                printk(&alloc::format!(
-                                    "rseq: activated {activated} irq handler(s)\n"
-                                ));
+                            if has_staged_bytecode {
+                                let next_bytecode = staged_bytecode.take().unwrap_or_default();
+                                bytecode = next_bytecode;
+                                let activated = activate_staged_irq_handlers();
+                                if activated != 0 {
+                                    printk(&alloc::format!(
+                                        "rseq: activated {activated} irq handler(s)\n"
+                                    ));
+                                } else {
+                                    printk("rseq: no irq handlers active\n");
+                                }
                             }
                             ExecStatus::Ok
                         }
@@ -745,13 +775,29 @@ fn mcu_loop<B: Bus, T: Transport>(
             FrameType::Reset => {
                 printk("rseq: RESET\n");
                 bytecode.clear();
+                staged_bytecode = None;
                 clear_irq_handlers();
+                reports_paused = false;
                 printk("rseq: reset, irq handlers cleared\n");
                 send_frame(&mut transport, FrameType::Ack, &[])?;
             }
             FrameType::Stop => {
                 printk("rseq: STOP reports\n");
+                staged_bytecode = None;
                 clear_irq_handlers();
+                reports_paused = false;
+                send_frame(&mut transport, FrameType::Ack, &[])?;
+            }
+            FrameType::Pause => {
+                printk("rseq: PAUSE reports\n");
+                reports_paused = true;
+                clear_irq_pending();
+                send_frame(&mut transport, FrameType::Ack, &[])?;
+            }
+            FrameType::Resume => {
+                printk("rseq: RESUME reports\n");
+                clear_irq_pending();
+                reports_paused = false;
                 send_frame(&mut transport, FrameType::Ack, &[])?;
             }
             FrameType::Ping => {

@@ -429,6 +429,36 @@ impl<T: Transport> HostLink<T> {
         Ok(())
     }
 
+    /// Temporarily suspend background IRQ/report execution without removing the
+    /// loaded or active IRQ handlers. Intended for short register-control
+    /// transactions that must not compete with a high-rate report stream.
+    pub fn pause_reports(&mut self) -> Result<(), LinkError> {
+        self.pause_reports_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// Same as [`HostLink::pause_reports`], but with a caller supplied timeout.
+    ///
+    /// UI control changes use this as a best-effort fast path: new firmware will
+    /// ACK quickly and pause the MCU report loop, while older firmware can time
+    /// out quickly and let the host fall back to suppressing reports locally.
+    pub fn pause_reports_timeout(&mut self, timeout: Duration) -> Result<(), LinkError> {
+        self.send_frame(FrameType::Pause, &[])?;
+        self.expect_control_ack(Instant::now() + timeout)?;
+        Ok(())
+    }
+
+    /// Resume background IRQ/report execution after [`HostLink::pause_reports`].
+    pub fn resume_reports(&mut self) -> Result<(), LinkError> {
+        self.resume_reports_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// Same as [`HostLink::resume_reports`], but with a caller supplied timeout.
+    pub fn resume_reports_timeout(&mut self, timeout: Duration) -> Result<(), LinkError> {
+        self.send_frame(FrameType::Resume, &[])?;
+        self.expect_control_ack(Instant::now() + timeout)?;
+        Ok(())
+    }
+
     /// 探活;收到 Pong 即返回。
     pub fn ping(&mut self) -> Result<(), LinkError> {
         self.send_frame(FrameType::Ping, &[])?;
@@ -609,6 +639,24 @@ mod tests {
         let w = &link.transport_mut().writes;
         assert_eq!(w[2], FrameType::Stop as u8);
         assert!(link.inbox.is_empty());
+    }
+
+    #[test]
+    fn pause_and_resume_reports_use_dedicated_frames() {
+        let rx = [frame(FrameType::Ack, &[]), frame(FrameType::Ack, &[])].concat();
+        let mut link = HostLink::new(ScriptTransport {
+            rx,
+            pos: 0,
+            writes: Vec::new(),
+        });
+
+        link.pause_reports().unwrap();
+        link.resume_reports().unwrap();
+
+        let writes = &link.transport_mut().writes;
+        assert_eq!(writes[2], FrameType::Pause as u8);
+        let second = frame(FrameType::Pause, &[]).len();
+        assert_eq!(writes[second + 2], FrameType::Resume as u8);
     }
 
     #[test]

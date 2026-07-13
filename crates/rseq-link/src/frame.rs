@@ -37,6 +37,10 @@ pub enum FrameType {
     Ping = 0x04,
     Stop = 0x05,
     Control = 0x06,
+    /// Temporarily suspend background IRQ/report execution while preserving handlers.
+    Pause = 0x07,
+    /// Resume background IRQ/report execution after [`FrameType::Pause`].
+    Resume = 0x08,
     // MCU → Host
     Ack = 0x81,
     Trace = 0x82,
@@ -54,6 +58,8 @@ impl FrameType {
             0x04 => Some(Self::Ping),
             0x05 => Some(Self::Stop),
             0x06 => Some(Self::Control),
+            0x07 => Some(Self::Pause),
+            0x08 => Some(Self::Resume),
             0x81 => Some(Self::Ack),
             0x82 => Some(Self::Trace),
             0x83 => Some(Self::Result),
@@ -66,7 +72,14 @@ impl FrameType {
     pub const fn is_host_to_mcu(self) -> bool {
         matches!(
             self,
-            Self::Load | Self::Exec | Self::Reset | Self::Ping | Self::Stop | Self::Control
+            Self::Load
+                | Self::Exec
+                | Self::Reset
+                | Self::Ping
+                | Self::Stop
+                | Self::Control
+                | Self::Pause
+                | Self::Resume
         )
     }
 }

@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
 pub use chip::{
-    Chip, ChipError, ChipRegistry, EventBit, Page, Register, UpdatePlan, emit_update_bytecode,
-    fields_to_bytes, load_chip, normalize_chip_path, resolve_chip_path,
+    Chip, ChipError, ChipRegistry, Control, ControlOption, EventBit, Field, Page, Register,
+    UpdatePlan, emit_update_bytecode, fields_to_bytes, load_chip, normalize_chip_path,
+    resolve_chip_path,
 };
 
 type ParserExtra<'tok, 'src> = extra::Err<Rich<'tok, Token<'src>>>;

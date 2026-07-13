@@ -17,6 +17,7 @@ serial = ["rseq-link/serial"]
 
 [dependencies]
 rseq = { workspace = true }
+rseq-host = { workspace = true }
 rseq-link = { workspace = true, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29"

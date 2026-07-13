@@ -5998,6 +5998,7 @@ dependencies = [
  "ariadne",
  "clap",
  "rseq",
+ "rseq-host",
  "rseq-link",
  "rseq-vm",
 ]
@@ -6070,6 +6071,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "rseq",
+ "rseq-host",
  "rseq-link",
 ]
 

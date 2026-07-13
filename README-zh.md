@@ -95,6 +95,49 @@ cargo run --package rseq-cli -- --file examples/qmi8660_init.rseq --serial /dev/
 
 CLI 会 `Load` 字节码、`Exec`, 然后按执行顺序打印 `Write`/`Read`/`Delay`, 格式与 `--execute` 的 MockBus 回放一致, 便于对照.
 
+## IMU 运行时参数
+
+芯片 YAML 顶层的 `controls` 可以把输出速率、滤波器、量程等用户参数映射到
+具体寄存器位域。主机端会先读取整个寄存器，再只替换目标位域并写回，因此同一
+寄存器里的其他配置位不会被覆盖。`qmi8660.yaml` 已声明 `accel_odr`、
+`gyro_odr`、`accel_lpf`、`gyro_lpf`、量程和温度输出速率。
+
+```yaml
+controls:
+  - name: accel_odr
+    group: Sampling
+    target: UI.ACTL0.aodr_ui
+    options:
+      - { value: 8, label: 100Hz }
+      - { value: 9, label: 200Hz }
+```
+
+CLI 可列出控制项，并在连接后立即应用一个或多个启动值：
+
+```bash
+cargo run -p rseq-cli -- --chip qmi8660.yaml --list-controls
+
+cargo run -p rseq-cli --features serial -- \
+  --serial /dev/ttyUSB0 --baud 115200 \
+  --chip qmi8660.yaml -f examples/qmi8660_fifo.rseq \
+  --set-control accel_odr=200Hz \
+  --set-control accel_lpf=preset2
+```
+
+MCU 已经运行时，也可以只发送一次实时调整而不重新 LOAD/EXEC：
+
+```bash
+cargo run -p rseq-cli --features serial -- \
+  --serial /dev/ttyUSB0 --baud 115200 \
+  --chip qmi8660.yaml \
+  --set-control gyro_odr=400Hz
+```
+
+TUI 和 GPUI 同样接受重复的 `--set-control NAME=VALUE` 启动参数。运行时，
+TUI 的 `Controls` 页可读取、循环选择或输入值；GPUI 将醒目的 `IMU Tuning`
+面板直接放在 `Motion` 页，提供当前值读取、枚举按钮和自定义值输入。所有路径
+使用相同的控制元数据和读-改-写逻辑。
+
 ### 模拟 MCU: rseq-mcu-sim
 
 没有真实硬件时, `rseq-mcu-sim` 在进程内充当 MCU, 跑同一套帧协议:

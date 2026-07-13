@@ -23,6 +23,7 @@ use gpui_component::{
     },
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
+    text::{TextView, TextViewState},
     tooltip::Tooltip,
     v_flex,
 };
@@ -34,15 +35,18 @@ use rseq_host::{
     AccessKind, FieldInfo, HostMetadata, MAX_TEXT_LINES, MotionSample, RegisterCatalog,
     RegisterInfo, ReportCaptureRecord, ReportDecoder, ReportDecoderRegistry, ReportHealth,
     ReportOutputMode, ReportProcessor, RseqSource, SessionCommand, SessionConfig, SessionEvent,
-    SessionHandle, compile_rseq_files, compile_rseq_sources, hex_bytes, load_host_metadata,
-    load_host_metadata_from_sources, make_i16_le_decoder, parse_register_write_bytes, push_bounded,
-    read_report_capture, write_report_capture,
+    SessionHandle, TuningAssignment, TuningControl, compile_rseq_files, compile_rseq_sources,
+    hex_bytes, load_host_metadata, load_host_metadata_from_sources, make_i16_le_decoder,
+    parse_register_write_bytes, parse_tuning_control_value, push_bounded, read_report_capture,
+    resolve_tuning_assignments, tuning_control_value_from_bytes, tuning_control_value_hint,
+    tuning_control_value_label, write_report_capture,
 };
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 const UI_TICK: Duration = Duration::from_millis(33);
+const REPORT_TEXT_REFRESH: Duration = Duration::from_millis(100);
 const MAX_SAMPLES: usize = 600;
 const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
@@ -732,6 +736,10 @@ struct SelectSerialPortAction(String);
 #[action(namespace = rseq_gpui, no_json)]
 struct SelectSerialBaudAction(u32);
 
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = rseq_gpui, no_json)]
+struct SelectMotionControlOptionAction(String, u32);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CaptureSidecar {
     version: u32,
@@ -781,6 +789,10 @@ struct Cli {
 
     #[arg(long, alias = "observe-only", alias = "rx-only")]
     watch: bool,
+
+    /// Apply a runtime control after connecting, for example accel_odr=200Hz.
+    #[arg(long = "set-control", value_name = "NAME=VALUE")]
+    set_control: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1246,8 +1258,11 @@ pub struct RseqGpui {
     compile_status: String,
     link_mode: LinkMode,
     session: Option<SessionHandle>,
+    control_busy: Option<String>,
+    pending_control_values: BTreeMap<String, u32>,
     selected_tab: PanelTab,
     selected_register_addr: u32,
+    selected_control_index: usize,
     active_register_page: Option<String>,
     register_view_mode: RegisterViewMode,
     inline_write_addr: Option<u32>,
@@ -1268,6 +1283,7 @@ pub struct RseqGpui {
     sequence_lsp_chips: Rc<RefCell<Vec<PathBuf>>>,
     inline_write_input: Entity<InputState>,
     write_input: Entity<InputState>,
+    control_value_input: Entity<InputState>,
     samples: VecDeque<MotionSample>,
     sample_skip_count: usize,
     sample_skip_remaining: usize,
@@ -1289,11 +1305,17 @@ pub struct RseqGpui {
     registers: BTreeMap<u32, RegisterValue>,
     capture_records: Vec<ReportCaptureRecord>,
     reports: VecDeque<String>,
+    reports_text_content: SharedString,
+    reports_text: Entity<TextViewState>,
+    reports_text_dirty: bool,
+    reports_text_last_sync: Option<Instant>,
     logs: VecDeque<String>,
+    logs_text: Entity<TextViewState>,
     health: ReportHealth,
     connection_label: String,
     session_mode: String,
     connected: bool,
+    reload_in_progress: bool,
     _tick: Task<()>,
 }
 
@@ -1377,6 +1399,21 @@ impl RseqGpui {
                 .default_value("")
         });
         let write_input = cx.new(|cx| InputState::new(window, cx).placeholder("hex bytes"));
+        let control_value_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("value or option label")
+                .default_value("")
+        });
+        let reports_text = cx.new(|cx| {
+            TextViewState::markdown("No report lines yet.", cx)
+                .selectable(true)
+                .scrollable(true)
+        });
+        let logs_text = cx.new(|cx| {
+            TextViewState::markdown("No log lines yet.", cx)
+                .selectable(true)
+                .scrollable(true)
+        });
         cx.subscribe_in(
             &inline_write_input,
             window,
@@ -1409,8 +1446,9 @@ impl RseqGpui {
                 smol::Timer::after(UI_TICK).await;
                 if this
                     .update(cx, |state, cx| {
-                        state.drain_session_events();
-                        cx.notify();
+                        if state.drain_session_events() {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -1426,8 +1464,11 @@ impl RseqGpui {
             compile_status,
             link_mode,
             session: None,
+            control_busy: None,
+            pending_control_values: BTreeMap::new(),
             selected_tab: PanelTab::Motion,
             selected_register_addr: 0,
+            selected_control_index: 0,
             active_register_page,
             register_view_mode: RegisterViewMode::Dump,
             inline_write_addr: None,
@@ -1448,6 +1489,7 @@ impl RseqGpui {
             sequence_lsp_chips,
             inline_write_input,
             write_input,
+            control_value_input,
             samples: VecDeque::with_capacity(MAX_SAMPLES),
             sample_skip_count: 0,
             sample_skip_remaining: 0,
@@ -1469,11 +1511,17 @@ impl RseqGpui {
             registers: BTreeMap::new(),
             capture_records: Vec::new(),
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
+            reports_text_content: SharedString::from("No report lines yet."),
+            reports_text,
+            reports_text_dirty: true,
+            reports_text_last_sync: None,
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
+            logs_text,
             health: ReportHealth::default(),
             connection_label: "disconnected".to_string(),
             session_mode: "idle".to_string(),
             connected: false,
+            reload_in_progress: false,
             _tick,
         };
 
@@ -1509,7 +1557,7 @@ impl RseqGpui {
                     true
                 }
                 Err(reason) => {
-                    push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                    self.push_log(reason);
                     false
                 }
             },
@@ -1521,7 +1569,7 @@ impl RseqGpui {
                     true
                 }
                 Err(reason) => {
-                    push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                    self.push_log(reason);
                     false
                 }
             },
@@ -1663,6 +1711,10 @@ impl RseqGpui {
         self.startup_program = loaded.startup_program;
         self.compile_status = loaded.status.clone();
         self.registers.clear();
+        self.pending_control_values.clear();
+        self.selected_control_index = self
+            .selected_control_index
+            .min(self.metadata.tuning_catalog.len().saturating_sub(1));
         self.sync_active_register_page();
 
         push_bounded(
@@ -1685,6 +1737,15 @@ impl RseqGpui {
         }
 
         ok
+    }
+
+    fn push_log(&mut self, line: impl Into<String>) {
+        push_bounded(&mut self.logs, line.into(), MAX_TEXT_LINES);
+    }
+
+    fn push_report_line(&mut self, line: impl Into<String>) {
+        push_bounded(&mut self.reports, line.into(), MAX_TEXT_LINES);
+        self.reports_text_dirty = true;
     }
 
     fn sync_active_register_page(&mut self) {
@@ -1736,7 +1797,7 @@ impl RseqGpui {
             );
             return;
         }
-        self.start_session(false);
+        self.load_and_run_compiled_program();
     }
 
     fn watch_from_inputs(&mut self, cx: &Context<Self>) {
@@ -1807,6 +1868,48 @@ impl RseqGpui {
             );
             return;
         }
+        self.load_and_run_compiled_program();
+    }
+
+    fn load_and_run_compiled_program(&mut self) {
+        let Some(program) = self.startup_program.clone() else {
+            push_bounded(
+                &mut self.logs,
+                "no compiled rseq program; choose an .rseq file first".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+
+        if self.reload_in_progress {
+            push_bounded(
+                &mut self.logs,
+                "load/run already in progress".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+
+        if self.session.is_some() {
+            push_bounded(
+                &mut self.logs,
+                "loading current rseq on active session".to_string(),
+                MAX_TEXT_LINES,
+            );
+            self.reload_in_progress = true;
+            if self.send_command(SessionCommand::LoadAndExec(program)) {
+                self.session_mode = "load/run".to_string();
+                return;
+            }
+            self.reload_in_progress = false;
+            push_bounded(
+                &mut self.logs,
+                "active session did not accept reload; reopening transport".to_string(),
+                MAX_TEXT_LINES,
+            );
+            self.stop_session();
+        }
+
         self.start_session(false);
     }
 
@@ -2339,6 +2442,7 @@ impl RseqGpui {
         }
 
         self.reset_stream_state(true);
+        self.reload_in_progress = !watch;
         let demo = self.link_mode == LinkMode::Demo;
         let serial = if self.link_mode == LinkMode::Serial {
             self.cli.serial.clone()
@@ -2355,10 +2459,11 @@ impl RseqGpui {
                 "{} endpoint is not configured; choose an endpoint and press Connect/Watch again",
                 self.link_mode.label()
             );
-            push_bounded(&mut self.logs, message, MAX_TEXT_LINES);
+            self.push_log(message);
             self.connected = false;
             self.session_mode = "idle".to_string();
             self.connection_label = "disconnected".to_string();
+            self.reload_in_progress = false;
             return;
         }
         self.connected = false;
@@ -2396,6 +2501,18 @@ impl RseqGpui {
             demo,
             startup_program: (!watch).then(|| self.startup_program.clone()).flatten(),
             report_decoders: self.metadata.report_decoders.clone(),
+            startup_controls: match resolve_tuning_assignments(
+                &self.metadata.tuning_catalog,
+                &self.cli.set_control,
+            ) {
+                Ok(assignments) => assignments,
+                Err(reason) => {
+                    self.push_log(reason);
+                    self.session_mode = "idle".to_string();
+                    self.reload_in_progress = false;
+                    return;
+                }
+            },
         };
         self.session = Some(rseq_host::spawn_session(config));
     }
@@ -2407,16 +2524,18 @@ impl RseqGpui {
         self.connected = false;
         self.connection_label = "disconnected".to_string();
         self.session_mode = "idle".to_string();
+        self.control_busy = None;
+        self.reload_in_progress = false;
     }
 
-    fn send_command(&mut self, command: SessionCommand) {
+    fn send_command(&mut self, command: SessionCommand) -> bool {
         let Some(session) = &self.session else {
             push_bounded(
                 &mut self.logs,
                 "no active session; connect first".to_string(),
                 MAX_TEXT_LINES,
             );
-            return;
+            return false;
         };
         if session.commands.send(command).is_err() {
             push_bounded(
@@ -2424,10 +2543,12 @@ impl RseqGpui {
                 "session command channel is closed".to_string(),
                 MAX_TEXT_LINES,
             );
+            return false;
         }
+        true
     }
 
-    fn drain_session_events(&mut self) {
+    fn drain_session_events(&mut self) -> bool {
         let mut events = Vec::new();
         if let Some(session) = &self.session {
             while let Ok(event) = session.events.try_recv() {
@@ -2437,9 +2558,11 @@ impl RseqGpui {
                 }
             }
         }
+        let had_events = !events.is_empty();
         for event in events {
             self.apply_event(event);
         }
+        had_events
     }
 
     fn apply_event(&mut self, event: SessionEvent) {
@@ -2447,24 +2570,67 @@ impl RseqGpui {
             SessionEvent::Connected { label } => {
                 self.connected = true;
                 self.connection_label = label;
+                self.reload_in_progress = false;
             }
             SessionEvent::Disconnected => {
                 self.connected = false;
+                self.session = None;
+                self.session_mode = "idle".to_string();
+                self.connection_label = "disconnected".to_string();
+                self.control_busy = None;
+                self.reload_in_progress = false;
                 push_bounded(
                     &mut self.logs,
                     "session disconnected".to_string(),
                     MAX_TEXT_LINES,
                 );
             }
-            SessionEvent::Log(line) => push_bounded(&mut self.logs, line, MAX_TEXT_LINES),
-            SessionEvent::Error(line) => {
-                push_bounded(&mut self.logs, format!("error: {line}"), MAX_TEXT_LINES)
-            }
+            SessionEvent::Log(line) => self.push_log(line),
+            SessionEvent::Error(line) => self.push_log(format!("error: {line}")),
             SessionEvent::ExecStatus(status) => push_bounded(
                 &mut self.logs,
                 format!("exec status: {status}"),
                 MAX_TEXT_LINES,
             ),
+            SessionEvent::LoadAndExecFinished { success } => {
+                self.reload_in_progress = false;
+                if success {
+                    self.reset_stream_state(true);
+                }
+            }
+            SessionEvent::ControlBusy { name, busy } => {
+                if busy {
+                    self.control_busy = Some(name);
+                } else if self.control_busy.as_deref() == Some(name.as_str()) {
+                    self.control_busy = None;
+                }
+            }
+            SessionEvent::ControlApplied {
+                name,
+                label,
+                report_scale,
+            } => {
+                self.pending_control_values.remove(&name);
+                if let Some(update) = report_scale {
+                    let updated = self.metadata.report_decoders.apply_scale_update(update);
+                    push_bounded(
+                        &mut self.logs,
+                        format!(
+                            "{name}={label}: updated {updated} decoder(s), {}={}; cleared capture boundary",
+                            update.kind.as_str(),
+                            update.value
+                        ),
+                        MAX_TEXT_LINES,
+                    );
+                    self.reset_stream_state(true);
+                } else {
+                    push_bounded(
+                        &mut self.logs,
+                        format!("{name}={label}: applied"),
+                        MAX_TEXT_LINES,
+                    );
+                }
+            }
             SessionEvent::Register { addr, access, data } => {
                 for (offset, byte) in data.iter().copied().enumerate() {
                     let cell_addr = addr + offset as u32;
@@ -2486,12 +2652,14 @@ impl RseqGpui {
                 self.ingest_motion_sample(sample);
             }
             SessionEvent::Report(summary) => {
-                self.push_capture_record(ReportCaptureRecord {
-                    meta: summary.meta,
-                    kind: summary.kind,
-                    args: summary.args.clone(),
-                });
-                push_bounded(&mut self.reports, summary.line, MAX_TEXT_LINES);
+                if !summary.discarded {
+                    self.push_capture_record(ReportCaptureRecord {
+                        meta: summary.meta,
+                        kind: summary.kind,
+                        args: summary.args.clone(),
+                    });
+                }
+                self.push_report_line(summary.line);
             }
             SessionEvent::Health(health) => self.health = health,
         }
@@ -2499,12 +2667,14 @@ impl RseqGpui {
 
     fn request_selected_register_dump(&mut self) {
         match self.selected_register_read_target(self.selected_register_addr) {
-            Ok(target) => self.send_command(SessionCommand::ReadRegister {
-                addr: target.addr,
-                len: target.len,
-                label: target.label,
-            }),
-            Err(reason) => push_bounded(&mut self.logs, reason, MAX_TEXT_LINES),
+            Ok(target) => {
+                self.send_command(SessionCommand::ReadRegister {
+                    addr: target.addr,
+                    len: target.len,
+                    label: target.label,
+                });
+            }
+            Err(reason) => self.push_log(reason),
         }
     }
 
@@ -2548,7 +2718,7 @@ impl RseqGpui {
             );
         }
         for item in skipped.iter().take(8) {
-            push_bounded(&mut self.logs, item.clone(), MAX_TEXT_LINES);
+            self.push_log(item.clone());
         }
         if skipped.len() > 8 {
             push_bounded(
@@ -2572,18 +2742,220 @@ impl RseqGpui {
         self.write_register_value(self.selected_register_addr, &value);
     }
 
+    fn selected_control(&self) -> Option<TuningControl> {
+        self.metadata
+            .tuning_catalog
+            .controls()
+            .get(self.selected_control_index)
+            .cloned()
+    }
+
+    fn control_value(&self, control: &TuningControl) -> Option<u32> {
+        let width = control.width.max(1) as usize;
+        let mut bytes = Vec::with_capacity(width);
+        for offset in 0..width {
+            let byte = self
+                .registers
+                .get(&(control.addr + offset as u32))?
+                .data
+                .first()
+                .copied()?;
+            bytes.push(byte);
+        }
+        tuning_control_value_from_bytes(control, &bytes)
+    }
+
+    fn pending_control_value(&self, control: &TuningControl) -> Option<u32> {
+        self.pending_control_values.get(&control.name).copied()
+    }
+
+    fn select_control(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_control_index =
+            index.min(self.metadata.tuning_catalog.len().saturating_sub(1));
+        let value = self
+            .selected_control()
+            .and_then(|control| {
+                self.pending_control_value(&control)
+                    .or_else(|| self.control_value(&control))
+                    .map(|value| tuning_control_value_label(&control, value))
+            })
+            .unwrap_or_default();
+        self.control_value_input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+        });
+    }
+
+    fn request_control_read(&mut self, control: TuningControl) {
+        let len = match u16::try_from(control.width.max(1)) {
+            Ok(len) if len > 0 => len,
+            _ => {
+                push_bounded(
+                    &mut self.logs,
+                    format!(
+                        "{} has invalid register width {}",
+                        control.name, control.width
+                    ),
+                    MAX_TEXT_LINES,
+                );
+                return;
+            }
+        };
+        self.send_command(SessionCommand::ReadRegister {
+            addr: control.addr,
+            len,
+            label: control.target,
+        });
+    }
+
+    fn stage_control_value(&mut self, control: TuningControl, value: u32) {
+        if let Some(name) = &self.control_busy {
+            push_bounded(
+                &mut self.logs,
+                format!("control transaction for {name} is still running"),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+        let label = tuning_control_value_label(&control, value);
+        if self.control_value(&control) == Some(value) {
+            self.pending_control_values.remove(&control.name);
+            push_bounded(
+                &mut self.logs,
+                format!("{} already {label}; staged change cleared", control.name),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+        self.pending_control_values
+            .insert(control.name.clone(), value);
+        push_bounded(
+            &mut self.logs,
+            format!("staged {}={label}", control.name),
+            MAX_TEXT_LINES,
+        );
+    }
+
+    fn clear_pending_controls(&mut self) {
+        let n = self.pending_control_values.len();
+        self.pending_control_values.clear();
+        if n > 0 {
+            push_bounded(
+                &mut self.logs,
+                format!("cleared {n} staged control change(s)"),
+                MAX_TEXT_LINES,
+            );
+        }
+    }
+
+    fn pending_control_assignments(&self) -> Vec<TuningAssignment> {
+        self.metadata
+            .tuning_catalog
+            .controls()
+            .iter()
+            .filter_map(|control| {
+                let value = self.pending_control_values.get(&control.name).copied()?;
+                Some(TuningAssignment {
+                    control: control.clone(),
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn apply_pending_controls(&mut self) {
+        if let Some(name) = &self.control_busy {
+            push_bounded(
+                &mut self.logs,
+                format!("control transaction for {name} is still running"),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+        let assignments = self.pending_control_assignments();
+        if assignments.is_empty() {
+            push_bounded(
+                &mut self.logs,
+                "no staged control changes".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        }
+        let summary = assignments
+            .iter()
+            .map(|assignment| {
+                format!(
+                    "{}={}",
+                    assignment.control.name,
+                    tuning_control_value_label(&assignment.control, assignment.value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_bounded(
+            &mut self.logs,
+            format!("set request {summary}"),
+            MAX_TEXT_LINES,
+        );
+        let busy_name = if assignments.len() == 1 {
+            assignments[0].control.name.clone()
+        } else {
+            format!("{} controls", assignments.len())
+        };
+        if self.send_command(SessionCommand::SetControls(assignments)) {
+            self.control_busy = Some(busy_name);
+        }
+    }
+
+    fn set_control_option_by_name(&mut self, control_name: &str, value: u32) {
+        let Some((index, control)) = self
+            .metadata
+            .tuning_catalog
+            .controls()
+            .iter()
+            .enumerate()
+            .find(|(_, control)| control.name == control_name)
+            .map(|(index, control)| (index, control.clone()))
+        else {
+            push_bounded(
+                &mut self.logs,
+                format!("unknown runtime control {control_name}"),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+
+        self.selected_control_index = index;
+        self.stage_control_value(control, value);
+    }
+
+    fn apply_selected_control(&mut self, cx: &Context<Self>) {
+        let Some(control) = self.selected_control() else {
+            push_bounded(
+                &mut self.logs,
+                "no runtime controls loaded".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+        let raw = self.control_value_input.read(cx).value().to_string();
+        match parse_tuning_control_value(&control, &raw) {
+            Ok(value) => self.stage_control_value(control, value),
+            Err(reason) => self.push_log(reason),
+        }
+    }
+
     fn write_register_value(&mut self, addr: u32, value: &str) {
         let data = match parse_register_write_bytes(value) {
             Ok(data) => data,
             Err(reason) => {
-                push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                self.push_log(reason);
                 return;
             }
         };
         let target = match self.selected_register_write_target(addr) {
             Ok(target) => target,
             Err(reason) => {
-                push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                self.push_log(reason);
                 return;
             }
         };
@@ -2614,7 +2986,7 @@ impl RseqGpui {
         let target = match self.selected_register_write_target(addr) {
             Ok(target) => target,
             Err(reason) => {
-                push_bounded(&mut self.logs, reason, MAX_TEXT_LINES);
+                self.push_log(reason);
                 return;
             }
         };
@@ -2764,7 +3136,7 @@ impl RseqGpui {
                     MAX_TEXT_LINES,
                 );
             }
-            Err(reason) => push_bounded(&mut self.logs, reason, MAX_TEXT_LINES),
+            Err(reason) => self.push_log(reason),
         }
     }
 
@@ -3427,7 +3799,7 @@ impl RseqGpui {
                                     .success()
                                     .label("Connect")
                                     .selected(connected_active)
-                                    .disabled(!can_connect)
+                                    .disabled(!can_connect || self.reload_in_progress)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.connect_from_current_source(cx);
                                         cx.notify();
@@ -3439,7 +3811,11 @@ impl RseqGpui {
                                     .primary()
                                     .label("Load & Run")
                                     .selected(load_run_active)
-                                    .disabled(!has_startup_source || !can_connect)
+                                    .disabled(
+                                        !has_startup_source
+                                            || !can_connect
+                                            || self.reload_in_progress,
+                                    )
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.load_and_run_from_current_source(cx);
                                         cx.notify();
@@ -3451,7 +3827,7 @@ impl RseqGpui {
                                     .info()
                                     .label("Watch")
                                     .selected(watch_active)
-                                    .disabled(!can_connect)
+                                    .disabled(!can_connect || self.reload_in_progress)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.watch_from_current_source(cx);
                                         cx.notify();
@@ -3970,6 +4346,9 @@ impl RseqGpui {
             .p_3()
             .gap_3()
             .child(self.render_motion_toolbar(cx))
+            .when(!self.metadata.tuning_catalog.is_empty(), |this| {
+                this.child(self.render_motion_controls(cx))
+            })
             .child(
                 div()
                     .flex()
@@ -4109,13 +4488,29 @@ impl RseqGpui {
             )
     }
 
-    fn render_reports(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_reports(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let refresh_due = self
+            .reports_text_last_sync
+            .map_or(true, |last_sync| last_sync.elapsed() >= REPORT_TEXT_REFRESH);
+        if self.reports_text_dirty && refresh_due {
+            self.reports_text_content =
+                text_lines_to_shared_string(&self.reports, "No report lines yet.");
+            sync_text_view(&self.reports_text, self.reports_text_content.as_str(), cx);
+            self.reports_text_dirty = false;
+            self.reports_text_last_sync = Some(Instant::now());
+        }
         v_flex()
             .size_full()
             .min_h_0()
             .overflow_hidden()
             .child(self.render_reports_toolbar(cx))
-            .child(text_panel("Reports", &self.reports, cx))
+            .child(text_panel(
+                "Reports",
+                self.reports.len(),
+                &self.reports_text_content,
+                &self.reports_text,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -4167,8 +4562,10 @@ impl RseqGpui {
             )
     }
 
-    fn render_logs(&self, cx: &Context<Self>) -> AnyElement {
-        text_panel("Logs", &self.logs, cx).into_any_element()
+    fn render_logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let logs_text = text_lines_to_shared_string(&self.logs, "No log lines yet.");
+        sync_text_view(&self.logs_text, logs_text.as_str(), cx);
+        text_panel("Logs", self.logs.len(), &logs_text, &self.logs_text, cx).into_any_element()
     }
 
     fn render_sequences(&self, cx: &Context<Self>) -> AnyElement {
@@ -4925,7 +5322,7 @@ impl RseqGpui {
                                     .icon(IconName::Play)
                                     .label("Load & Run")
                                     .selected(load_run_active)
-                                    .disabled(!source_ready)
+                                    .disabled(!source_ready || self.reload_in_progress)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.load_and_run_sequence_editor(cx);
                                         cx.notify();
@@ -4937,7 +5334,7 @@ impl RseqGpui {
                                     .info()
                                     .label("Watch")
                                     .selected(watch_active)
-                                    .disabled(!source_ready)
+                                    .disabled(!source_ready || self.reload_in_progress)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         if this.prepare_connection_config(cx)
                                             && this.reload_workspace_from_sequence_editor(false, cx)
@@ -5283,7 +5680,7 @@ impl RseqGpui {
                     return;
                 }
                 self.sequence_status = self.compile_status.clone();
-                self.start_session(false);
+                self.load_and_run_compiled_program();
             }
             Err(errors) => {
                 self.sequence_status = errors.join("\n");
@@ -6077,6 +6474,273 @@ impl RseqGpui {
             .unwrap_or(0x0f)
     }
 
+    fn render_motion_controls(&self, cx: &Context<Self>) -> AnyElement {
+        let controls = self.metadata.tuning_catalog.controls().to_vec();
+        if controls.is_empty() {
+            return div().into_any_element();
+        }
+
+        let controls_disabled = self.control_busy.is_some();
+        let pending_count = self.pending_control_values.len();
+        let busy_label = self
+            .control_busy
+            .as_deref()
+            .map(|name| format!("applying {name}..."))
+            .unwrap_or_default();
+        let selected = controls
+            .get(self.selected_control_index)
+            .cloned()
+            .unwrap_or_else(|| controls[0].clone());
+        let show_manual_value = selected.options.is_empty();
+
+        v_flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary.opacity(0.24))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().font_semibold().child("IMU Tuning"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if busy_label.is_empty() {
+                                "Ready".to_string()
+                            } else {
+                                busy_label
+                            }),
+                    )
+                    .when(pending_count > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().primary)
+                                .child(format!("{pending_count} pending")),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("motion-control-apply-pending")
+                            .xsmall()
+                            .label(if pending_count == 0 {
+                                "Apply".to_string()
+                            } else {
+                                format!("Apply {pending_count}")
+                            })
+                            .primary()
+                            .disabled(!self.connected || controls_disabled || pending_count == 0)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.apply_pending_controls();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("motion-control-clear-pending")
+                            .xsmall()
+                            .label("Clear")
+                            .disabled(self.control_busy.is_some() || pending_count == 0)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.clear_pending_controls();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .children(controls.into_iter().enumerate().map(|(index, control)| {
+                        let selected_row = index == self.selected_control_index;
+                        self.render_motion_control_row(
+                            index,
+                            control,
+                            selected_row,
+                            controls_disabled,
+                            cx,
+                        )
+                    })),
+            )
+            .when(show_manual_value, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(selected.target.clone()),
+                        )
+                        .child(
+                            Input::new(&self.control_value_input)
+                                .xsmall()
+                                .w(px(150.))
+                                .disabled(controls_disabled),
+                        )
+                        .child(
+                            Button::new("motion-control-apply-value")
+                                .xsmall()
+                                .label("Stage")
+                                .disabled(controls_disabled)
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.apply_selected_control(cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("Values: {}", tuning_control_value_hint(&selected))),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_motion_control_row(
+        &self,
+        index: usize,
+        control: TuningControl,
+        selected_row: bool,
+        controls_disabled: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let current = self.control_value(&control);
+        let pending = self.pending_control_value(&control);
+        let value_label = current
+            .map(|value| tuning_control_value_label(&control, value))
+            .unwrap_or_else(|| "not read".to_string());
+        let pending_label = pending.map(|value| tuning_control_value_label(&control, value));
+        let button_label = if control.options.is_empty() {
+            pending_label.clone().unwrap_or_else(|| value_label.clone())
+        } else {
+            let display_value = pending.or(current);
+            let label = pending_label.clone().unwrap_or_else(|| value_label.clone());
+            format!(
+                "{}{} ({})",
+                if pending.is_some() { "* " } else { "" },
+                label,
+                display_value.map_or("--".to_string(), |value| value.to_string())
+            )
+        };
+        let control_for_read = control.clone();
+        let control_name = control.name.clone();
+        let menu_control_name = control.name.clone();
+        let options = control.options.clone();
+        let target = control.target.clone();
+        let row_border = if pending.is_some() {
+            cx.theme().primary.opacity(0.75)
+        } else if selected_row {
+            cx.theme().primary.opacity(0.55)
+        } else {
+            cx.theme().border
+        };
+
+        h_flex()
+            .gap_1()
+            .items_center()
+            .w(px(254.))
+            .px_1()
+            .py_0p5()
+            .border_1()
+            .border_color(row_border)
+            .rounded(cx.theme().radius)
+            .bg(if selected_row {
+                cx.theme().primary.opacity(0.08)
+            } else if pending.is_some() {
+                cx.theme().primary.opacity(0.05)
+            } else {
+                cx.theme().background
+            })
+            .child(
+                v_flex()
+                    .gap_0()
+                    .w(px(74.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .overflow_hidden()
+                            .child(control.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_hidden()
+                            .child(control.group.clone()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.select_control(index, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div().w(px(126.)).child(
+                    DropdownButton::new(format!("motion-control-dropdown-{control_name}"))
+                        .xsmall()
+                        .button(
+                            Button::new(format!("motion-control-dropdown-button-{control_name}"))
+                                .label(button_label),
+                        )
+                        .disabled(controls_disabled || options.is_empty())
+                        .tooltip(format!("Set {} ({target})", control.name))
+                        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                            if options.is_empty() {
+                                return menu.menu_with_check_and_disabled(
+                                    "No options",
+                                    false,
+                                    Box::new(SelectMotionControlOptionAction(
+                                        menu_control_name.clone(),
+                                        0,
+                                    )),
+                                    true,
+                                );
+                            }
+
+                            options.iter().fold(menu, |menu, option| {
+                                let checked = pending.or(current) == Some(option.value);
+                                menu.menu_with_check_and_disabled(
+                                    motion_control_option_label(option),
+                                    checked,
+                                    Box::new(SelectMotionControlOptionAction(
+                                        menu_control_name.clone(),
+                                        option.value,
+                                    )),
+                                    controls_disabled || checked,
+                                )
+                            })
+                        }),
+                ),
+            )
+            .child(
+                Button::new(format!("motion-control-read-{control_name}"))
+                    .xsmall()
+                    .label("Read")
+                    .tooltip(format!("Read {target}"))
+                    .disabled(!self.connected || controls_disabled)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.request_control_read(control_for_read.clone());
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_4()
@@ -6090,6 +6754,7 @@ impl RseqGpui {
             .child(format!("reports {}", self.health.total_reports))
             .child(format!("dropped {}", self.health.dropped_frames))
             .child(format!("regs {}", self.registers.len()))
+            .child(format!("controls {}", self.metadata.tuning_catalog.len()))
             .child(format!("mode {}", self.session_mode))
     }
 }
@@ -6127,6 +6792,12 @@ impl Render for RseqGpui {
                     cx.notify();
                 }),
             )
+            .on_action(cx.listener(
+                |this, action: &SelectMotionControlOptionAction, _window, cx| {
+                    this.set_control_option_by_name(&action.0, action.1);
+                    cx.notify();
+                },
+            ))
             .bg(cx.theme().background)
             .child(
                 TitleBar::new().child(
@@ -6135,6 +6806,9 @@ impl Render for RseqGpui {
                         .selected_index(self.selected_tab.index())
                         .on_click(cx.listener(|this, index: &usize, _window, cx| {
                             this.selected_tab = PanelTab::from_index(*index);
+                            if this.selected_tab == PanelTab::Reports {
+                                this.reports_text_last_sync = None;
+                            }
                             cx.notify();
                         }))
                         .children(
@@ -6845,14 +7519,60 @@ fn sequence_info_block(title: &str, body: String, cx: &Context<RseqGpui>) -> imp
         )
 }
 
-fn text_panel(title: &str, lines: &VecDeque<String>, cx: &Context<RseqGpui>) -> impl IntoElement {
+fn sync_text_view(state: &Entity<TextViewState>, text: &str, cx: &mut Context<RseqGpui>) {
+    state.update(cx, |view, cx| {
+        view.set_text(text, cx);
+    });
+}
+
+fn text_lines_to_shared_string(lines: &VecDeque<String>, empty: &str) -> SharedString {
+    if lines.is_empty() {
+        return SharedString::from(empty);
+    }
+    SharedString::from(lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+}
+
+fn text_panel(
+    title: &str,
+    line_count: usize,
+    text: &SharedString,
+    state: &Entity<TextViewState>,
+    cx: &mut Context<RseqGpui>,
+) -> impl IntoElement {
+    let copy_text = text.clone();
+
     v_flex()
         .size_full()
         .min_h_0()
         .overflow_hidden()
         .p_3()
         .gap_2()
-        .child(div().text_sm().font_semibold().child(title.to_string()))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_sm().font_semibold().child(title.to_string()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{} line(s)", line_count)),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new(format!("{title}-copy-all"))
+                        .xsmall()
+                        .label("Copy All")
+                        .disabled(line_count == 0)
+                        .on_click(move |_, _, cx| {
+                            if !copy_text.trim().is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_text.to_string(),
+                                ));
+                            }
+                        }),
+                ),
+        )
         .child(
             div()
                 .flex_1()
@@ -6862,17 +7582,14 @@ fn text_panel(title: &str, lines: &VecDeque<String>, cx: &Context<RseqGpui>) -> 
                 .border_color(cx.theme().border)
                 .rounded(cx.theme().radius)
                 .child(
-                    v_flex()
+                    TextView::new(state)
+                        .selectable(true)
+                        .scrollable(true)
                         .size_full()
-                        .overflow_y_scrollbar()
                         .p_3()
                         .text_sm()
-                        .children(lines.iter().rev().take(240).rev().map(|line| {
-                            div()
-                                .py_0p5()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(line.clone())
-                        })),
+                        .font_family("monospace")
+                        .text_color(cx.theme().muted_foreground),
                 ),
         )
 }
@@ -7556,6 +8273,16 @@ fn parse_nonnegative_usize(value: &str, label: &str) -> Result<usize, String> {
     trimmed
         .parse::<usize>()
         .map_err(|_| format!("invalid {label}: {trimmed}"))
+}
+
+fn motion_control_option_label(option: &rseq_host::TuningControlOption) -> String {
+    if !option.label.is_empty() {
+        option.label.clone()
+    } else if !option.name.is_empty() {
+        option.name.clone()
+    } else {
+        option.value.to_string()
+    }
 }
 
 fn serial_port_menu_label(port: &rseq_host::SerialPortInfo) -> String {

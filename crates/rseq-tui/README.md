@@ -2,11 +2,12 @@
 
 Terminal dashboard demo for rseq report streams.
 
-It provides four tabs:
+It provides five tabs:
 
 - Motion: live acc and gyro charts.
 - Reports: recent report frames.
 - Registers: latest traced register reads/writes.
+- Controls: live output-rate, filter, range, and other YAML-defined settings.
 - Logs: link and source messages.
 
 Run the synthetic demo:
@@ -22,6 +23,8 @@ cargo run -p rseq-tui --features serial -- \
   --serial /dev/cu.usbmodem314201 \
   --baud 115200 \
   --chip qmi8660.yaml \
+  --set-control accel_odr=200Hz \
+  --set-control accel_lpf=preset2 \
   -f examples/qmi8660_fifo.rseq
 ```
 
@@ -67,3 +70,9 @@ Press `w` on a writable register to open the write dialog. Enter hex bytes such 
 `12 34`, or `0x1234`, then press Enter to send a `Control` BusWrite frame. Press `q` or `Esc` to
 cancel the dialog without exiting the TUI. Registers marked read-only in YAML are rejected by the TUI
 before a control frame is sent.
+
+The Controls tab is populated from the chip YAML top-level `controls` list. Press `r` to read the
+selected control's backing register, `[`/`]` to cycle declared options, or `Enter`/`e` to enter an
+option label or numeric value. Changes use a live register read-modify-write and do not reload the
+running rseq program. Repeated `--set-control NAME=VALUE` arguments apply initial values immediately
+after the TUI connects; the same controls remain editable from the tab afterward.

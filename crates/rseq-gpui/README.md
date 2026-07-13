@@ -12,6 +12,8 @@ cargo run -p rseq-gpui --features serial -- \
   --serial /dev/cu.usbmodem314201 \
   --baud 115200 \
   --chip qmi8660.yaml \
+  --set-control accel_odr=200Hz \
+  --set-control accel_lpf=preset2 \
   -f examples/qmi8660_fifo.rseq
 ```
 
@@ -96,7 +98,11 @@ working directory so `qmi8660.yaml` and `examples\*.rseq` paths continue to work
 
 ## UI
 
-- Motion: live accelerometer (`m/s^2`) and gyroscope (`rad/s`) charts.
+- Motion: live accelerometer (`m/s^2`) and gyroscope (`rad/s`) charts, plus an
+  always-visible IMU Tuning panel for YAML-defined output rate, filter, range,
+  and related parameters. Read the selected backing register, choose a declared
+  option, or enter a label/raw value while reports continue streaming. Writes
+  use register read-modify-write and preserve unrelated fields.
 - Reports: decoded report stream with frame/timestamp/drop statistics.
 - Registers: page-aware Matrix and Register Map views. Hover decodes YAML
   bitfields with live-value highlighting, `??` means `no_dump`, and double-click
@@ -121,6 +127,10 @@ loads and runs the compiled `.rseq`. If the Sequences editor is active or dirty,
 the toolbar actions use the editor buffer; otherwise they use the startup file
 from the command line. `Watch` always opens an observing session, and `Load & Run`
 always sends LOAD/EXEC when a compiled program is available.
+
+Repeated `--set-control NAME=VALUE` arguments are applied as soon as the session
+connects, in both watch and load/run modes. The Motion page's IMU Tuning panel
+remains available for later live changes through the same host control channel.
 
 The Sequences tab has `Open` buttons backed by the system file picker. You can
 launch the app without `-f`, choose a local `.rseq` file and chip YAML in the UI,

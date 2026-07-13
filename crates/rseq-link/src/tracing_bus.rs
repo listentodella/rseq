@@ -248,7 +248,12 @@ impl<B: Bus, L: LinkTx, const BUF: usize> Bus for TracingBus<B, L, BUF> {
 
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), BusError> {
         self.common.inner.write(addr, data)?;
-        let n = encode_trace_rw(&mut self.common.buf, crate::wire::TRACE_OP_WRITE, addr, data);
+        let n = encode_trace_rw(
+            &mut self.common.buf,
+            crate::wire::TRACE_OP_WRITE,
+            addr,
+            data,
+        );
         self.common.send(n);
         Ok(())
     }

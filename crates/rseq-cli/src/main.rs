@@ -26,6 +26,10 @@ struct Cli {
     #[arg(short, long)]
     manifest: Option<String>,
 
+    /// Chip YAML used for register/control metadata.
+    #[arg(long)]
+    chip: Vec<PathBuf>,
+
     #[arg(short, long)]
     run: Vec<String>,
 
@@ -78,6 +82,14 @@ struct Cli {
     #[arg(long)]
     replay: Option<PathBuf>,
 
+    /// List runtime-tunable controls from --chip or chip!(...) metadata.
+    #[arg(long)]
+    list_controls: bool,
+
+    /// Set a runtime-tunable control via read-modify-write, e.g. --set-control accel_odr=200Hz.
+    #[arg(long = "set-control", value_name = "NAME=VALUE")]
+    set_control: Vec<String>,
+
     /// 每 N 条 report 打印一次累计健康统计；0 表示关闭。
     #[arg(long, default_value_t = 100)]
     stats_every: u64,
@@ -124,17 +136,43 @@ fn main() {
         return;
     }
 
-    if cli.stop || cli.reset_mcu || cli.ping {
+    if cli.list_controls {
+        let metadata = load_control_metadata(&cli).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
+        print_tuning_controls(&metadata.tuning_catalog);
+        return;
+    }
+
+    let set_control_only = !cli.set_control.is_empty()
+        && cli.file.is_empty()
+        && cli.manifest.is_none()
+        && !cli.watch
+        && !cli.decompile
+        && !cli.execute;
+
+    if cli.stop || cli.reset_mcu || cli.ping || set_control_only {
         let Some(endpoint) = cli.endpoint() else {
-            eprintln!("--stop/--reset-mcu/--ping require --serial <port> or --tcp <host:port>");
+            eprintln!(
+                "--stop/--reset-mcu/--ping/--set-control require --serial <port> or --tcp <host:port>"
+            );
             std::process::exit(2);
         };
+        let control_assignments = load_control_assignments(&cli);
 
         match endpoint {
             Endpoint::Serial(path) => {
                 #[cfg(feature = "serial")]
                 {
-                    run_control_serial(path, cli.baud, cli.stop, cli.reset_mcu, cli.ping);
+                    run_control_serial(
+                        path,
+                        cli.baud,
+                        cli.stop,
+                        cli.reset_mcu,
+                        cli.ping,
+                        &control_assignments,
+                    );
                     return;
                 }
                 #[cfg(not(feature = "serial"))]
@@ -147,7 +185,13 @@ fn main() {
                 }
             }
             Endpoint::Tcp(addr) => {
-                run_control_tcp(addr, cli.stop, cli.reset_mcu, cli.ping);
+                run_control_tcp(
+                    addr,
+                    cli.stop,
+                    cli.reset_mcu,
+                    cli.ping,
+                    &control_assignments,
+                );
                 return;
             }
         }
@@ -165,6 +209,7 @@ fn main() {
             );
         }
         let report_decoders = load_watch_report_decoders(&cli);
+        let control_assignments = load_control_assignments(&cli);
         let mut save = open_save_sink(cli.save.as_deref()).unwrap_or_else(|err| {
             eprintln!("{err}");
             std::process::exit(1);
@@ -173,7 +218,14 @@ fn main() {
             Endpoint::Serial(path) => {
                 #[cfg(feature = "serial")]
                 {
-                    run_watch_serial(path, cli.baud, report_decoders, &mut save, cli.stats_every);
+                    run_watch_serial(
+                        path,
+                        cli.baud,
+                        report_decoders,
+                        &control_assignments,
+                        &mut save,
+                        cli.stats_every,
+                    );
                     return;
                 }
                 #[cfg(not(feature = "serial"))]
@@ -186,7 +238,13 @@ fn main() {
                 }
             }
             Endpoint::Tcp(addr) => {
-                run_watch_tcp(addr, report_decoders, &mut save, cli.stats_every);
+                run_watch_tcp(
+                    addr,
+                    report_decoders,
+                    &control_assignments,
+                    &mut save,
+                    cli.stats_every,
+                );
                 return;
             }
         }
@@ -258,6 +316,7 @@ fn main() {
             eprintln!("{err}");
             std::process::exit(1);
         });
+        let control_assignments = load_control_assignments(&cli);
 
         println!("\nCompiling to bytecode...");
         let program_units = parsed_sources
@@ -577,6 +636,7 @@ fn main() {
                             &bytecode,
                             &irq_bytecodes,
                             report_decoders,
+                            &control_assignments,
                             &mut save,
                             cli.stats_every,
                         );
@@ -596,6 +656,7 @@ fn main() {
                         &bytecode,
                         &irq_bytecodes,
                         report_decoders,
+                        &control_assignments,
                         &mut save,
                         cli.stats_every,
                     );
@@ -613,6 +674,7 @@ fn run_over_serial(
     bytecode: &[u8],
     irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
     report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -629,6 +691,7 @@ fn run_over_serial(
         bytecode,
         irq_bytecodes,
         report_decoders,
+        control_assignments,
         save,
         stats_every,
     );
@@ -639,6 +702,7 @@ fn run_over_tcp(
     bytecode: &[u8],
     irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
     report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -655,6 +719,7 @@ fn run_over_tcp(
         bytecode,
         irq_bytecodes,
         report_decoders,
+        control_assignments,
         save,
         stats_every,
     );
@@ -665,7 +730,8 @@ fn run_over_transport<T: rseq_link::Transport>(
     transport: T,
     bytecode: &[u8],
     irq_bytecodes: &std::collections::HashMap<String, Vec<u8>>,
-    report_decoders: ReportDecoderRegistry,
+    mut report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -698,10 +764,11 @@ fn run_over_transport<T: rseq_link::Transport>(
             std::process::exit(1);
         }
     }
+    apply_control_assignments(&mut host, control_assignments, Some(&mut report_decoders));
 
     if !irq_bytecodes.is_empty() {
         println!("\nObserving report events. Press Ctrl-C to stop.");
-        observe_reports_forever(&mut host, &report_decoders, save, stats_every);
+        observe_reports_forever(&mut host, &mut report_decoders, save, stats_every);
     }
 }
 
@@ -710,6 +777,7 @@ fn run_watch_serial(
     path: &str,
     baud: u32,
     report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -724,6 +792,7 @@ fn run_watch_serial(
         &Endpoint::Serial(path).label(baud),
         transport,
         report_decoders,
+        control_assignments,
         save,
         stats_every,
     );
@@ -732,6 +801,7 @@ fn run_watch_serial(
 fn run_watch_tcp(
     addr: &str,
     report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -746,6 +816,7 @@ fn run_watch_tcp(
         &Endpoint::Tcp(addr).label(0),
         transport,
         report_decoders,
+        control_assignments,
         save,
         stats_every,
     );
@@ -754,7 +825,8 @@ fn run_watch_tcp(
 fn run_watch_transport<T: rseq_link::Transport>(
     label: &str,
     transport: T,
-    report_decoders: ReportDecoderRegistry,
+    mut report_decoders: ReportDecoderRegistry,
+    control_assignments: &[rseq_host::TuningAssignment],
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -770,12 +842,25 @@ fn run_watch_transport<T: rseq_link::Transport>(
     println!("No LOAD/EXEC/PING frames will be sent. Press Ctrl-C to stop.");
 
     let mut host = HostLink::new(transport);
-    observe_reports_forever(&mut host, &report_decoders, save, stats_every);
+    apply_control_assignments(&mut host, control_assignments, Some(&mut report_decoders));
+    observe_reports_forever(&mut host, &mut report_decoders, save, stats_every);
 }
 
 #[cfg(feature = "serial")]
-fn run_control_serial(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: bool) {
-    let transport = match rseq_link::SerialTransport::open(path, baud) {
+fn run_control_serial(
+    path: &str,
+    baud: u32,
+    stop: bool,
+    reset_mcu: bool,
+    ping: bool,
+    control_assignments: &[rseq_host::TuningAssignment],
+) {
+    let transport = if !control_assignments.is_empty() && !stop && !reset_mcu && !ping {
+        rseq_link::SerialTransport::open_observing(path, baud)
+    } else {
+        rseq_link::SerialTransport::open(path, baud)
+    };
+    let transport = match transport {
         Ok(t) => t,
         Err(e) => {
             eprintln!("open serial {path} failed: {e}");
@@ -788,11 +873,23 @@ fn run_control_serial(path: &str, baud: u32, stop: bool, reset_mcu: bool, ping: 
         stop,
         reset_mcu,
         ping,
+        control_assignments,
     );
 }
 
-fn run_control_tcp(addr: &str, stop: bool, reset_mcu: bool, ping: bool) {
-    let transport = match rseq_link::TcpTransport::connect(addr) {
+fn run_control_tcp(
+    addr: &str,
+    stop: bool,
+    reset_mcu: bool,
+    ping: bool,
+    control_assignments: &[rseq_host::TuningAssignment],
+) {
+    let transport = if !control_assignments.is_empty() && !stop && !reset_mcu && !ping {
+        rseq_link::TcpTransport::connect_observing(addr)
+    } else {
+        rseq_link::TcpTransport::connect(addr)
+    };
+    let transport = match transport {
         Ok(t) => t,
         Err(e) => {
             eprintln!("open tcp {addr} failed: {e}");
@@ -805,6 +902,7 @@ fn run_control_tcp(addr: &str, stop: bool, reset_mcu: bool, ping: bool) {
         stop,
         reset_mcu,
         ping,
+        control_assignments,
     );
 }
 
@@ -814,6 +912,7 @@ fn run_control_transport<T: rseq_link::Transport>(
     stop: bool,
     reset_mcu: bool,
     ping: bool,
+    control_assignments: &[rseq_host::TuningAssignment],
 ) {
     use rseq::link::HostLink;
 
@@ -841,11 +940,154 @@ fn run_control_transport<T: rseq_link::Transport>(
         }
         println!("✓ Reset MCU rseq program state");
     }
+    apply_control_assignments(&mut host, control_assignments, None);
+}
+
+fn apply_control_assignments<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
+    assignments: &[rseq_host::TuningAssignment],
+    mut report_decoders: Option<&mut ReportDecoderRegistry>,
+) {
+    if assignments.is_empty() {
+        return;
+    }
+
+    println!("\nApplying runtime control(s)...");
+    let reports_paused = match host.pause_reports_timeout(std::time::Duration::from_millis(250)) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "warning: PAUSE unavailable before runtime controls: {err}; applying controls while suppressing reports on the host"
+            );
+            false
+        }
+    };
+
+    let result =
+        apply_control_assignments_paused(host, assignments, report_decoders.as_deref_mut());
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(std::time::Duration::from_millis(50));
+        None
+    };
+
+    if let Some(Err(err)) = resume_result {
+        eprintln!("RESUME failed after runtime controls: {err}");
+        if result.is_ok() {
+            std::process::exit(1);
+        }
+    }
+    if let Err(err) = result {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn apply_control_assignments_paused<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
+    assignments: &[rseq_host::TuningAssignment],
+    mut report_decoders: Option<&mut ReportDecoderRegistry>,
+) -> Result<(), String> {
+    for assignment in assignments {
+        let control = &assignment.control;
+        let len = match u16::try_from(control.width.max(1)) {
+            Ok(len) if len > 0 => len,
+            _ => {
+                return Err(format!(
+                    "set {} failed: invalid register width {}",
+                    control.name, control.width
+                ));
+            }
+        };
+        if len as usize > rseq_link::wire::CONTROL_MAX_READ_LEN {
+            return Err(format!(
+                "set {} failed: width {} exceeds control read limit {}",
+                control.name,
+                len,
+                rseq_link::wire::CONTROL_MAX_READ_LEN
+            ));
+        }
+
+        let read = match host.control_read(control.addr, len) {
+            Ok(read) => read,
+            Err(err) => {
+                return Err(format!(
+                    "set {} read {} @ 0x{:02x} failed: {err}",
+                    control.name, control.register_name, control.addr
+                ));
+            }
+        };
+        let before = rseq_host::tuning_control_value_from_bytes(control, &read.data);
+        let data =
+            match rseq_host::apply_tuning_control_value(control, &read.data, assignment.value) {
+                Ok(data) => data,
+                Err(err) => {
+                    return Err(format!("set {} failed: {err}", control.name));
+                }
+            };
+        let label = rseq_host::tuning_control_value_label(control, assignment.value);
+        if read.data.get(..data.len()) == Some(data.as_slice()) {
+            println!(
+                "✓ {} already {} ({}) @ 0x{:02x}",
+                control.name, label, control.target, control.addr
+            );
+            update_control_decoder_scale(assignment, report_decoders.as_deref_mut())?;
+            continue;
+        }
+
+        match host.control_write(control.addr, &data) {
+            Ok(result) => {
+                let before_label = before
+                    .map(|value| rseq_host::tuning_control_value_label(control, value))
+                    .unwrap_or_else(|| "?".to_string());
+                println!(
+                    "✓ set {}: {} -> {} ({}) @ 0x{:02x}: [{}]",
+                    control.name,
+                    before_label,
+                    label,
+                    control.target,
+                    result.addr,
+                    bytes_hex(&data)
+                );
+                update_control_decoder_scale(assignment, report_decoders.as_deref_mut())?;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "set {} write {} @ 0x{:02x} data=[{}] failed: {err}",
+                    control.name,
+                    control.register_name,
+                    control.addr,
+                    bytes_hex(&data)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_control_decoder_scale(
+    assignment: &rseq_host::TuningAssignment,
+    report_decoders: Option<&mut ReportDecoderRegistry>,
+) -> Result<(), String> {
+    let report_scale = rseq_host::tuning_assignment_report_scale(assignment)?;
+    if let Some(report_decoders) = report_decoders {
+        if let Some(update) = report_scale {
+            let updated = report_decoders.apply_scale_update(update);
+            println!(
+                "  updated {updated} report decoder(s): {}={}",
+                update.kind.as_str(),
+                update.value
+            );
+        }
+        report_decoders.mark_stream_reconfigured();
+    }
+    Ok(())
 }
 
 fn observe_reports_forever<T: rseq_link::Transport>(
     host: &mut rseq::link::HostLink<T>,
-    report_decoders: &ReportDecoderRegistry,
+    report_decoders: &mut ReportDecoderRegistry,
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -998,7 +1240,7 @@ impl ReportObserveState {
 fn print_observed_report(
     op: &rseq::trace::BusOp,
     state: &mut ReportObserveState,
-    report_decoders: &ReportDecoderRegistry,
+    report_decoders: &mut ReportDecoderRegistry,
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -1006,6 +1248,15 @@ fn print_observed_report(
         let info = state.next(*meta);
         state.note_report_kind(*kind);
         if *kind == rseq::REPORT_KIND_FIFO_RAW {
+            if report_decoders.take_fifo_discard(*kind) {
+                println!(
+                    "FIFO_RAW #{}{}: discarded after runtime control reconfiguration",
+                    info.seq,
+                    format_report_watch_meta(&info)
+                );
+                state.maybe_print_summary(stats_every);
+                return;
+            }
             print_fifo_raw_report(&info, args, state, report_decoders.get(*kind));
         } else {
             print_named_report(&info, *kind, args);
@@ -1188,6 +1439,7 @@ impl ReportDecoder {
 #[derive(Debug, Clone, Default)]
 struct ReportDecoderRegistry {
     by_kind: std::collections::HashMap<u32, ReportDecoder>,
+    discard_next_fifo_report: bool,
 }
 
 impl ReportDecoderRegistry {
@@ -1205,6 +1457,38 @@ impl ReportDecoderRegistry {
 
     fn len(&self) -> usize {
         self.by_kind.len()
+    }
+
+    fn apply_scale_update(&mut self, update: rseq_host::ReportScaleUpdate) -> usize {
+        let mut updated = 0;
+        for decoder in self.by_kind.values_mut() {
+            match decoder {
+                ReportDecoder::I16Le(decoder) => match update.kind {
+                    rseq_host::ReportScaleKind::AccelFullScaleG
+                        if !decoder.accel_fields.is_empty() =>
+                    {
+                        decoder.accel_fs_g = update.value;
+                        updated += 1;
+                    }
+                    rseq_host::ReportScaleKind::GyroFullScaleDps
+                        if !decoder.gyro_fields.is_empty() =>
+                    {
+                        decoder.gyro_fs_dps = update.value;
+                        updated += 1;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        updated
+    }
+
+    fn mark_stream_reconfigured(&mut self) {
+        self.discard_next_fifo_report = true;
+    }
+
+    fn take_fifo_discard(&mut self, kind: u32) -> bool {
+        kind == rseq::REPORT_KIND_FIFO_RAW && std::mem::take(&mut self.discard_next_fifo_report)
     }
 }
 
@@ -1727,7 +2011,7 @@ impl BinSave {
 
 fn run_replay(
     path: &Path,
-    report_decoders: ReportDecoderRegistry,
+    mut report_decoders: ReportDecoderRegistry,
     save: &mut SaveSink,
     stats_every: u64,
 ) {
@@ -1743,7 +2027,7 @@ fn run_replay(
     let mut state = ReportObserveState::default();
     for (meta, kind, args) in reports {
         let op = rseq::trace::BusOp::Report { meta, kind, args };
-        print_observed_report(&op, &mut state, &report_decoders, save, stats_every);
+        print_observed_report(&op, &mut state, &mut report_decoders, save, stats_every);
     }
     state.maybe_print_summary(1);
 }
@@ -2050,6 +2334,65 @@ fn load_watch_report_decoders(cli: &Cli) -> ReportDecoderRegistry {
         eprintln!("{err}");
         std::process::exit(1);
     })
+}
+
+fn load_control_assignments(cli: &Cli) -> Vec<rseq_host::TuningAssignment> {
+    if cli.set_control.is_empty() {
+        return Vec::new();
+    }
+    let metadata = load_control_metadata(cli).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
+    rseq_host::resolve_tuning_assignments(&metadata.tuning_catalog, &cli.set_control)
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        })
+}
+
+fn load_control_metadata(cli: &Cli) -> Result<rseq_host::HostMetadata, String> {
+    let sources = load_watch_sources(cli)?
+        .into_iter()
+        .map(|(name, source, base_dir)| rseq_host::RseqSource::new(name, source, base_dir))
+        .collect::<Vec<_>>();
+    rseq_host::load_host_metadata_from_sources(&sources, &cli.chip)
+}
+
+fn print_tuning_controls(catalog: &rseq_host::TuningControlCatalog) {
+    if catalog.is_empty() {
+        println!(
+            "No runtime controls found. Provide --chip <chip.yaml> or an .rseq with chip!(...)."
+        );
+        return;
+    }
+
+    let mut current_group: Option<&str> = None;
+    for control in catalog.controls() {
+        let group = if control.group.is_empty() {
+            "General"
+        } else {
+            control.group.as_str()
+        };
+        if current_group != Some(group) {
+            if current_group.is_some() {
+                println!();
+            }
+            println!("{group}:");
+            current_group = Some(group);
+        }
+        println!(
+            "  {} -> {} [{}:{}] @ 0x{:02x}",
+            control.name, control.target, control.bit_hi, control.bit_lo, control.addr
+        );
+        if !control.desc.is_empty() {
+            println!("      {}", control.desc);
+        }
+        println!(
+            "      values: {}",
+            rseq_host::tuning_control_value_hint(control)
+        );
+    }
 }
 
 fn load_watch_sources(cli: &Cli) -> Result<Vec<(String, String, Option<PathBuf>)>, String> {

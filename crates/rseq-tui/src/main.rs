@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long, alias = "observe-only", alias = "rx-only")]
     watch: bool,
 
+    /// Apply runtime controls after connecting, for example accel_odr=200Hz.
+    #[arg(long = "set-control", value_name = "NAME=VALUE")]
+    set_control: Vec<String>,
+
     /// Number of IMU samples retained for the charts.
     #[arg(long, default_value_t = 512)]
     history: usize,
@@ -76,6 +80,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let metadata = load_host_metadata(&cli.file, &cli.chip)?;
+    let startup_controls =
+        rseq_host::resolve_tuning_assignments(&metadata.tuning_catalog, &cli.set_control)?;
     let startup_program = serial_startup_program(&cli)?;
     let (tx, rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -84,6 +90,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         &cli,
         metadata.report_decoders,
         startup_program,
+        startup_controls,
         tx,
         cmd_rx,
         stop.clone(),
@@ -94,6 +101,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         source_label,
         cli.history.max(16),
         metadata.register_dump,
+        metadata.tuning_catalog,
         Some(cmd_tx),
     );
     run_app(&mut terminal, &mut app, rx)?;
@@ -105,12 +113,13 @@ fn start_source(
     cli: &Cli,
     report_decoders: ReportDecoderRegistry,
     startup_program: Option<CompiledProgram>,
+    startup_controls: Vec<rseq_host::TuningAssignment>,
     tx: Sender<AppEvent>,
     cmd_rx: Receiver<SourceCommand>,
     stop: Arc<AtomicBool>,
 ) -> String {
     if cli.demo || (cli.serial.is_none() && cli.tcp.is_none()) {
-        spawn_demo_source(tx, cmd_rx, stop);
+        spawn_demo_source(tx, cmd_rx, stop, startup_controls);
         return "demo".to_string();
     }
 
@@ -125,6 +134,7 @@ fn start_source(
             serial,
             cli.baud,
             startup_program,
+            startup_controls,
             report_decoders,
             tx,
             cmd_rx,
@@ -135,7 +145,15 @@ fn start_source(
 
     let tcp = cli.tcp.clone().expect("--tcp checked above");
     let label = format!("{tcp} ({mode})");
-    spawn_tcp_source(tcp, startup_program, report_decoders, tx, cmd_rx, stop);
+    spawn_tcp_source(
+        tcp,
+        startup_program,
+        startup_controls,
+        report_decoders,
+        tx,
+        cmd_rx,
+        stop,
+    );
     label
 }
 
@@ -174,17 +192,25 @@ enum Tab {
     Motion,
     Reports,
     Registers,
+    Controls,
     Logs,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Motion, Self::Reports, Self::Registers, Self::Logs];
+    const ALL: [Self; 5] = [
+        Self::Motion,
+        Self::Reports,
+        Self::Registers,
+        Self::Controls,
+        Self::Logs,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Motion => "Motion",
             Self::Reports => "Reports",
             Self::Registers => "Registers",
+            Self::Controls => "Controls",
             Self::Logs => "Logs",
         }
     }
@@ -208,6 +234,7 @@ struct RegisterValue {
 struct HostMetadata {
     report_decoders: ReportDecoderRegistry,
     register_dump: RegisterDumpMap,
+    tuning_catalog: rseq_host::TuningControlCatalog,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -318,6 +345,14 @@ enum AppEvent {
         data: Vec<u8>,
     },
     Report(String),
+    ControlApplied {
+        name: String,
+        label: String,
+        report_scale: Option<rseq_host::ReportScaleUpdate>,
+    },
+    ControlFinished {
+        name: String,
+    },
     Log(String),
     Error(String),
 }
@@ -334,6 +369,7 @@ enum SourceCommand {
         data: Vec<u8>,
         label: String,
     },
+    SetControl(rseq_host::TuningAssignment),
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +393,13 @@ struct RegisterWriteDialog {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TuningDialog {
+    control: rseq_host::TuningControl,
+    input: String,
+    error: Option<String>,
+}
+
 struct App {
     running: bool,
     tab: usize,
@@ -369,6 +412,10 @@ struct App {
     selected_register_addr: u32,
     register_detail_open: bool,
     register_write_dialog: Option<RegisterWriteDialog>,
+    tuning_catalog: rseq_host::TuningControlCatalog,
+    selected_control_index: usize,
+    tuning_dialog: Option<TuningDialog>,
+    control_busy: Option<String>,
     reports: VecDeque<String>,
     logs: VecDeque<String>,
     sample_counter: u64,
@@ -382,6 +429,7 @@ impl App {
         source_label: String,
         history: usize,
         register_dump: RegisterDumpMap,
+        tuning_catalog: rseq_host::TuningControlCatalog,
         source_commands: Option<Sender<SourceCommand>>,
     ) -> Self {
         Self {
@@ -396,6 +444,10 @@ impl App {
             selected_register_addr: 0,
             register_detail_open: false,
             register_write_dialog: None,
+            tuning_catalog,
+            selected_control_index: 0,
+            tuning_dialog: None,
+            control_busy: None,
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
             sample_counter: 0,
@@ -410,11 +462,18 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
+        if self.handle_tuning_dialog_key(code) {
+            return;
+        }
+
         if self.handle_register_write_dialog_key(code) {
             return;
         }
 
         if self.selected_tab() == Tab::Registers && self.handle_register_key(code) {
+            return;
+        }
+        if self.selected_tab() == Tab::Controls && self.handle_control_key(code) {
             return;
         }
 
@@ -428,7 +487,47 @@ impl App {
             KeyCode::Char('2') => self.tab = 1,
             KeyCode::Char('3') => self.tab = 2,
             KeyCode::Char('4') => self.tab = 3,
+            KeyCode::Char('5') => self.tab = 4,
             _ => {}
+        }
+    }
+
+    fn handle_tuning_dialog_key(&mut self, code: KeyCode) -> bool {
+        if self.tuning_dialog.is_none() {
+            return false;
+        }
+
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.tuning_dialog = None;
+                true
+            }
+            KeyCode::Enter => {
+                self.submit_tuning_dialog();
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.tuning_dialog {
+                    dialog.input.pop();
+                    dialog.error = None;
+                }
+                true
+            }
+            KeyCode::Delete => {
+                if let Some(dialog) = &mut self.tuning_dialog {
+                    dialog.input.clear();
+                    dialog.error = None;
+                }
+                true
+            }
+            KeyCode::Char(ch) if is_tuning_input_char(ch) => {
+                if let Some(dialog) = &mut self.tuning_dialog {
+                    dialog.input.push(ch);
+                    dialog.error = None;
+                }
+                true
+            }
+            _ => true,
         }
     }
 
@@ -528,6 +627,48 @@ impl App {
         }
     }
 
+    fn handle_control_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Up => {
+                self.move_control_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_control_selection(1);
+                true
+            }
+            KeyCode::Home => {
+                self.selected_control_index = 0;
+                true
+            }
+            KeyCode::End => {
+                self.selected_control_index =
+                    self.tuning_catalog.controls().len().saturating_sub(1);
+                true
+            }
+            KeyCode::Char('r') => {
+                self.request_selected_control_read();
+                true
+            }
+            KeyCode::Char('[') => {
+                self.cycle_selected_control(-1);
+                true
+            }
+            KeyCode::Char(']') => {
+                self.cycle_selected_control(1);
+                true
+            }
+            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('w') => {
+                self.open_tuning_dialog();
+                true
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='5') | KeyCode::Char('q') => {
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn move_register_selection(&mut self, delta: i32) {
         let max_addr = register_grid_max_addr(self).max(0x0f);
         let next = if delta.is_negative() {
@@ -537,6 +678,207 @@ impl App {
             self.selected_register_addr.saturating_add(delta as u32)
         };
         self.selected_register_addr = next.min(max_addr);
+    }
+
+    fn move_control_selection(&mut self, delta: i32) {
+        let len = self.tuning_catalog.controls().len();
+        if len == 0 {
+            self.selected_control_index = 0;
+            return;
+        }
+        let current = self.selected_control_index.min(len - 1);
+        self.selected_control_index = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            current.saturating_add(delta as usize).min(len - 1)
+        };
+    }
+
+    fn selected_control(&self) -> Option<&rseq_host::TuningControl> {
+        self.tuning_catalog
+            .controls()
+            .get(self.selected_control_index)
+    }
+
+    fn selected_control_bytes(&self) -> Option<Vec<u8>> {
+        let control = self.selected_control()?;
+        let width = control.width.max(1) as usize;
+        let mut bytes = Vec::with_capacity(width);
+        for offset in 0..width {
+            bytes.push(
+                *self
+                    .registers
+                    .get(&(control.addr + offset as u32))?
+                    .data
+                    .first()?,
+            );
+        }
+        Some(bytes)
+    }
+
+    fn selected_control_value(&self) -> Option<u32> {
+        let control = self.selected_control()?;
+        let bytes = self.selected_control_bytes()?;
+        rseq_host::tuning_control_value_from_bytes(control, &bytes)
+    }
+
+    fn request_selected_control_read(&mut self) {
+        let Some(control) = self.selected_control().cloned() else {
+            push_bounded(
+                &mut self.logs,
+                "no tuning controls loaded".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+        let Some(tx) = &self.source_commands else {
+            push_bounded(
+                &mut self.logs,
+                "control read unavailable: no active source command channel".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+        let len = match u16::try_from(control.width.max(1)) {
+            Ok(len) => len,
+            Err(_) => {
+                push_bounded(
+                    &mut self.logs,
+                    format!("{} width {} exceeds u16::MAX", control.name, control.width),
+                    MAX_TEXT_LINES,
+                );
+                return;
+            }
+        };
+        match tx.send(SourceCommand::ReadRegister {
+            addr: control.addr,
+            len,
+            label: control.register_name.clone(),
+        }) {
+            Ok(()) => push_bounded(
+                &mut self.logs,
+                format!(
+                    "control read {} @ 0x{:02x} len={}",
+                    control.name, control.addr, len
+                ),
+                MAX_TEXT_LINES,
+            ),
+            Err(_) => push_bounded(
+                &mut self.logs,
+                "control read failed: source thread is not running".to_string(),
+                MAX_TEXT_LINES,
+            ),
+        }
+    }
+
+    fn open_tuning_dialog(&mut self) {
+        let Some(control) = self.selected_control().cloned() else {
+            push_bounded(
+                &mut self.logs,
+                "no tuning controls loaded".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+        let input = self
+            .selected_control_value()
+            .map(|value| rseq_host::tuning_control_value_label(&control, value))
+            .unwrap_or_default();
+        self.tuning_dialog = Some(TuningDialog {
+            control,
+            input,
+            error: None,
+        });
+    }
+
+    fn submit_tuning_dialog(&mut self) {
+        let Some(dialog) = &mut self.tuning_dialog else {
+            return;
+        };
+        let value = match rseq_host::parse_tuning_control_value(&dialog.control, &dialog.input) {
+            Ok(value) => value,
+            Err(err) => {
+                dialog.error = Some(err);
+                return;
+            }
+        };
+        let assignment = rseq_host::TuningAssignment {
+            control: dialog.control.clone(),
+            value,
+        };
+        if self.send_control_assignment(assignment) {
+            self.tuning_dialog = None;
+        }
+    }
+
+    fn cycle_selected_control(&mut self, delta: i32) {
+        let Some(control) = self.selected_control().cloned() else {
+            push_bounded(
+                &mut self.logs,
+                "no tuning controls loaded".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return;
+        };
+        if control.options.is_empty() {
+            self.open_tuning_dialog();
+            return;
+        }
+        let current_value = self.selected_control_value();
+        let current_index = current_value.and_then(|value| {
+            control
+                .options
+                .iter()
+                .position(|option| option.value == value)
+        });
+        let len = control.options.len();
+        let next_index = match (current_index, delta.is_negative()) {
+            (Some(index), true) => (index + len - 1) % len,
+            (Some(index), false) => (index + 1) % len,
+            (None, true) => len - 1,
+            (None, false) => 0,
+        };
+        let value = control.options[next_index].value;
+        self.send_control_assignment(rseq_host::TuningAssignment { control, value });
+    }
+
+    fn send_control_assignment(&mut self, assignment: rseq_host::TuningAssignment) -> bool {
+        if let Some(name) = &self.control_busy {
+            push_bounded(
+                &mut self.logs,
+                format!("control transaction for {name} is still running"),
+                MAX_TEXT_LINES,
+            );
+            return false;
+        }
+        let Some(tx) = &self.source_commands else {
+            push_bounded(
+                &mut self.logs,
+                "control write unavailable: no active source command channel".to_string(),
+                MAX_TEXT_LINES,
+            );
+            return false;
+        };
+        let label = rseq_host::tuning_control_value_label(&assignment.control, assignment.value);
+        match tx.send(SourceCommand::SetControl(assignment.clone())) {
+            Ok(()) => {
+                self.control_busy = Some(assignment.control.name.clone());
+                push_bounded(
+                    &mut self.logs,
+                    format!("set request {}={label}", assignment.control.name),
+                    MAX_TEXT_LINES,
+                );
+                true
+            }
+            Err(_) => {
+                push_bounded(
+                    &mut self.logs,
+                    "control write failed: source thread is not running".to_string(),
+                    MAX_TEXT_LINES,
+                );
+                false
+            }
+        }
     }
 
     fn request_selected_register_dump(&mut self) {
@@ -733,6 +1075,26 @@ impl App {
                 self.report_counter += 1;
                 push_bounded(&mut self.reports, line, MAX_TEXT_LINES);
             }
+            AppEvent::ControlApplied {
+                name,
+                label,
+                report_scale,
+            } => {
+                self.samples.clear();
+                let scale = report_scale
+                    .map(|update| format!(", {}={}", update.kind.as_str(), update.value))
+                    .unwrap_or_default();
+                push_bounded(
+                    &mut self.logs,
+                    format!("applied {name}={label}{scale}; motion history cleared"),
+                    MAX_TEXT_LINES,
+                );
+            }
+            AppEvent::ControlFinished { name } => {
+                if self.control_busy.as_deref() == Some(name.as_str()) {
+                    self.control_busy = None;
+                }
+            }
             AppEvent::Log(line) => {
                 push_bounded(&mut self.logs, line, MAX_TEXT_LINES);
             }
@@ -846,6 +1208,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Tab::Motion => render_motion(frame, root[1], app),
         Tab::Reports => render_reports(frame, root[1], app),
         Tab::Registers => render_registers(frame, root[1], app),
+        Tab::Controls => render_controls(frame, root[1], app),
         Tab::Logs => render_logs(frame, root[1], app),
     }
     render_help(frame, root[2], app);
@@ -1201,6 +1564,131 @@ fn render_register_write_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &Regi
     frame.render_widget(paragraph, area);
 }
 
+fn render_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.tuning_catalog.is_empty() {
+        let paragraph = Paragraph::new("no runtime controls loaded; pass --chip or chip!(...)")
+            .block(Block::default().borders(Borders::ALL).title("controls"));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let rows = app
+        .tuning_catalog
+        .controls()
+        .iter()
+        .enumerate()
+        .map(|(idx, control)| {
+            let selected = idx == app.selected_control_index;
+            let value = control_value_text(app, control);
+            let options = rseq_host::tuning_control_value_hint(control);
+            Row::new([
+                Cell::from(if control.group.is_empty() {
+                    "General".to_string()
+                } else {
+                    control.group.clone()
+                }),
+                Cell::from(control.name.clone()),
+                Cell::from(value),
+                Cell::from(control.target.clone()),
+                Cell::from(options),
+            ])
+            .style(if selected {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Length(14),
+            Constraint::Length(24),
+            Constraint::Min(24),
+        ],
+    )
+    .column_spacing(1)
+    .header(
+        Row::new(["Group", "Name", "Value", "Target", "Options"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("controls: r read | [/] cycle | Enter/e edit"),
+    );
+    frame.render_widget(table, area);
+
+    if let Some(dialog) = &app.tuning_dialog {
+        render_tuning_dialog(frame, centered_rect(area, 68, 30), dialog);
+    }
+}
+
+fn control_value_text(app: &App, control: &rseq_host::TuningControl) -> String {
+    let width = control.width.max(1) as usize;
+    let mut bytes = Vec::with_capacity(width);
+    for offset in 0..width {
+        let Some(byte) = app
+            .registers
+            .get(&(control.addr + offset as u32))
+            .and_then(|value| value.data.first())
+        else {
+            return "--".to_string();
+        };
+        bytes.push(*byte);
+    }
+    rseq_host::tuning_control_value_from_bytes(control, &bytes)
+        .map(|value| {
+            format!(
+                "{} ({value})",
+                rseq_host::tuning_control_value_label(control, value)
+            )
+        })
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn render_tuning_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &TuningDialog) {
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("control ", Style::default().fg(Color::DarkGray)),
+            Span::raw(dialog.control.name.clone()),
+            Span::styled(" target ", Style::default().fg(Color::DarkGray)),
+            Span::raw(dialog.control.target.clone()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Yellow)),
+            Span::raw(dialog.input.clone()),
+        ]),
+        Line::from(""),
+        Line::from(format!(
+            "values: {}",
+            rseq_host::tuning_control_value_hint(&dialog.control)
+        )),
+    ];
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("set control: Enter send | Esc/q cancel"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1235,6 +1723,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn help_spans(app: &App) -> Vec<Span<'static>> {
+    if app.tuning_dialog.is_some() {
+        return key_hint_spans(&[
+            ("Enter", "set"),
+            ("Esc/q", "cancel"),
+            ("Backspace", "edit"),
+            ("Del", "clear"),
+        ]);
+    }
+
     if app.register_write_dialog.is_some() {
         return key_hint_spans(&[
             ("Enter", "write"),
@@ -1265,9 +1762,20 @@ fn help_spans(app: &App) -> Vec<Span<'static>> {
         ]);
     }
 
+    if app.selected_tab() == Tab::Controls {
+        return key_hint_spans(&[
+            ("up/down", "select"),
+            ("r", "read"),
+            ("[/]", "cycle"),
+            ("Enter/e", "edit"),
+            ("Tab", "switch"),
+            ("q", "quit"),
+        ]);
+    }
+
     key_hint_spans(&[
         ("Tab/Shift+Tab", "switch"),
-        ("1-4", "jump"),
+        ("1-5", "jump"),
         ("q/Esc", "quit"),
     ])
 }
@@ -1307,6 +1815,8 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(app.report_counter.to_string()),
         Span::styled(" regs ", Style::default().fg(Color::DarkGray)),
         Span::raw(app.registers.len().to_string()),
+        Span::styled(" controls ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.tuning_catalog.len().to_string()),
         Span::styled(" errors ", Style::default().fg(Color::DarkGray)),
         Span::raw(app.error_counter.to_string()),
         Span::styled(" up ", Style::default().fg(Color::DarkGray)),
@@ -1342,17 +1852,27 @@ fn format_age(duration: Duration) -> String {
     }
 }
 
-fn spawn_demo_source(tx: Sender<AppEvent>, cmd_rx: Receiver<SourceCommand>, stop: Arc<AtomicBool>) {
+fn spawn_demo_source(
+    tx: Sender<AppEvent>,
+    cmd_rx: Receiver<SourceCommand>,
+    stop: Arc<AtomicBool>,
+    startup_controls: Vec<rseq_host::TuningAssignment>,
+) {
     thread::spawn(move || {
         let start = Instant::now();
         let mut frame = 0u64;
+        let mut regs = [0u8; 256];
+        regs[0] = 0x06;
         let _ = tx.send(AppEvent::Log("demo source started".to_string()));
+        for assignment in startup_controls {
+            apply_demo_control(assignment, &mut regs, &tx);
+        }
         while !stop.load(Ordering::Relaxed) {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     SourceCommand::ReadRegister { addr, len, label } => {
                         let data = (0..len)
-                            .map(|offset| ((addr + u32::from(offset) + frame as u32) & 0xff) as u8)
+                            .map(|offset| regs[((addr + u32::from(offset)) & 0xff) as usize])
                             .collect::<Vec<_>>();
                         let _ = tx.send(AppEvent::Register {
                             addr,
@@ -1365,6 +1885,9 @@ fn spawn_demo_source(tx: Sender<AppEvent>, cmd_rx: Receiver<SourceCommand>, stop
                         )));
                     }
                     SourceCommand::WriteRegister { addr, data, label } => {
+                        for (offset, byte) in data.iter().enumerate() {
+                            regs[(addr as usize + offset) & 0xff] = *byte;
+                        }
                         let _ = tx.send(AppEvent::Register {
                             addr,
                             access: AccessKind::Write,
@@ -1374,6 +1897,9 @@ fn spawn_demo_source(tx: Sender<AppEvent>, cmd_rx: Receiver<SourceCommand>, stop
                             "demo write {label} @ 0x{addr:02x}: [{}]",
                             hex_bytes(&data)
                         )));
+                    }
+                    SourceCommand::SetControl(assignment) => {
+                        apply_demo_control(assignment, &mut regs, &tx);
                     }
                 }
             }
@@ -1434,12 +1960,66 @@ fn spawn_demo_source(tx: Sender<AppEvent>, cmd_rx: Receiver<SourceCommand>, stop
     });
 }
 
+fn apply_demo_control(
+    assignment: rseq_host::TuningAssignment,
+    regs: &mut [u8; 256],
+    tx: &Sender<AppEvent>,
+) {
+    let name = assignment.control.name.clone();
+    let label = rseq_host::tuning_control_value_label(&assignment.control, assignment.value);
+    let report_scale = match rseq_host::tuning_assignment_report_scale(&assignment) {
+        Ok(update) => update,
+        Err(err) => {
+            let _ = tx.send(AppEvent::Error(format!("demo set {name} failed: {err}")));
+            let _ = tx.send(AppEvent::ControlFinished { name });
+            return;
+        }
+    };
+    let control = assignment.control;
+    let width = control.width.max(1) as usize;
+    let current = (0..width)
+        .map(|offset| regs[(control.addr as usize + offset) & 0xff])
+        .collect::<Vec<_>>();
+    match rseq_host::apply_tuning_control_value(&control, &current, assignment.value) {
+        Ok(data) => {
+            for (offset, byte) in data.iter().enumerate() {
+                regs[(control.addr as usize + offset) & 0xff] = *byte;
+            }
+            let _ = tx.send(AppEvent::Register {
+                addr: control.addr,
+                access: AccessKind::Write,
+                data: data.clone(),
+            });
+            let _ = tx.send(AppEvent::Log(format!(
+                "demo set {}={} @ 0x{:02x}: [{}]",
+                control.name,
+                rseq_host::tuning_control_value_label(&control, assignment.value),
+                control.addr,
+                hex_bytes(&data)
+            )));
+            let _ = tx.send(AppEvent::ControlApplied {
+                name: control.name.clone(),
+                label,
+                report_scale,
+            });
+        }
+        Err(err) => {
+            let _ = tx.send(AppEvent::Error(format!(
+                "demo set {} failed: {err}",
+                control.name
+            )));
+        }
+    }
+    let _ = tx.send(AppEvent::ControlFinished { name });
+}
+
 #[cfg(feature = "serial")]
 fn spawn_serial_source(
     serial: String,
     baud: u32,
     startup_program: Option<CompiledProgram>,
-    report_decoders: ReportDecoderRegistry,
+    startup_controls: Vec<rseq_host::TuningAssignment>,
+    mut report_decoders: ReportDecoderRegistry,
     tx: Sender<AppEvent>,
     cmd_rx: Receiver<SourceCommand>,
     stop: Arc<AtomicBool>,
@@ -1467,7 +2047,7 @@ fn spawn_serial_source(
         };
         let mut host = rseq::link::HostLink::new(transport);
         if let Some(program) = startup_program {
-            if !load_and_exec_program(&mut host, &program, &report_decoders, &tx) {
+            if !load_and_exec_program(&mut host, &program, &mut report_decoders, &tx) {
                 return;
             }
         } else {
@@ -1475,14 +2055,15 @@ fn spawn_serial_source(
                 "watch mode: no LOAD/EXEC frames will be sent".to_string(),
             ));
         }
+        handle_tui_control_transactions(&startup_controls, &mut host, &mut report_decoders, &tx);
         let _ = tx.send(AppEvent::Log("serial observe loop started".to_string()));
         while !stop.load(Ordering::Relaxed) {
             while let Ok(cmd) = cmd_rx.try_recv() {
-                handle_source_command(cmd, &mut host, &report_decoders, &tx);
+                handle_source_command(cmd, &mut host, &mut report_decoders, &tx);
             }
 
             match host.observe_next_trace(Duration::from_millis(20)) {
-                Ok(Some(op)) => handle_bus_op(op, &report_decoders, &tx),
+                Ok(Some(op)) => handle_bus_op(op, &mut report_decoders, &tx),
                 Ok(None) => {}
                 Err(err) => {
                     let _ = tx.send(AppEvent::Error(format!("observe failed: {err}")));
@@ -1496,7 +2077,8 @@ fn spawn_serial_source(
 fn spawn_tcp_source(
     addr: String,
     startup_program: Option<CompiledProgram>,
-    report_decoders: ReportDecoderRegistry,
+    startup_controls: Vec<rseq_host::TuningAssignment>,
+    mut report_decoders: ReportDecoderRegistry,
     tx: Sender<AppEvent>,
     cmd_rx: Receiver<SourceCommand>,
     stop: Arc<AtomicBool>,
@@ -1522,7 +2104,7 @@ fn spawn_tcp_source(
         };
         let mut host = rseq::link::HostLink::new(transport);
         if let Some(program) = startup_program {
-            if !load_and_exec_program(&mut host, &program, &report_decoders, &tx) {
+            if !load_and_exec_program(&mut host, &program, &mut report_decoders, &tx) {
                 return;
             }
         } else {
@@ -1530,14 +2112,15 @@ fn spawn_tcp_source(
                 "watch mode: no LOAD/EXEC frames will be sent".to_string(),
             ));
         }
+        handle_tui_control_transactions(&startup_controls, &mut host, &mut report_decoders, &tx);
         let _ = tx.send(AppEvent::Log("tcp observe loop started".to_string()));
         while !stop.load(Ordering::Relaxed) {
             while let Ok(cmd) = cmd_rx.try_recv() {
-                handle_source_command(cmd, &mut host, &report_decoders, &tx);
+                handle_source_command(cmd, &mut host, &mut report_decoders, &tx);
             }
 
             match host.observe_next_trace(Duration::from_millis(20)) {
-                Ok(Some(op)) => handle_bus_op(op, &report_decoders, &tx),
+                Ok(Some(op)) => handle_bus_op(op, &mut report_decoders, &tx),
                 Ok(None) => {}
                 Err(err) => {
                     let _ = tx.send(AppEvent::Error(format!("observe failed: {err}")));
@@ -1553,6 +2136,7 @@ fn spawn_serial_source(
     serial: String,
     _baud: u32,
     _startup_program: Option<CompiledProgram>,
+    _startup_controls: Vec<rseq_host::TuningAssignment>,
     _report_decoders: ReportDecoderRegistry,
     tx: Sender<AppEvent>,
     _cmd_rx: Receiver<SourceCommand>,
@@ -1566,7 +2150,7 @@ fn spawn_serial_source(
 fn load_and_exec_program<T: rseq_link::Transport>(
     host: &mut rseq::link::HostLink<T>,
     program: &CompiledProgram,
-    report_decoders: &ReportDecoderRegistry,
+    report_decoders: &mut ReportDecoderRegistry,
     tx: &Sender<AppEvent>,
 ) -> bool {
     use rseq_link::wire::{SEG_KIND_IRQ_INT1, SEG_KIND_MAIN};
@@ -1616,7 +2200,7 @@ fn load_and_exec_program<T: rseq_link::Transport>(
 fn handle_source_command<T: rseq_link::Transport>(
     cmd: SourceCommand,
     host: &mut rseq::link::HostLink<T>,
-    report_decoders: &ReportDecoderRegistry,
+    report_decoders: &mut ReportDecoderRegistry,
     tx: &Sender<AppEvent>,
 ) {
     match cmd {
@@ -1673,10 +2257,209 @@ fn handle_source_command<T: rseq_link::Transport>(
                 }
             }
         }
+        SourceCommand::SetControl(assignment) => {
+            handle_tui_control_transaction(assignment, host, report_decoders, tx);
+        }
     }
 }
 
-fn handle_bus_op(op: BusOp, report_decoders: &ReportDecoderRegistry, tx: &Sender<AppEvent>) {
+fn handle_tui_control_transaction<T: rseq_link::Transport>(
+    assignment: rseq_host::TuningAssignment,
+    host: &mut rseq::link::HostLink<T>,
+    report_decoders: &mut ReportDecoderRegistry,
+    tx: &Sender<AppEvent>,
+) {
+    let control = &assignment.control;
+    let name = control.name.clone();
+    let label = rseq_host::tuning_control_value_label(control, assignment.value);
+    let _ = tx.send(AppEvent::Log(format!(
+        "pausing report stream to set {name}={label}"
+    )));
+    let reports_paused = tui_pause_reports_best_effort(host, tx);
+
+    let result = apply_tui_paused_control(&assignment, host, report_decoders, tx);
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(Duration::from_millis(50));
+        None
+    };
+    match result {
+        Ok(report_scale) => {
+            let _ = tx.send(AppEvent::ControlApplied {
+                name: name.clone(),
+                label: label.clone(),
+                report_scale,
+            });
+            if matches!(resume_result, Some(Ok(()))) {
+                let _ = tx.send(AppEvent::Log(format!(
+                    "set {name}={label}; report stream resumed"
+                )));
+            } else if !reports_paused {
+                let _ = tx.send(AppEvent::Log(format!(
+                    "set {name}={label}; MCU pause unavailable, host stream resync requested"
+                )));
+            }
+        }
+        Err(err) => {
+            let _ = tx.send(AppEvent::Error(format!("set {name} failed: {err}")));
+        }
+    }
+    if let Some(Err(err)) = resume_result {
+        let _ = tx.send(AppEvent::Error(format!(
+            "resume reports after setting {name} failed: {err}"
+        )));
+    }
+    let _ = tx.send(AppEvent::ControlFinished { name });
+}
+
+fn handle_tui_control_transactions<T: rseq_link::Transport>(
+    assignments: &[rseq_host::TuningAssignment],
+    host: &mut rseq::link::HostLink<T>,
+    report_decoders: &mut ReportDecoderRegistry,
+    tx: &Sender<AppEvent>,
+) {
+    if assignments.is_empty() {
+        return;
+    }
+    if assignments.len() == 1 {
+        handle_tui_control_transaction(assignments[0].clone(), host, report_decoders, tx);
+        return;
+    }
+
+    let summary = tui_tuning_assignments_summary(assignments);
+    let _ = tx.send(AppEvent::Log(format!(
+        "pausing report stream to apply runtime controls: {summary}"
+    )));
+    let reports_paused = tui_pause_reports_best_effort(host, tx);
+
+    let mut failed = false;
+    for assignment in assignments {
+        let control = &assignment.control;
+        let name = control.name.clone();
+        let label = rseq_host::tuning_control_value_label(control, assignment.value);
+        match apply_tui_paused_control(assignment, host, report_decoders, tx) {
+            Ok(report_scale) => {
+                let _ = tx.send(AppEvent::ControlApplied {
+                    name: name.clone(),
+                    label: label.clone(),
+                    report_scale,
+                });
+                let _ = tx.send(AppEvent::Log(format!("set {name}={label}")));
+            }
+            Err(err) => {
+                let _ = tx.send(AppEvent::Error(format!("set {name} failed: {err}")));
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(Duration::from_millis(50));
+        None
+    };
+    if let Some(Err(err)) = resume_result {
+        let _ = tx.send(AppEvent::Error(format!(
+            "resume reports after setting runtime controls failed: {err}"
+        )));
+    } else if !failed && reports_paused {
+        let _ = tx.send(AppEvent::Log(
+            "runtime controls applied; report stream resumed".to_string(),
+        ));
+    } else if !failed {
+        let _ = tx.send(AppEvent::Log(
+            "runtime controls applied; MCU pause unavailable, host stream resync requested"
+                .to_string(),
+        ));
+    }
+}
+
+fn tui_pause_reports_best_effort<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
+    tx: &Sender<AppEvent>,
+) -> bool {
+    match host.pause_reports_timeout(Duration::from_millis(250)) {
+        Ok(()) => true,
+        Err(err) => {
+            let _ = tx.send(AppEvent::Log(format!(
+                "MCU report pause unavailable ({err}); applying control while suppressing reports on the host"
+            )));
+            false
+        }
+    }
+}
+
+fn tui_tuning_assignments_summary(assignments: &[rseq_host::TuningAssignment]) -> String {
+    assignments
+        .iter()
+        .map(|assignment| {
+            format!(
+                "{}={}",
+                assignment.control.name,
+                rseq_host::tuning_control_value_label(&assignment.control, assignment.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn apply_tui_paused_control<T: rseq_link::Transport>(
+    assignment: &rseq_host::TuningAssignment,
+    host: &mut rseq::link::HostLink<T>,
+    report_decoders: &mut ReportDecoderRegistry,
+    tx: &Sender<AppEvent>,
+) -> Result<Option<rseq_host::ReportScaleUpdate>, String> {
+    let control = &assignment.control;
+    let len = u16::try_from(control.width.max(1))
+        .ok()
+        .filter(|len| *len > 0)
+        .ok_or_else(|| format!("invalid register width {}", control.width))?;
+    if len as usize > rseq_link::wire::CONTROL_MAX_READ_LEN {
+        return Err(format!(
+            "width {} exceeds control read limit {}",
+            len,
+            rseq_link::wire::CONTROL_MAX_READ_LEN
+        ));
+    }
+    let read = host.control_read(control.addr, len).map_err(|err| {
+        format!(
+            "read {} @ 0x{:02x} failed: {err}",
+            control.register_name, control.addr
+        )
+    })?;
+    let _ = tx.send(AppEvent::Register {
+        addr: read.addr,
+        access: AccessKind::Read,
+        data: read.data.clone(),
+    });
+    let data = rseq_host::apply_tuning_control_value(control, &read.data, assignment.value)?;
+    if read.data.get(..data.len()) != Some(data.as_slice()) {
+        let write = host.control_write(control.addr, &data).map_err(|err| {
+            format!(
+                "write {} @ 0x{:02x} data=[{}] failed: {err}",
+                control.register_name,
+                control.addr,
+                hex_bytes(&data)
+            )
+        })?;
+        let _ = tx.send(AppEvent::Register {
+            addr: write.addr,
+            access: AccessKind::Write,
+            data,
+        });
+    }
+    let report_scale = rseq_host::tuning_assignment_report_scale(assignment)?;
+    if let Some(update) = report_scale {
+        report_decoders.apply_scale_update(update);
+    }
+    report_decoders.mark_stream_reconfigured();
+    Ok(report_scale)
+}
+
+fn handle_bus_op(op: BusOp, report_decoders: &mut ReportDecoderRegistry, tx: &Sender<AppEvent>) {
     match op {
         BusOp::Read { addr, data } => {
             let _ = tx.send(AppEvent::Register {
@@ -1717,7 +2500,7 @@ fn handle_report(
     meta: Option<ReportMeta>,
     kind: u32,
     args: &[ReportArg],
-    report_decoders: &ReportDecoderRegistry,
+    report_decoders: &mut ReportDecoderRegistry,
     tx: &Sender<AppEvent>,
 ) {
     let label = report_kind_label(kind);
@@ -1725,6 +2508,18 @@ fn handle_report(
     if kind == rseq::REPORT_KIND_FIFO_RAW {
         let fifo_len = first_report_u32(args);
         let bytes = first_report_bytes(args);
+        if report_decoders.take_fifo_discard() {
+            let _ = write!(
+                line,
+                " discarded=reconfiguration-boundary fifo_len={} data_len={}",
+                fifo_len
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                bytes.map(<[u8]>::len).unwrap_or(0)
+            );
+            let _ = tx.send(AppEvent::Report(line));
+            return;
+        }
         match (bytes, report_decoders.get(kind)) {
             (Some(bytes), Some(ReportDecoder::I16Le(decoder))) => {
                 let decoded = decode_i16_le_fifo_samples(bytes, decoder);
@@ -1837,6 +2632,10 @@ fn is_register_write_input_char(ch: char) -> bool {
         )
 }
 
+fn is_tuning_input_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | 'x' | 'X')
+}
+
 fn parse_register_write_bytes(input: &str) -> Result<Vec<u8>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -1903,6 +2702,7 @@ fn parse_register_write_token(token: &str) -> Result<Vec<u8>, String> {
 #[derive(Debug, Clone, Default)]
 struct ReportDecoderRegistry {
     by_kind: HashMap<u32, ReportDecoder>,
+    discard_next_fifo_report: bool,
 }
 
 impl ReportDecoderRegistry {
@@ -1912,6 +2712,38 @@ impl ReportDecoderRegistry {
 
     fn get(&self, kind: u32) -> Option<&ReportDecoder> {
         self.by_kind.get(&kind)
+    }
+
+    fn apply_scale_update(&mut self, update: rseq_host::ReportScaleUpdate) -> usize {
+        let mut updated = 0;
+        for decoder in self.by_kind.values_mut() {
+            match decoder {
+                ReportDecoder::I16Le(decoder) => match update.kind {
+                    rseq_host::ReportScaleKind::AccelFullScaleG
+                        if !decoder.accel_fields.is_empty() =>
+                    {
+                        decoder.accel_fs_g = update.value;
+                        updated += 1;
+                    }
+                    rseq_host::ReportScaleKind::GyroFullScaleDps
+                        if !decoder.gyro_fields.is_empty() =>
+                    {
+                        decoder.gyro_fs_dps = update.value;
+                        updated += 1;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        updated
+    }
+
+    fn mark_stream_reconfigured(&mut self) {
+        self.discard_next_fifo_report = true;
+    }
+
+    fn take_fifo_discard(&mut self) -> bool {
+        std::mem::take(&mut self.discard_next_fifo_report)
     }
 }
 
@@ -2229,6 +3061,7 @@ fn load_host_metadata(files: &[PathBuf], chips: &[PathBuf]) -> Result<HostMetada
         collect_register_dump_map_from_stmts(file, &program.stmts, &mut metadata.register_dump)
             .map_err(|err| format!("{}: {err}", file.display()))?;
     }
+    metadata.tuning_catalog = rseq_host::load_host_metadata(files, chips)?.tuning_catalog;
     Ok(metadata)
 }
 
@@ -2574,7 +3407,13 @@ mod tests {
     fn no_dump_reads_are_not_expanded_as_register_bytes() {
         let mut dump = RegisterDumpMap::default();
         dump.mark_dumpability(0x57, 1, false);
-        let mut app = App::new("test".to_string(), 16, dump, None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            dump,
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
 
         app.apply(AppEvent::Register {
             addr: 0x57,
@@ -2591,7 +3430,13 @@ mod tests {
     fn selected_register_dump_uses_yaml_width() {
         let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
         let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
-        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            metadata.register_dump,
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.selected_register_addr = 0x54;
 
         let target = app
@@ -2606,7 +3451,13 @@ mod tests {
     fn selected_register_dump_rejects_no_dump() {
         let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
         let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
-        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            metadata.register_dump,
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.selected_register_addr = 0x57;
 
         assert!(app.selected_register_read_target().is_err());
@@ -2629,7 +3480,13 @@ mod tests {
     fn selected_register_write_rejects_read_only_yaml_register() {
         let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
         let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
-        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            metadata.register_dump,
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.selected_register_addr = 0x00;
 
         assert!(app.selected_register_write_target().is_err());
@@ -2639,7 +3496,13 @@ mod tests {
     fn selected_register_write_uses_yaml_width_for_rw_register() {
         let chip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qmi8660.yaml");
         let metadata = load_host_metadata(&[], &[chip]).expect("load explicit chip metadata");
-        let mut app = App::new("test".to_string(), 16, metadata.register_dump, None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            metadata.register_dump,
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.selected_register_addr = 0x0b;
 
         let target = app
@@ -2651,7 +3514,13 @@ mod tests {
 
     #[test]
     fn q_closes_register_write_dialog_without_quitting() {
-        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            RegisterDumpMap::default(),
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.register_write_dialog = Some(RegisterWriteDialog {
             target: RegisterWriteTarget {
                 addr: 0x0b,
@@ -2670,7 +3539,13 @@ mod tests {
 
     #[test]
     fn q_closes_register_detail_without_quitting() {
-        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            RegisterDumpMap::default(),
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.tab = 2;
         app.register_detail_open = true;
 
@@ -2682,7 +3557,13 @@ mod tests {
 
     #[test]
     fn q_quits_when_no_register_overlay_is_open() {
-        let mut app = App::new("test".to_string(), 16, RegisterDumpMap::default(), None);
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            RegisterDumpMap::default(),
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
         app.tab = 2;
 
         app.handle_key(KeyCode::Char('q'));

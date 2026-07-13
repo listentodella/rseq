@@ -7,3 +7,5 @@ node_modules/
 .zephyr-cache/
 .cargo/config
 .cargo/config.toml
+# Zephyr build outputs
+mcu/rseq-zephyr/build-*/

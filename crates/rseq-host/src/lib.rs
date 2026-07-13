@@ -22,6 +22,9 @@ pub const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 pub const DEFAULT_BAUD: u32 = 230_400;
 pub const MAX_TEXT_LINES: usize = 512;
 pub const CAPTURE_MAGIC: &[u8] = b"RSEQCAP1\n";
+const CONTROL_PAUSE_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_FALLBACK_RESUME_TIMEOUT: Duration = Duration::from_millis(50);
+const RELOAD_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialPortInfo {
@@ -34,6 +37,7 @@ pub struct SerialPortInfo {
 pub struct HostMetadata {
     pub report_decoders: ReportDecoderRegistry,
     pub register_catalog: RegisterCatalog,
+    pub tuning_catalog: TuningControlCatalog,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +57,72 @@ pub struct RegisterInfo {
     pub no_dump: bool,
     pub no_dump_reason: String,
     pub fields: Vec<FieldInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TuningControlCatalog {
+    controls: Vec<TuningControl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuningControl {
+    pub name: String,
+    pub group: String,
+    pub desc: String,
+    pub target: String,
+    pub register_name: String,
+    pub addr: u32,
+    pub width: u32,
+    pub bit_hi: u8,
+    pub bit_lo: u8,
+    pub report_scale: Option<String>,
+    pub options: Vec<TuningControlOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuningControlOption {
+    pub value: u32,
+    pub name: String,
+    pub label: String,
+    pub desc: String,
+    pub scale: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuningAssignment {
+    pub control: TuningControl,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportScaleKind {
+    AccelFullScaleG,
+    GyroFullScaleDps,
+}
+
+impl ReportScaleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AccelFullScaleG => "accel_fs_g",
+            Self::GyroFullScaleDps => "gyro_fs_dps",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "accel_fs_g" => Ok(Self::AccelFullScaleG),
+            "gyro_fs_dps" => Ok(Self::GyroFullScaleDps),
+            _ => Err(format!(
+                "unknown report_scale '{value}', expected accel_fs_g or gyro_fs_dps"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportScaleUpdate {
+    pub kind: ReportScaleKind,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +377,389 @@ impl RegisterCatalog {
     }
 }
 
+impl TuningControlCatalog {
+    pub fn mark_control(
+        &mut self,
+        control: &rseq::Control,
+        registry: &rseq::ChipRegistry,
+    ) -> Result<(), String> {
+        if self
+            .controls
+            .iter()
+            .any(|existing| existing.name == control.name)
+        {
+            return Ok(());
+        }
+
+        let field_name = control
+            .target
+            .rsplit('.')
+            .next()
+            .ok_or_else(|| format!("control '{}' has empty target", control.name))?
+            .to_string();
+        let plan = registry
+            .plan_update(&control.target, &[(field_name, 0)])
+            .map_err(|err| format!("control '{}': {err}", control.name))?;
+        let field = plan
+            .fields
+            .first()
+            .ok_or_else(|| format!("control '{}' target has no field", control.name))?;
+
+        let tuning = TuningControl {
+            name: control.name.clone(),
+            group: control.group.clone(),
+            desc: control.desc.clone(),
+            target: control.target.clone(),
+            register_name: plan.register_name,
+            addr: plan.addr,
+            width: plan.width,
+            bit_hi: field.bit_hi,
+            bit_lo: field.bit_lo,
+            report_scale: control.report_scale.clone(),
+            options: control
+                .options
+                .iter()
+                .map(|option| TuningControlOption {
+                    value: option.value,
+                    name: option.name.clone(),
+                    label: option.label.clone(),
+                    desc: option.desc.clone(),
+                    scale: option.scale,
+                })
+                .collect(),
+        };
+        validate_tuning_report_scale(&tuning)?;
+        for option in &tuning.options {
+            validate_tuning_control_value(&tuning, option.value).map_err(|err| {
+                format!(
+                    "control '{}' option '{}': {err}",
+                    tuning.name,
+                    tuning_option_display(option)
+                )
+            })?;
+        }
+        self.controls.push(tuning);
+        self.controls.sort_by(|a, b| {
+            a.group
+                .cmp(&b.group)
+                .then(a.name.cmp(&b.name))
+                .then(a.target.cmp(&b.target))
+        });
+        Ok(())
+    }
+
+    pub fn controls(&self) -> &[TuningControl] {
+        &self.controls
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.controls.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.controls.len()
+    }
+
+    pub fn groups(&self) -> Vec<String> {
+        let mut groups = Vec::new();
+        for control in &self.controls {
+            if !groups.iter().any(|group| group == &control.group) {
+                groups.push(control.group.clone());
+            }
+        }
+        groups
+    }
+
+    pub fn get(&self, name: &str) -> Option<&TuningControl> {
+        self.controls
+            .iter()
+            .find(|control| control.name == name || control.target == name)
+    }
+
+    pub fn resolve_assignment(&self, spec: &str) -> Result<TuningAssignment, String> {
+        let (name, value) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("control assignment '{spec}' must be NAME=VALUE"))?;
+        let control = self
+            .get(name.trim())
+            .ok_or_else(|| format!("unknown tuning control '{}'", name.trim()))?;
+        let value = parse_tuning_control_value(control, value.trim())?;
+        Ok(TuningAssignment {
+            control: control.clone(),
+            value,
+        })
+    }
+}
+
+fn validate_tuning_report_scale(control: &TuningControl) -> Result<(), String> {
+    let Some(property) = control.report_scale.as_deref() else {
+        if control.options.iter().any(|option| option.scale.is_some()) {
+            return Err(format!(
+                "control '{}' has option scale values but no report_scale property",
+                control.name
+            ));
+        }
+        return Ok(());
+    };
+
+    ReportScaleKind::parse(property).map_err(|err| format!("control '{}': {err}", control.name))?;
+    if control.options.is_empty() {
+        return Err(format!(
+            "control '{}' report_scale requires enumerated options",
+            control.name
+        ));
+    }
+    for option in &control.options {
+        let scale = option.scale.ok_or_else(|| {
+            format!(
+                "control '{}' option '{}' requires scale because report_scale is set",
+                control.name,
+                tuning_option_display(option)
+            )
+        })?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!(
+                "control '{}' option '{}' scale must be finite and greater than zero",
+                control.name,
+                tuning_option_display(option)
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn tuning_assignment_report_scale(
+    assignment: &TuningAssignment,
+) -> Result<Option<ReportScaleUpdate>, String> {
+    let Some(property) = assignment.control.report_scale.as_deref() else {
+        return Ok(None);
+    };
+    let kind = ReportScaleKind::parse(property)?;
+    let option = assignment
+        .control
+        .options
+        .iter()
+        .find(|option| option.value == assignment.value)
+        .ok_or_else(|| {
+            format!(
+                "{} value {} has no declared report scale",
+                assignment.control.name, assignment.value
+            )
+        })?;
+    let value = option.scale.ok_or_else(|| {
+        format!(
+            "{} value {} has no declared report scale",
+            assignment.control.name, assignment.value
+        )
+    })?;
+    Ok(Some(ReportScaleUpdate { kind, value }))
+}
+
+pub fn parse_tuning_control_value(control: &TuningControl, raw: &str) -> Result<u32, String> {
+    if raw.trim().is_empty() {
+        return Err(format!("{} requires a value", control.name));
+    }
+    if let Ok(value) = parse_u32_text(raw) {
+        return validate_tuning_control_value(control, value);
+    }
+
+    let wanted = normalize_control_token(raw);
+    for option in &control.options {
+        let candidates = [
+            option.name.as_str(),
+            option.label.as_str(),
+            option.desc.as_str(),
+        ];
+        if candidates
+            .iter()
+            .any(|candidate| !candidate.is_empty() && normalize_control_token(candidate) == wanted)
+        {
+            return validate_tuning_control_value(control, option.value);
+        }
+    }
+
+    Err(format!(
+        "unknown value '{raw}' for {}; expected {}",
+        control.name,
+        tuning_control_value_hint(control)
+    ))
+}
+
+pub fn validate_tuning_control_value(control: &TuningControl, value: u32) -> Result<u32, String> {
+    let width = control.bit_hi - control.bit_lo + 1;
+    let max = if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
+    if value > max {
+        return Err(format!(
+            "{} value {value} exceeds {}-bit field max {max}",
+            control.name, width
+        ));
+    }
+    if !control.options.is_empty() && !control.options.iter().any(|option| option.value == value) {
+        return Err(format!(
+            "unsupported value {value} for {}; expected {}",
+            control.name,
+            tuning_control_value_hint(control)
+        ));
+    }
+    Ok(value)
+}
+
+pub fn tuning_control_value_hint(control: &TuningControl) -> String {
+    if control.options.is_empty() {
+        let width = control.bit_hi - control.bit_lo + 1;
+        let max = if width >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << width) - 1
+        };
+        return format!("0..{max}");
+    }
+
+    control
+        .options
+        .iter()
+        .map(|option| tuning_option_display(option))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn tuning_option_display(option: &TuningControlOption) -> String {
+    if !option.label.is_empty() {
+        format!("{}={}", option.label, option.value)
+    } else if !option.name.is_empty() {
+        format!("{}={}", option.name, option.value)
+    } else {
+        option.value.to_string()
+    }
+}
+
+pub fn tuning_control_value_label(control: &TuningControl, value: u32) -> String {
+    control
+        .options
+        .iter()
+        .find(|option| option.value == value)
+        .map(|option| {
+            if !option.label.is_empty() {
+                option.label.clone()
+            } else if !option.name.is_empty() {
+                option.name.clone()
+            } else {
+                option.value.to_string()
+            }
+        })
+        .unwrap_or_else(|| value.to_string())
+}
+
+pub fn tuning_control_value_from_bytes(control: &TuningControl, bytes: &[u8]) -> Option<u32> {
+    let need = control.bit_hi as usize / 8 + 1;
+    if bytes.len() < need {
+        return None;
+    }
+    let raw = bytes_to_u128(bytes)?;
+    let width = control.bit_hi - control.bit_lo + 1;
+    let mask = if width >= 32 {
+        u128::from(u32::MAX)
+    } else {
+        (1u128 << width) - 1
+    };
+    Some(((raw >> control.bit_lo) & mask) as u32)
+}
+
+pub fn apply_tuning_control_value(
+    control: &TuningControl,
+    current: &[u8],
+    value: u32,
+) -> Result<Vec<u8>, String> {
+    let value = validate_tuning_control_value(control, value)?;
+    let width = usize::try_from(control.width.max(1))
+        .map_err(|_| format!("{} width is too large", control.name))?;
+    if width > rseq_link::wire::CONTROL_MAX_WRITE_LEN {
+        return Err(format!(
+            "{} width {} exceeds control write limit {}",
+            control.name,
+            width,
+            rseq_link::wire::CONTROL_MAX_WRITE_LEN
+        ));
+    }
+    if current.len() < width {
+        return Err(format!(
+            "{} read returned {} byte(s), expected {}",
+            control.name,
+            current.len(),
+            width
+        ));
+    }
+
+    let mut raw = bytes_to_u128(&current[..width])
+        .ok_or_else(|| format!("{} width {} is not supported", control.name, width))?;
+    let field_width = control.bit_hi - control.bit_lo + 1;
+    let field_mask = if field_width >= 32 {
+        u128::from(u32::MAX)
+    } else {
+        (1u128 << field_width) - 1
+    };
+    let shifted_mask = field_mask << control.bit_lo;
+    raw = (raw & !shifted_mask) | ((u128::from(value) & field_mask) << control.bit_lo);
+
+    let mut out = vec![0u8; width];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        *byte = ((raw >> (idx * 8)) & 0xff) as u8;
+    }
+    Ok(out)
+}
+
+pub fn resolve_tuning_assignments(
+    catalog: &TuningControlCatalog,
+    specs: &[String],
+) -> Result<Vec<TuningAssignment>, String> {
+    specs
+        .iter()
+        .map(|spec| catalog.resolve_assignment(spec))
+        .collect()
+}
+
+fn bytes_to_u128(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() > 16 {
+        return None;
+    }
+    let mut raw = 0u128;
+    for (idx, byte) in bytes.iter().enumerate() {
+        raw |= u128::from(*byte) << (idx * 8);
+    }
+    Some(raw)
+}
+
+fn normalize_control_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && !matches!(ch, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn parse_u32_text(text: &str) -> Result<u32, String> {
+    let trimmed = text.trim().replace('_', "");
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex '{text}': {e}"))
+    } else if let Some(bin) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
+        u32::from_str_radix(bin, 2).map_err(|e| format!("invalid binary '{text}': {e}"))
+    } else {
+        trimmed
+            .parse::<u32>()
+            .map_err(|e| format!("invalid integer '{text}': {e}"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedField {
     pub register: String,
@@ -442,7 +895,7 @@ pub fn load_host_metadata_from_sources(
 ) -> Result<HostMetadata, String> {
     let mut metadata = HostMetadata::default();
     for chip in chips {
-        collect_register_catalog_from_chip(chip, None, &mut metadata.register_catalog)
+        collect_metadata_from_chip(chip, None, &mut metadata)
             .map_err(|err| format!("{}: {err}", chip.display()))?;
     }
 
@@ -462,7 +915,7 @@ pub fn load_host_metadata_from_sources(
         collect_register_catalog_from_stmts(
             source.base_dir.as_deref(),
             &program.stmts,
-            &mut metadata.register_catalog,
+            &mut metadata,
         )
         .map_err(|err| format!("{}: {err}", source.name))?;
     }
@@ -564,22 +1017,22 @@ fn resolve_program_chip_paths(base_dir: Option<&Path>, stmts: &mut [rseq::Stmt])
 fn collect_register_catalog_from_stmts(
     base_dir: Option<&Path>,
     stmts: &[rseq::Stmt],
-    register_catalog: &mut RegisterCatalog,
+    metadata: &mut HostMetadata,
 ) -> Result<(), String> {
     let mut chip_paths = Vec::new();
     collect_chip_paths(stmts, &mut chip_paths);
 
     for chip_path in chip_paths {
-        collect_register_catalog_from_chip(Path::new(&chip_path), base_dir, register_catalog)?;
+        collect_metadata_from_chip(Path::new(&chip_path), base_dir, metadata)?;
     }
 
     Ok(())
 }
 
-fn collect_register_catalog_from_chip(
+fn collect_metadata_from_chip(
     chip_path: &Path,
     base_dir: Option<&Path>,
-    register_catalog: &mut RegisterCatalog,
+    metadata: &mut HostMetadata,
 ) -> Result<(), String> {
     let resolved = resolve_host_chip_path(&chip_path.to_string_lossy(), base_dir);
     let registry = rseq::ChipRegistry::load(&resolved)
@@ -587,8 +1040,11 @@ fn collect_register_catalog_from_chip(
     for chip in registry.chips() {
         for page in &chip.pages {
             for reg in &page.registers {
-                register_catalog.mark_register(&page.name, reg);
+                metadata.register_catalog.mark_register(&page.name, reg);
             }
+        }
+        for control in &chip.controls {
+            metadata.tuning_catalog.mark_control(control, &registry)?;
         }
     }
     Ok(())
@@ -702,6 +1158,26 @@ impl ReportDecoderRegistry {
 
     pub fn len(&self) -> usize {
         self.by_kind.len()
+    }
+
+    pub fn apply_scale_update(&mut self, update: ReportScaleUpdate) -> usize {
+        let mut updated = 0;
+        for decoder in self.by_kind.values_mut() {
+            match decoder {
+                ReportDecoder::I16Le(decoder) => match update.kind {
+                    ReportScaleKind::AccelFullScaleG if !decoder.accel_fields.is_empty() => {
+                        decoder.accel_fs_g = update.value;
+                        updated += 1;
+                    }
+                    ReportScaleKind::GyroFullScaleDps if !decoder.gyro_fields.is_empty() => {
+                        decoder.gyro_fs_dps = update.value;
+                        updated += 1;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        updated
     }
 }
 
@@ -1134,6 +1610,7 @@ pub struct ReportSummary {
     pub data_len: Option<usize>,
     pub sample_count: usize,
     pub trailing_bytes: usize,
+    pub discarded: bool,
     pub health: ReportHealth,
 }
 
@@ -1141,6 +1618,7 @@ pub struct ReportSummary {
 pub struct ReportProcessor {
     decoders: ReportDecoderRegistry,
     health: ReportHealthTracker,
+    discard_next_fifo_report: bool,
 }
 
 impl ReportProcessor {
@@ -1148,6 +1626,7 @@ impl ReportProcessor {
         Self {
             decoders,
             health: ReportHealthTracker::default(),
+            discard_next_fifo_report: false,
         }
     }
 
@@ -1157,6 +1636,14 @@ impl ReportProcessor {
 
     pub fn health(&self) -> ReportHealth {
         self.health.health()
+    }
+
+    pub fn apply_scale_update(&mut self, update: ReportScaleUpdate) -> usize {
+        self.decoders.apply_scale_update(update)
+    }
+
+    pub fn mark_stream_reconfigured(&mut self) {
+        self.discard_next_fifo_report = true;
     }
 
     pub fn handle_bus_op(&mut self, op: BusOp) -> Vec<SessionEvent> {
@@ -1204,6 +1691,7 @@ impl ReportProcessor {
             data_len: None,
             sample_count: 0,
             trailing_bytes: 0,
+            discarded: false,
             health,
         };
 
@@ -1212,6 +1700,22 @@ impl ReportProcessor {
             let bytes = first_report_bytes(args);
             summary.fifo_len = fifo_len;
             summary.data_len = bytes.map(<[u8]>::len);
+            if self.discard_next_fifo_report {
+                self.discard_next_fifo_report = false;
+                summary.discarded = true;
+                let _ = write!(
+                    line,
+                    " discarded=reconfiguration-boundary fifo_len={} data_len={}",
+                    fifo_len
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    bytes.map(<[u8]>::len).unwrap_or(0)
+                );
+                summary.line = line;
+                events.push(SessionEvent::Report(summary));
+                events.push(SessionEvent::Health(health));
+                return events;
+            }
             match (bytes, self.decoders.get(kind)) {
                 (Some(bytes), Some(ReportDecoder::I16Le(decoder))) => {
                     let decoded = decode_i16_le_fifo_samples(bytes, decoder);
@@ -1577,6 +2081,9 @@ pub enum SessionCommand {
         data: Vec<u8>,
         label: String,
     },
+    SetControl(TuningAssignment),
+    SetControls(Vec<TuningAssignment>),
+    LoadAndExec(CompiledProgram),
     Shutdown,
 }
 
@@ -1589,6 +2096,18 @@ pub enum SessionEvent {
     Log(String),
     Error(String),
     ExecStatus(String),
+    LoadAndExecFinished {
+        success: bool,
+    },
+    ControlBusy {
+        name: String,
+        busy: bool,
+    },
+    ControlApplied {
+        name: String,
+        label: String,
+        report_scale: Option<ReportScaleUpdate>,
+    },
     Register {
         addr: u32,
         access: AccessKind,
@@ -1608,6 +2127,7 @@ pub struct SessionConfig {
     pub demo: bool,
     pub startup_program: Option<CompiledProgram>,
     pub report_decoders: ReportDecoderRegistry,
+    pub startup_controls: Vec<TuningAssignment>,
 }
 
 impl Default for SessionConfig {
@@ -1620,6 +2140,7 @@ impl Default for SessionConfig {
             demo: true,
             startup_program: None,
             report_decoders: ReportDecoderRegistry::default(),
+            startup_controls: Vec::new(),
         }
     }
 }
@@ -1650,7 +2171,7 @@ pub fn spawn_session(config: SessionConfig) -> SessionHandle {
 
     match (config.demo, config.serial.is_some(), config.tcp.is_some()) {
         (true, _, _) => {
-            spawn_demo_session(event_tx, cmd_rx, stop.clone());
+            spawn_demo_session(event_tx, cmd_rx, stop.clone(), config.startup_controls);
         }
         (false, false, false) => {
             spawn_error_session(
@@ -1749,6 +2270,7 @@ fn spawn_demo_session(
     tx: Sender<SessionEvent>,
     cmd_rx: Receiver<SessionCommand>,
     stop: Arc<AtomicBool>,
+    startup_controls: Vec<TuningAssignment>,
 ) {
     thread::spawn(move || {
         let _ = tx.send(SessionEvent::Connected {
@@ -1756,6 +2278,9 @@ fn spawn_demo_session(
         });
         let mut regs = [0u8; 256];
         regs[0] = 0x06;
+        for assignment in startup_controls {
+            apply_demo_session_control(assignment, &mut regs, &tx);
+        }
         let started = Instant::now();
         let mut index = 0u64;
         while !stop.load(Ordering::Relaxed) {
@@ -1799,6 +2324,20 @@ fn spawn_demo_session(
                             "demo write {label} @ 0x{addr:02x}: [{}]",
                             hex_bytes(&data)
                         )));
+                    }
+                    SessionCommand::SetControl(assignment) => {
+                        apply_demo_session_control(assignment, &mut regs, &tx);
+                    }
+                    SessionCommand::SetControls(assignments) => {
+                        apply_demo_session_controls(assignments, &mut regs, &tx);
+                    }
+                    SessionCommand::LoadAndExec(program) => {
+                        let _ = tx.send(SessionEvent::Log(format!(
+                            "demo load+exec requested for {} main byte(s) and {} irq handler(s)",
+                            program.main.len(),
+                            program.irq_bytecodes.len()
+                        )));
+                        let _ = tx.send(SessionEvent::LoadAndExecFinished { success: true });
                     }
                     SessionCommand::Shutdown => {
                         stop.store(true, Ordering::Relaxed);
@@ -1849,6 +2388,7 @@ fn spawn_demo_session(
                 data_len: Some(12),
                 sample_count: 1,
                 trailing_bytes: 0,
+                discarded: false,
                 health,
             };
             let _ = tx.send(SessionEvent::Sample(sample));
@@ -1858,6 +2398,131 @@ fn spawn_demo_session(
             thread::sleep(Duration::from_millis(33));
         }
         let _ = tx.send(SessionEvent::Disconnected);
+    });
+}
+
+fn apply_demo_session_control(
+    assignment: TuningAssignment,
+    regs: &mut [u8; 256],
+    tx: &Sender<SessionEvent>,
+) {
+    let name = assignment.control.name.clone();
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: name.clone(),
+        busy: true,
+    });
+    let report_scale = match tuning_assignment_report_scale(&assignment) {
+        Ok(update) => update,
+        Err(err) => {
+            let _ = tx.send(SessionEvent::Error(format!(
+                "demo set {name} failed: {err}"
+            )));
+            let _ = tx.send(SessionEvent::ControlBusy { name, busy: false });
+            return;
+        }
+    };
+    let control = assignment.control;
+    let width = control.width.max(1) as usize;
+    let current = (0..width)
+        .map(|offset| regs[(control.addr as usize + offset) & 0xff])
+        .collect::<Vec<_>>();
+    match apply_tuning_control_value(&control, &current, assignment.value) {
+        Ok(data) => {
+            for (offset, byte) in data.iter().enumerate() {
+                regs[(control.addr as usize + offset) & 0xff] = *byte;
+            }
+            let _ = tx.send(SessionEvent::Register {
+                addr: control.addr,
+                access: AccessKind::Write,
+                data: data.clone(),
+            });
+            let _ = tx.send(SessionEvent::Log(format!(
+                "demo set {}={} @ 0x{:02x}: [{}]",
+                control.name,
+                tuning_control_value_label(&control, assignment.value),
+                control.addr,
+                hex_bytes(&data)
+            )));
+            let _ = tx.send(SessionEvent::ControlApplied {
+                name: control.name.clone(),
+                label: tuning_control_value_label(&control, assignment.value),
+                report_scale,
+            });
+        }
+        Err(err) => {
+            let _ = tx.send(SessionEvent::Error(err));
+        }
+    }
+    let _ = tx.send(SessionEvent::ControlBusy { name, busy: false });
+}
+
+fn apply_demo_session_controls(
+    assignments: Vec<TuningAssignment>,
+    regs: &mut [u8; 256],
+    tx: &Sender<SessionEvent>,
+) {
+    if assignments.is_empty() {
+        return;
+    }
+    if assignments.len() == 1 {
+        apply_demo_session_control(assignments.into_iter().next().unwrap(), regs, tx);
+        return;
+    }
+
+    let busy_name = format!("{} controls", assignments.len());
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: busy_name.clone(),
+        busy: true,
+    });
+    for assignment in assignments {
+        let name = assignment.control.name.clone();
+        let report_scale = match tuning_assignment_report_scale(&assignment) {
+            Ok(update) => update,
+            Err(err) => {
+                let _ = tx.send(SessionEvent::Error(format!(
+                    "demo set {name} failed: {err}"
+                )));
+                break;
+            }
+        };
+        let control = assignment.control;
+        let width = control.width.max(1) as usize;
+        let current = (0..width)
+            .map(|offset| regs[(control.addr as usize + offset) & 0xff])
+            .collect::<Vec<_>>();
+        match apply_tuning_control_value(&control, &current, assignment.value) {
+            Ok(data) => {
+                for (offset, byte) in data.iter().enumerate() {
+                    regs[(control.addr as usize + offset) & 0xff] = *byte;
+                }
+                let _ = tx.send(SessionEvent::Register {
+                    addr: control.addr,
+                    access: AccessKind::Write,
+                    data: data.clone(),
+                });
+                let label = tuning_control_value_label(&control, assignment.value);
+                let _ = tx.send(SessionEvent::Log(format!(
+                    "demo set {}={} @ 0x{:02x}: [{}]",
+                    control.name,
+                    label,
+                    control.addr,
+                    hex_bytes(&data)
+                )));
+                let _ = tx.send(SessionEvent::ControlApplied {
+                    name: control.name.clone(),
+                    label,
+                    report_scale,
+                });
+            }
+            Err(err) => {
+                let _ = tx.send(SessionEvent::Error(err));
+                break;
+            }
+        }
+    }
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: busy_name,
+        busy: false,
     });
 }
 
@@ -1875,6 +2540,7 @@ fn spawn_serial_session(
         } else {
             config.startup_program
         };
+        let startup_controls = config.startup_controls;
         let mode = if startup_program.is_some() {
             "load+exec"
         } else {
@@ -1898,6 +2564,7 @@ fn spawn_serial_session(
             label,
             transport,
             startup_program,
+            startup_controls,
             config.report_decoders,
             tx,
             cmd_rx,
@@ -1919,6 +2586,7 @@ fn spawn_tcp_session(
         } else {
             config.startup_program
         };
+        let startup_controls = config.startup_controls;
         let mode = if startup_program.is_some() {
             "load+exec"
         } else {
@@ -1942,6 +2610,7 @@ fn spawn_tcp_session(
             label,
             transport,
             startup_program,
+            startup_controls,
             config.report_decoders,
             tx,
             cmd_rx,
@@ -1967,6 +2636,7 @@ fn run_link_session<T: rseq_link::Transport>(
     label: String,
     transport: T,
     startup_program: Option<CompiledProgram>,
+    startup_controls: Vec<TuningAssignment>,
     report_decoders: ReportDecoderRegistry,
     tx: Sender<SessionEvent>,
     cmd_rx: Receiver<SessionCommand>,
@@ -1977,6 +2647,7 @@ fn run_link_session<T: rseq_link::Transport>(
 
     if let Some(program) = startup_program {
         if !load_and_exec_program(&mut host, &program, &mut processor, &tx) {
+            let _ = tx.send(SessionEvent::Disconnected);
             return;
         }
     } else {
@@ -1986,6 +2657,7 @@ fn run_link_session<T: rseq_link::Transport>(
     }
 
     let _ = tx.send(SessionEvent::Connected { label });
+    handle_set_controls_transaction(&startup_controls, &mut host, &mut processor, &tx);
     while !stop.load(Ordering::Relaxed) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             if matches!(cmd, SessionCommand::Shutdown) {
@@ -2141,8 +2813,294 @@ fn handle_source_command<T: rseq_link::Transport>(
                 }
             }
         }
+        SessionCommand::SetControl(assignment) => {
+            handle_set_control_transaction(assignment, host, processor, tx);
+        }
+        SessionCommand::SetControls(assignments) => {
+            handle_set_controls_transaction(&assignments, host, processor, tx);
+        }
+        SessionCommand::LoadAndExec(program) => {
+            handle_load_and_exec_program(program, host, processor, tx);
+        }
         SessionCommand::Shutdown => {}
     }
+}
+
+fn handle_set_control_transaction<T: rseq_link::Transport>(
+    assignment: TuningAssignment,
+    host: &mut rseq::link::HostLink<T>,
+    processor: &mut ReportProcessor,
+    tx: &Sender<SessionEvent>,
+) {
+    let control = &assignment.control;
+    let name = control.name.clone();
+    let label = tuning_control_value_label(control, assignment.value);
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: name.clone(),
+        busy: true,
+    });
+    let _ = tx.send(SessionEvent::Log(format!(
+        "pausing report stream to set {name}={label}"
+    )));
+
+    let reports_paused = pause_reports_best_effort(host, tx);
+
+    let result = apply_paused_control(&assignment, host, processor, tx);
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(CONTROL_FALLBACK_RESUME_TIMEOUT);
+        None
+    };
+
+    match result {
+        Ok(report_scale) => {
+            let _ = tx.send(SessionEvent::ControlApplied {
+                name: name.clone(),
+                label: label.clone(),
+                report_scale,
+            });
+            if matches!(resume_result, Some(Ok(()))) {
+                let _ = tx.send(SessionEvent::Log(format!(
+                    "set {name}={label}; report stream resumed"
+                )));
+            } else if !reports_paused {
+                let _ = tx.send(SessionEvent::Log(format!(
+                    "set {name}={label}; MCU pause unavailable, host stream resync requested"
+                )));
+            }
+        }
+        Err(err) => {
+            let _ = tx.send(SessionEvent::Error(format!("set {name} failed: {err}")));
+        }
+    }
+    if let Some(Err(err)) = resume_result {
+        let _ = tx.send(SessionEvent::Error(format!(
+            "resume reports after setting {name} failed: {err}"
+        )));
+    }
+    let _ = tx.send(SessionEvent::ControlBusy { name, busy: false });
+}
+
+fn handle_set_controls_transaction<T: rseq_link::Transport>(
+    assignments: &[TuningAssignment],
+    host: &mut rseq::link::HostLink<T>,
+    processor: &mut ReportProcessor,
+    tx: &Sender<SessionEvent>,
+) {
+    if assignments.is_empty() {
+        return;
+    }
+    if assignments.len() == 1 {
+        handle_set_control_transaction(assignments[0].clone(), host, processor, tx);
+        return;
+    }
+
+    let busy_name = format!("{} controls", assignments.len());
+    let summary = tuning_assignments_summary(assignments);
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: busy_name.clone(),
+        busy: true,
+    });
+    let _ = tx.send(SessionEvent::Log(format!(
+        "pausing report stream to apply runtime controls: {summary}"
+    )));
+
+    let reports_paused = pause_reports_best_effort(host, tx);
+
+    let mut failed = false;
+    for assignment in assignments {
+        let control = &assignment.control;
+        let name = control.name.clone();
+        let label = tuning_control_value_label(control, assignment.value);
+        match apply_paused_control(assignment, host, processor, tx) {
+            Ok(report_scale) => {
+                let _ = tx.send(SessionEvent::ControlApplied {
+                    name: name.clone(),
+                    label: label.clone(),
+                    report_scale,
+                });
+                let _ = tx.send(SessionEvent::Log(format!("set {name}={label}")));
+            }
+            Err(err) => {
+                let _ = tx.send(SessionEvent::Error(format!("set {name} failed: {err}")));
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(CONTROL_FALLBACK_RESUME_TIMEOUT);
+        None
+    };
+    if let Some(Err(err)) = resume_result {
+        let _ = tx.send(SessionEvent::Error(format!(
+            "resume reports after setting runtime controls failed: {err}"
+        )));
+    } else if !failed && reports_paused {
+        let _ = tx.send(SessionEvent::Log(
+            "runtime controls applied; report stream resumed".to_string(),
+        ));
+    } else if !failed {
+        let _ = tx.send(SessionEvent::Log(
+            "runtime controls applied; MCU pause unavailable, host stream resync requested"
+                .to_string(),
+        ));
+    }
+    let _ = tx.send(SessionEvent::ControlBusy {
+        name: busy_name,
+        busy: false,
+    });
+}
+
+fn handle_load_and_exec_program<T: rseq_link::Transport>(
+    program: CompiledProgram,
+    host: &mut rseq::link::HostLink<T>,
+    processor: &mut ReportProcessor,
+    tx: &Sender<SessionEvent>,
+) {
+    let _ = tx.send(SessionEvent::Log(format!(
+        "reloading session with main={} byte(s), irq_handlers={}",
+        program.main.len(),
+        program.irq_bytecodes.len()
+    )));
+
+    let reports_paused = match host.pause_reports_timeout(RELOAD_PAUSE_TIMEOUT) {
+        Ok(()) => {
+            let _ = tx.send(SessionEvent::Log(
+                "report stream paused for reload".to_string(),
+            ));
+            true
+        }
+        Err(err) => {
+            let _ = tx.send(SessionEvent::Log(format!(
+                "MCU report pause before reload unavailable ({err}); reloading with host-side trace drain"
+            )));
+            false
+        }
+    };
+
+    let success = load_and_exec_program(host, &program, processor, tx);
+
+    let resume_result = if reports_paused {
+        Some(host.resume_reports())
+    } else {
+        let _ = host.resume_reports_timeout(CONTROL_FALLBACK_RESUME_TIMEOUT);
+        None
+    };
+
+    if !success {
+        let _ = tx.send(SessionEvent::Error(
+            "reload failed; session remains open".to_string(),
+        ));
+    } else if reports_paused && matches!(resume_result, Some(Ok(()))) {
+        let _ = tx.send(SessionEvent::Log(
+            "reload complete; report stream resumed".to_string(),
+        ));
+    } else if !reports_paused {
+        let _ = tx.send(SessionEvent::Log(
+            "reload complete; MCU pause unavailable, host stream resync requested".to_string(),
+        ));
+    }
+    if let Some(Err(err)) = resume_result {
+        let _ = tx.send(SessionEvent::Error(format!(
+            "resume reports after reload failed: {err}"
+        )));
+    }
+    let _ = tx.send(SessionEvent::LoadAndExecFinished { success });
+}
+
+fn pause_reports_best_effort<T: rseq_link::Transport>(
+    host: &mut rseq::link::HostLink<T>,
+    tx: &Sender<SessionEvent>,
+) -> bool {
+    match host.pause_reports_timeout(CONTROL_PAUSE_TIMEOUT) {
+        Ok(()) => true,
+        Err(err) => {
+            let _ = tx.send(SessionEvent::Log(format!(
+                "MCU report pause unavailable ({err}); applying control while suppressing reports on the host"
+            )));
+            false
+        }
+    }
+}
+
+fn tuning_assignments_summary(assignments: &[TuningAssignment]) -> String {
+    assignments
+        .iter()
+        .map(|assignment| {
+            format!(
+                "{}={}",
+                assignment.control.name,
+                tuning_control_value_label(&assignment.control, assignment.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn apply_paused_control<T: rseq_link::Transport>(
+    assignment: &TuningAssignment,
+    host: &mut rseq::link::HostLink<T>,
+    processor: &mut ReportProcessor,
+    tx: &Sender<SessionEvent>,
+) -> Result<Option<ReportScaleUpdate>, String> {
+    let control = &assignment.control;
+    let width = u16::try_from(control.width.max(1))
+        .ok()
+        .filter(|width| *width > 0)
+        .ok_or_else(|| format!("invalid register width {}", control.width))?;
+    if width as usize > rseq_link::wire::CONTROL_MAX_READ_LEN {
+        return Err(format!(
+            "width {} exceeds control read limit {}",
+            width,
+            rseq_link::wire::CONTROL_MAX_READ_LEN
+        ));
+    }
+
+    let read = host.control_read(control.addr, width).map_err(|err| {
+        format!(
+            "read {} @ 0x{:02x} failed: {err}",
+            control.register_name, control.addr
+        )
+    })?;
+    let _ = tx.send(SessionEvent::Register {
+        addr: read.addr,
+        access: AccessKind::Read,
+        data: read.data.clone(),
+    });
+
+    let data = apply_tuning_control_value(control, &read.data, assignment.value)?;
+    if read.data.get(..data.len()) != Some(data.as_slice()) {
+        let write = host.control_write(control.addr, &data).map_err(|err| {
+            format!(
+                "write {} @ 0x{:02x} data=[{}] failed: {err}",
+                control.register_name,
+                control.addr,
+                hex_bytes(&data)
+            )
+        })?;
+        let _ = tx.send(SessionEvent::Register {
+            addr: write.addr,
+            access: AccessKind::Write,
+            data: data.clone(),
+        });
+    }
+
+    let report_scale = tuning_assignment_report_scale(assignment)?;
+    if let Some(update) = report_scale {
+        let updated = processor.apply_scale_update(update);
+        let _ = tx.send(SessionEvent::Log(format!(
+            "updated {updated} report decoder(s): {}={}",
+            update.kind.as_str(),
+            update.value
+        )));
+    }
+    processor.mark_stream_reconfigured();
+    Ok(report_scale)
 }
 
 fn send_processed_events(events: Vec<SessionEvent>, tx: &Sender<SessionEvent>) {
@@ -2185,6 +3143,19 @@ mod tests {
             &chip,
             r#"
 sensor: qmi8660
+controls:
+  - name: accel_odr
+    group: Sampling
+    target: UI.ACTL0.aodr_ui
+    options:
+      - { value: 8, label: 100Hz }
+      - { value: 9, label: 200Hz }
+  - name: gyro_lpf
+    group: Filter
+    target: UI.GCTL1.glpf_ui
+    options:
+      - { value: 0, label: off }
+      - { value: 2, label: preset2 }
 pages:
   UI:
     registers:
@@ -2194,6 +3165,18 @@ pages:
       - addr: 0x0b
         name: COMM_CTL
         access: RW
+      - addr: 0x20
+        name: ACTL0
+        access: RW
+        fields:
+          - name: aodr_ui
+            bits: "3:0"
+      - addr: 0x39
+        name: GCTL1
+        access: RW
+        fields:
+          - name: glpf_ui
+            bits: "5:3"
       - addr: 0x54
         name: FIFO_STATUSL
         access: RO
@@ -2266,6 +3249,27 @@ let whoami = read!(UI.WHOAMI, 1);
                 .get(rseq::REPORT_KIND_FIFO_RAW)
                 .is_some()
         );
+        let control = metadata.tuning_catalog.get("accel_odr").unwrap();
+        assert_eq!(control.addr, 0x20);
+        assert_eq!((control.bit_hi, control.bit_lo), (3, 0));
+    }
+
+    #[test]
+    fn tuning_controls_parse_labels_and_preserve_unrelated_bits() {
+        let dir = temp_dir();
+        let (chip, _script) = write_fixture(&dir);
+        let metadata = load_host_metadata(&[], &[chip]).unwrap();
+        let control = metadata.tuning_catalog.get("accel_odr").unwrap();
+
+        assert_eq!(parse_tuning_control_value(control, "200Hz").unwrap(), 9);
+        assert_eq!(parse_tuning_control_value(control, "0x8").unwrap(), 8);
+        assert!(parse_tuning_control_value(control, "7").is_err());
+        assert!(parse_tuning_control_value(control, "6400Hz").is_err());
+
+        let updated = apply_tuning_control_value(control, &[0xa5], 9).unwrap();
+        assert_eq!(updated, vec![0xa9]);
+        assert_eq!(tuning_control_value_from_bytes(control, &updated), Some(9));
+        assert_eq!(tuning_control_value_label(control, 9), "200Hz");
     }
 
     #[test]
@@ -2465,6 +3469,305 @@ let whoami = read!(UI.WHOAMI, 1);
             event,
             SessionEvent::Health(health)
                 if health.total_reports == 1 && health.last_frame_id == Some(77)
+        )));
+    }
+
+    #[test]
+    fn demo_session_applies_startup_controls() {
+        let dir = temp_dir();
+        let (chip, _script) = write_fixture(&dir);
+        let metadata = load_host_metadata(&[], &[chip]).unwrap();
+        let assignment = metadata
+            .tuning_catalog
+            .resolve_assignment("accel_odr=200Hz")
+            .unwrap();
+        let session = spawn_session(SessionConfig {
+            startup_controls: vec![assignment],
+            ..SessionConfig::default()
+        });
+
+        let mut observed = false;
+        for _ in 0..32 {
+            let Ok(event) = session.events.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            if matches!(
+                event,
+                SessionEvent::Register {
+                    addr: 0x20,
+                    access: AccessKind::Write,
+                    data
+                } if data == vec![0x09]
+            ) {
+                observed = true;
+                break;
+            }
+        }
+        session.stop();
+        assert!(observed);
+    }
+
+    #[test]
+    fn batch_control_transaction_pauses_once_and_applies_all() {
+        use rseq::link::HostLink;
+        use rseq_link::MockTransport;
+        use rseq_mcu_sim::{SimBus, mcu_loop};
+
+        let dir = temp_dir();
+        let (chip, _script) = write_fixture(&dir);
+        let metadata = load_host_metadata(&[], &[chip]).unwrap();
+        let assignments = vec![
+            metadata
+                .tuning_catalog
+                .resolve_assignment("accel_odr=200Hz")
+                .unwrap(),
+            metadata
+                .tuning_catalog
+                .resolve_assignment("gyro_lpf=preset2")
+                .unwrap(),
+        ];
+
+        let (host_t, mcu_t) = MockTransport::pair();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_mcu = stop.clone();
+        let mcu = std::thread::spawn(move || {
+            let _ = mcu_loop(mcu_t, SimBus::new(), stop_mcu);
+        });
+        let mut host = HostLink::new(host_t);
+        let mut processor = ReportProcessor::new(ReportDecoderRegistry::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle_set_controls_transaction(&assignments, &mut host, &mut processor, &tx);
+
+        stop.store(true, Ordering::SeqCst);
+        drop(host);
+        let _ = mcu.join();
+        let events = rx.try_iter().collect::<Vec<_>>();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Log(line)
+                if line.contains("pausing report stream to apply runtime controls")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ControlApplied { name, label, .. }
+                if name == "accel_odr" && label == "200Hz"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ControlApplied { name, label, .. }
+                if name == "gyro_lpf" && label == "preset2"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Register {
+                addr: 0x20,
+                access: AccessKind::Write,
+                data
+            } if data == &vec![0x09]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Register {
+                addr: 0x39,
+                access: AccessKind::Write,
+                data
+            } if data == &vec![0x10]
+        )));
+    }
+
+    #[test]
+    fn control_transaction_falls_back_when_pause_is_unavailable() {
+        use rseq::link::HostLink;
+        use rseq_link::MockTransport;
+        use rseq_link::Transport;
+        use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
+        use rseq_link::wire::{
+            ControlRequestRef, ControlStatus, decode_control_request,
+            encode_control_bus_read_result_into, encode_control_bus_write_result_into,
+        };
+
+        fn send_frame<T: Transport>(
+            transport: &mut T,
+            ty: FrameType,
+            payload: &[u8],
+        ) -> Result<(), rseq_link::LinkError> {
+            let mut buf = vec![0u8; payload.len() + OVERHEAD];
+            let n = encode_into(ty, payload, &mut buf);
+            transport.write(&buf[..n])
+        }
+
+        let dir = temp_dir();
+        let (chip, _script) = write_fixture(&dir);
+        let metadata = load_host_metadata(&[], &[chip]).unwrap();
+        let assignment = metadata
+            .tuning_catalog
+            .resolve_assignment("accel_odr=200Hz")
+            .unwrap();
+
+        let (host_t, mut device_t) = MockTransport::pair();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_device = stop.clone();
+        let device = std::thread::spawn(move || {
+            let mut dec = FrameDecoder::<HOST_FRAME_BUF>::new();
+            let mut inbox = std::collections::VecDeque::<(FrameType, Vec<u8>)>::new();
+            let mut reg_0x20 = 0xa0u8;
+            while !stop_device.load(Ordering::SeqCst) {
+                let mut buf = [0u8; 128];
+                match device_t.read(&mut buf) {
+                    Ok(0) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(n) => {
+                        dec.feed(&buf[..n], |ty, payload| {
+                            inbox.push_back((ty, payload.to_vec()));
+                        });
+                    }
+                    Err(_) => break,
+                }
+
+                while let Some((ty, payload)) = inbox.pop_front() {
+                    match ty {
+                        FrameType::Pause | FrameType::Resume => {
+                            // Simulate older firmware: control frames work, but pause/resume
+                            // do not ACK.
+                        }
+                        FrameType::Control => match decode_control_request(&payload) {
+                            Some(ControlRequestRef::BusRead {
+                                request_id,
+                                addr,
+                                len,
+                            }) => {
+                                let data = if addr == 0x20 && len == 1 {
+                                    vec![reg_0x20]
+                                } else {
+                                    vec![0; len as usize]
+                                };
+                                let mut response = vec![0u8; 64];
+                                let n = encode_control_bus_read_result_into(
+                                    &mut response,
+                                    request_id,
+                                    ControlStatus::Ok,
+                                    addr,
+                                    &data,
+                                );
+                                let _ = send_frame(
+                                    &mut device_t,
+                                    FrameType::ControlResult,
+                                    &response[..n],
+                                );
+                            }
+                            Some(ControlRequestRef::BusWrite {
+                                request_id,
+                                addr,
+                                data,
+                            }) => {
+                                if addr == 0x20 && data.len() == 1 {
+                                    reg_0x20 = data[0];
+                                }
+                                let mut response = vec![0u8; 64];
+                                let n = encode_control_bus_write_result_into(
+                                    &mut response,
+                                    request_id,
+                                    ControlStatus::Ok,
+                                    addr,
+                                    data.len() as u16,
+                                );
+                                let _ = send_frame(
+                                    &mut device_t,
+                                    FrameType::ControlResult,
+                                    &response[..n],
+                                );
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let mut host = HostLink::new(host_t);
+        let mut processor = ReportProcessor::new(ReportDecoderRegistry::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle_set_control_transaction(assignment, &mut host, &mut processor, &tx);
+
+        stop.store(true, Ordering::SeqCst);
+        drop(host);
+        let _ = device.join();
+        let events = rx.try_iter().collect::<Vec<_>>();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Log(line) if line.contains("MCU report pause unavailable")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ControlApplied { name, label, .. }
+                if name == "accel_odr" && label == "200Hz"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Register {
+                addr: 0x20,
+                access: AccessKind::Write,
+                data
+            } if data == &vec![0xa9]
+        )));
+    }
+
+    #[test]
+    fn reload_transaction_pauses_before_reloading_and_resumes_afterwards() {
+        use rseq::link::HostLink;
+        use rseq_link::MockTransport;
+        use rseq_mcu_sim::{SimBus, mcu_loop};
+
+        let source = "\
+write!(0x20, [0xaa], 10);
+";
+        let program = rseq::parse(source).unwrap();
+        let bytecode = rseq::compile(&program).unwrap();
+
+        let (host_t, mcu_t) = MockTransport::pair();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_mcu = stop.clone();
+        let mcu = std::thread::spawn(move || {
+            let _ = mcu_loop(mcu_t, SimBus::new(), stop_mcu);
+        });
+
+        let mut host = HostLink::new(host_t);
+        let mut processor = ReportProcessor::new(ReportDecoderRegistry::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle_load_and_exec_program(
+            rseq::CompiledProgram {
+                main: bytecode,
+                irqs: Vec::new(),
+                irq_bytecodes: Default::default(),
+            },
+            &mut host,
+            &mut processor,
+            &tx,
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        drop(host);
+        let _ = mcu.join();
+        let events = rx.try_iter().collect::<Vec<_>>();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Log(line) if line.contains("report stream paused for reload")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::LoadAndExecFinished { success } if *success
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Log(line) if line.contains("reload complete; report stream resumed")
         )));
     }
 

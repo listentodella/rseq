@@ -54,6 +54,8 @@ struct ChipYaml {
     sensor: String,
     #[serde(default)]
     who_am_i: Option<WhoAmIYaml>,
+    #[serde(default)]
+    controls: Vec<ControlYaml>,
     pages: HashMap<String, PageYaml>,
 }
 
@@ -117,6 +119,37 @@ struct FieldYaml {
     event: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ControlYaml {
+    name: String,
+    target: String,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    desc: String,
+    /// Optional host-side report decoder property adjusted by this control.
+    /// Currently understood by host tools for runtime full-scale changes.
+    #[serde(default)]
+    report_scale: Option<String>,
+    #[serde(default)]
+    options: Vec<ControlOptionYaml>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ControlOptionYaml {
+    #[serde(deserialize_with = "deserialize_u32")]
+    value: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    desc: String,
+    /// Physical full-scale value associated with this register encoding.
+    #[serde(default)]
+    scale: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhoAmI {
     pub reg: u32,
@@ -160,6 +193,26 @@ pub struct Register {
     pub fields: Vec<Field>,
 }
 
+/// 一个用户可调参数，通常映射到某个寄存器位域，例如输出速率、滤波器或量程。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Control {
+    pub name: String,
+    pub target: String,
+    pub group: String,
+    pub desc: String,
+    pub report_scale: Option<String>,
+    pub options: Vec<ControlOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlOption {
+    pub value: u32,
+    pub name: String,
+    pub label: String,
+    pub desc: String,
+    pub scale: Option<f64>,
+}
+
 /// 一个中断事件在状态寄存器中的位置，供 irq! 派发表解析。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventBit {
@@ -186,10 +239,11 @@ pub struct UpdatePlan {
     pub fields: Vec<FieldUpdate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chip {
     pub sensor: String,
     pub who_am_i: Option<WhoAmI>,
+    pub controls: Vec<Control>,
     pub pages: Vec<Page>,
     pub source: PathBuf,
 }
@@ -320,10 +374,33 @@ impl ChipRegistry {
             reg: w.reg,
             values: w.values.into_iter().map(|v| (v.value, v.desc)).collect(),
         });
+        let controls = yaml
+            .controls
+            .into_iter()
+            .map(|control| Control {
+                name: control.name,
+                target: control.target,
+                group: control.group,
+                desc: control.desc,
+                report_scale: control.report_scale,
+                options: control
+                    .options
+                    .into_iter()
+                    .map(|option| ControlOption {
+                        value: option.value,
+                        name: option.name,
+                        label: option.label,
+                        desc: option.desc,
+                        scale: option.scale,
+                    })
+                    .collect(),
+            })
+            .collect();
 
         self.chips.push(Chip {
             sensor: yaml.sensor,
             who_am_i,
+            controls,
             pages,
             source: path.to_path_buf(),
         });

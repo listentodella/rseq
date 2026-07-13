@@ -15,7 +15,11 @@ use std::thread;
 use std::time::Duration;
 
 use rseq_link::frame::{FrameDecoder, FrameType, HOST_FRAME_BUF, OVERHEAD, encode_into};
-use rseq_link::wire::{ExecStatus, SEG_KIND_MAIN, load_segments};
+use rseq_link::wire::{
+    CONTROL_MAX_READ_LEN, ControlRequestRef, ControlStatus, ExecStatus, SEG_KIND_MAIN,
+    decode_control_request, encode_control_bus_read_result_into,
+    encode_control_bus_write_result_into, load_segments,
+};
 use rseq_link::{LinkError, TracingBus, Transport};
 use rseq_vm::{Bus, BusError, Vm};
 
@@ -147,6 +151,64 @@ pub fn mcu_loop<B: Bus, T: Transport>(
             FrameType::Stop => {
                 send_frame(&mut transport, FrameType::Ack, &[])?;
             }
+            FrameType::Pause | FrameType::Resume => {
+                send_frame(&mut transport, FrameType::Ack, &[])?;
+            }
+            FrameType::Control => match decode_control_request(&payload) {
+                Some(ControlRequestRef::BusRead {
+                    request_id,
+                    addr,
+                    len,
+                }) => {
+                    let mut data = vec![0; len as usize];
+                    let status = match bus.read(addr, &mut data) {
+                        Ok(()) => ControlStatus::Ok,
+                        Err(err) => {
+                            data.clear();
+                            ControlStatus::from_bus_error(err)
+                        }
+                    };
+                    let mut response = [0u8; 1 + 2 + 1 + 4 + 2 + CONTROL_MAX_READ_LEN];
+                    let n = encode_control_bus_read_result_into(
+                        &mut response,
+                        request_id,
+                        status,
+                        addr,
+                        &data,
+                    );
+                    send_frame(&mut transport, FrameType::ControlResult, &response[..n])?;
+                }
+                Some(ControlRequestRef::BusWrite {
+                    request_id,
+                    addr,
+                    data,
+                }) => {
+                    let status = match bus.write(addr, data) {
+                        Ok(()) => ControlStatus::Ok,
+                        Err(err) => ControlStatus::from_bus_error(err),
+                    };
+                    let mut response = [0u8; 1 + 2 + 1 + 4 + 2];
+                    let n = encode_control_bus_write_result_into(
+                        &mut response,
+                        request_id,
+                        status,
+                        addr,
+                        data.len() as u16,
+                    );
+                    send_frame(&mut transport, FrameType::ControlResult, &response[..n])?;
+                }
+                None => {
+                    let mut response = [0u8; 1 + 2 + 1 + 4 + 2];
+                    let n = encode_control_bus_write_result_into(
+                        &mut response,
+                        0,
+                        ControlStatus::InvalidPayload,
+                        0,
+                        0,
+                    );
+                    send_frame(&mut transport, FrameType::ControlResult, &response[..n])?;
+                }
+            },
             // MCU→Host 方向的帧在 MCU 侧忽略。
             _ => {}
         }

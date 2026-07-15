@@ -11,6 +11,12 @@ use gpui_component::{
 pub type Vec3 = [f32; 3];
 
 #[derive(Clone, Copy, Debug)]
+pub struct EventMarker {
+    pub x: f32,
+    pub color: Hsla,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ProjectedPoint {
     x: f32,
     y: f32,
@@ -144,6 +150,7 @@ pub struct TripleLineChart {
     x_max: f32,
     y_min: f32,
     y_max: f32,
+    event_markers: Vec<EventMarker>,
 }
 
 impl TripleLineChart {
@@ -155,6 +162,28 @@ impl TripleLineChart {
         x_max: f32,
         y_min: f32,
         y_max: f32,
+    ) -> Self {
+        Self::new_with_ranges_axes_and_markers(
+            data,
+            colors,
+            visible_axes,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_ranges_axes_and_markers(
+        data: Vec<Vec3>,
+        colors: [Hsla; 3],
+        visible_axes: [bool; 3],
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
+        event_markers: Vec<EventMarker>,
     ) -> Self {
         let (x_min, x_max) = if x_max > x_min {
             (x_min, x_max)
@@ -174,6 +203,7 @@ impl TripleLineChart {
             x_max,
             y_min,
             y_max,
+            event_markers,
         }
     }
 }
@@ -195,6 +225,26 @@ impl Plot for TripleLineChart {
             .stroke(cx.theme().border)
             .dash_array(&[px(4.), px(2.)])
             .paint(&bounds, window);
+
+        for marker in &self.event_markers {
+            if marker.x < self.x_min || marker.x > self.x_max {
+                continue;
+            }
+            let Some(x_pos) = x.tick(&(marker.x as f64)) else {
+                continue;
+            };
+            let mut line = PathBuilder::stroke(px(1.));
+            line.move_to(origin_point(px(x_pos), px(0.), bounds.origin));
+            line.line_to(origin_point(px(x_pos), px(height), bounds.origin));
+            if let Ok(path) = line.build() {
+                window.paint_path(path, marker.color.opacity(0.30));
+            }
+            let mark = Bounds::from_corners(
+                origin_point(px((x_pos - 3.).max(0.)), px(2.), bounds.origin),
+                origin_point(px((x_pos + 3.).min(width)), px(8.), bounds.origin),
+            );
+            window.paint_quad(fill(mark, marker.color.opacity(0.88)));
+        }
 
         for axis in 0..3 {
             if !self.visible_axes[axis] {

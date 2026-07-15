@@ -2921,10 +2921,12 @@ fn decompile_block(bytecode: &[u8]) -> Result<String, DecompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     /// 用于 irq! 派发测试的简易内存总线。
     struct MapBus {
         mem: HashMap<u32, u8>,
+        fifo_data: VecDeque<u8>,
         writes: Vec<(u32, Vec<u8>)>,
         logs: Vec<String>,
         reports: Vec<(u32, Vec<ReportArgOwned>)>,
@@ -2934,6 +2936,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 mem: HashMap::new(),
+                fifo_data: VecDeque::new(),
                 writes: Vec::new(),
                 logs: Vec::new(),
                 reports: Vec::new(),
@@ -2943,6 +2946,12 @@ mod tests {
 
     impl rseq_vm::Bus for MapBus {
         fn read(&mut self, addr: u32, data: &mut [u8]) -> Result<(), rseq_vm::BusError> {
+            if addr == 0x57 && !self.fifo_data.is_empty() {
+                for slot in data {
+                    *slot = self.fifo_data.pop_front().unwrap_or(0);
+                }
+                return Ok(());
+            }
             for (i, slot) in data.iter_mut().enumerate() {
                 *slot = self.mem.get(&(addr + i as u32)).copied().unwrap_or(0);
             }
@@ -4192,6 +4201,64 @@ mod tests {
         assert!(int1.iter().any(|&b| b == rseq_vm::Opcode::ReadDyn as u8));
     }
 
+    #[test]
+    fn test_qmi_irq_segment_reports_amd_before_fifo_for_combined_snapshot() {
+        let src = r#"
+        chip!("qmi8660.yaml");
+        irq!(int1) {
+            on(motion_b) {
+                report!(AMD);
+            }
+
+            on(fifo_watermark) {
+                let fifo_l = read!(UI.FIFO_STATUSL, 1);
+                let fifo_h = read!(UI.FIFO_STATUSH, 1);
+                let fifo_hi = fifo_h & 0x0f;
+                let fifo_len = fifo_l | (fifo_hi << 8);
+                let data = read!(UI.FIFO_DATA, fifo_len);
+                report!(FIFO_RAW, fifo_len, data);
+            }
+        }
+        wait!(int1);
+        "#;
+        let program = parse(src).unwrap();
+        let compiled = compile_program_units(&[ProgramUnit {
+            program: &program,
+            base_dir: Some(&qmi_base()),
+        }])
+        .unwrap();
+
+        let vector = compiled
+            .irqs
+            .iter()
+            .find(|irq| irq.pin == "int1")
+            .expect("int1 template");
+        assert_eq!(vector.arms[0].event, "motion_b");
+        assert_eq!(vector.arms[0].mask, 0x0200);
+        assert_eq!(vector.arms[1].event, "fifo_watermark");
+        assert_eq!(vector.arms[1].mask, 0x0040);
+
+        let mut bus = MapBus::new();
+        bus.mem.insert(0x58, 0x40);
+        bus.mem.insert(0x59, 0x02);
+        bus.mem.insert(0x54, 14);
+        bus.mem.insert(0x55, 0);
+        let fifo_data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        bus.fifo_data.extend(fifo_data);
+
+        rseq_vm::Vm::new(&mut bus, &compiled.main).run().unwrap();
+        assert_eq!(bus.reports.len(), 2);
+        assert_eq!(bus.reports[0], (REPORT_KIND_AMD, Vec::new()));
+        assert_eq!(bus.reports[1].0, REPORT_KIND_FIFO_RAW);
+        assert_eq!(
+            bus.reports[1].1,
+            vec![
+                ReportArgOwned::U32(14),
+                ReportArgOwned::Bytes(fifo_data.to_vec())
+            ]
+        );
+    }
+
     // ── if-else / 逻辑运算符 ────────────────────────────────────────
 
     #[test]
@@ -4561,6 +4628,16 @@ mod tests {
                 (REPORT_KIND_DRDY, vec![ReportArgOwned::U32(3)]),
             ]
         );
+    }
+
+    #[test]
+    fn test_report_amd_compiles_without_args() {
+        let src = "report!(AMD);";
+        let bc = compile(&parse(src).unwrap()).unwrap();
+        let mut bus = MapBus::new();
+
+        rseq_vm::Vm::new(&mut bus, &bc).run().unwrap();
+        assert_eq!(bus.reports, vec![(REPORT_KIND_AMD, vec![])]);
     }
 
     #[test]

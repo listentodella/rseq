@@ -28,18 +28,19 @@ use gpui_component::{
     v_flex,
 };
 use plot::{
-    OrientationModel, ScalarLineChart, TripleLineChart, TripleOhlc, TripleOhlcChart, Vec3,
-    new_triple_ohlc, push_triple_ohlc,
+    EventMarker, OrientationModel, ScalarLineChart, TripleLineChart, TripleOhlc, TripleOhlcChart,
+    Vec3, new_triple_ohlc, push_triple_ohlc,
 };
 use rseq_host::{
     AccessKind, FieldInfo, HostMetadata, MAX_TEXT_LINES, MotionSample, RegisterCatalog,
     RegisterInfo, ReportCaptureRecord, ReportDecoder, ReportDecoderRegistry, ReportHealth,
     ReportOutputMode, ReportProcessor, RseqSource, SessionCommand, SessionConfig, SessionEvent,
-    SessionHandle, TuningAssignment, TuningControl, compile_rseq_files, compile_rseq_sources,
-    hex_bytes, load_host_metadata, load_host_metadata_from_sources, make_i16_le_decoder,
-    parse_register_write_bytes, parse_tuning_control_value, push_bounded, read_report_capture,
-    resolve_tuning_assignments, tuning_control_value_from_bytes, tuning_control_value_hint,
-    tuning_control_value_label, write_report_capture,
+    SessionHandle, SpecialEvent, SpecialEventKind, TuningAssignment, TuningControl,
+    compile_rseq_files, compile_rseq_sources, hex_bytes, load_host_metadata,
+    load_host_metadata_from_sources, make_i16_le_decoder, parse_register_write_bytes,
+    parse_tuning_control_value, push_bounded, read_report_capture, resolve_tuning_assignments,
+    tuning_control_value_from_bytes, tuning_control_value_hint, tuning_control_value_label,
+    write_report_capture,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -48,6 +49,8 @@ use serde::de::DeserializeOwned;
 const UI_TICK: Duration = Duration::from_millis(33);
 const REPORT_TEXT_REFRESH: Duration = Duration::from_millis(100);
 const MAX_SAMPLES: usize = 600;
+const MAX_MOTION_EVENTS: usize = 1024;
+const MAX_CHART_EVENT_MARKERS: usize = 256;
 const HISTORY_BUCKET_SECS: u64 = 1;
 const HISTORY_BUCKET_US: u64 = HISTORY_BUCKET_SECS * 1_000_000;
 const MAX_HISTORY_BARS: usize = 120;
@@ -862,6 +865,15 @@ struct ChartDragState {
     auto_x_range: ChartXRange,
 }
 
+#[derive(Debug, Clone)]
+struct MotionEventRecord {
+    kind: SpecialEventKind,
+    meta: Option<rseq::trace::ReportMeta>,
+    args: Vec<rseq::trace::ReportArg>,
+    sample_anchor_seq: u64,
+    received_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttitudeEstimate {
     roll: f32,
@@ -1285,8 +1297,12 @@ pub struct RseqGpui {
     write_input: Entity<InputState>,
     control_value_input: Entity<InputState>,
     samples: VecDeque<MotionSample>,
+    sample_seq_next: u64,
+    sample_seq_base: u64,
     sample_skip_count: usize,
     sample_skip_remaining: usize,
+    motion_events: VecDeque<MotionEventRecord>,
+    motion_event_counts: [u64; 3],
     motion_axis_visible: [bool; 3],
     history_bars: VecDeque<HistoryBar>,
     history_bucket: Option<HistoryBucket>,
@@ -1491,8 +1507,12 @@ impl RseqGpui {
             write_input,
             control_value_input,
             samples: VecDeque::with_capacity(MAX_SAMPLES),
+            sample_seq_next: 0,
+            sample_seq_base: 0,
             sample_skip_count: 0,
             sample_skip_remaining: 0,
+            motion_events: VecDeque::with_capacity(MAX_MOTION_EVENTS),
+            motion_event_counts: [0; 3],
             motion_axis_visible: [true; 3],
             history_bars: VecDeque::with_capacity(MAX_HISTORY_BARS),
             history_bucket: None,
@@ -2651,6 +2671,9 @@ impl RseqGpui {
             SessionEvent::Sample(sample) => {
                 self.ingest_motion_sample(sample);
             }
+            SessionEvent::SpecialEvent(event) => {
+                self.ingest_special_event(event);
+            }
             SessionEvent::Report(summary) => {
                 if !summary.discarded {
                     self.push_capture_record(ReportCaptureRecord {
@@ -3106,10 +3129,18 @@ impl RseqGpui {
 
     fn reset_stream_state(&mut self, clear_capture: bool) {
         self.samples.clear();
+        self.sample_seq_next = 0;
+        self.sample_seq_base = 0;
+        self.motion_events.clear();
+        self.motion_event_counts = [0; 3];
         self.history_bars.clear();
         self.history_bucket = None;
         self.history_intraday = None;
         self.chart_drag = None;
+        self.acc_chart_range = None;
+        self.gyro_chart_range = None;
+        self.acc_chart_x_range = None;
+        self.gyro_chart_x_range = None;
         self.attitude = AttitudeEstimate::default();
         self.health = ReportHealth::default();
         self.sample_skip_remaining = self.sample_skip_count;
@@ -3142,10 +3173,18 @@ impl RseqGpui {
 
     fn clear_motion_samples(&mut self) {
         self.samples.clear();
+        self.sample_seq_next = 0;
+        self.sample_seq_base = 0;
+        self.motion_events.clear();
+        self.motion_event_counts = [0; 3];
         self.history_bars.clear();
         self.history_bucket = None;
         self.history_intraday = None;
         self.chart_drag = None;
+        self.acc_chart_range = None;
+        self.gyro_chart_range = None;
+        self.acc_chart_x_range = None;
+        self.gyro_chart_x_range = None;
         self.attitude = AttitudeEstimate::default();
         self.sample_skip_remaining = self.sample_skip_count;
         push_bounded(
@@ -3167,9 +3206,76 @@ impl RseqGpui {
 
         if self.samples.len() == MAX_SAMPLES {
             self.samples.pop_front();
+            self.sample_seq_base = self.sample_seq_base.saturating_add(1);
         }
+        self.sample_seq_next = self.sample_seq_next.saturating_add(1);
         self.samples.push_back(sample);
         self.push_history_sample(acc, gyro, sample.timestamp_us);
+    }
+
+    fn ingest_special_event(&mut self, event: SpecialEvent) {
+        let anchor = self
+            .sample_seq_next
+            .saturating_sub(1)
+            .max(self.sample_seq_base);
+        if self.motion_events.len() == MAX_MOTION_EVENTS {
+            self.motion_events.pop_front();
+        }
+        self.motion_event_counts[event.kind.index()] =
+            self.motion_event_counts[event.kind.index()].saturating_add(1);
+        self.motion_events.push_back(MotionEventRecord {
+            kind: event.kind,
+            meta: event.meta,
+            args: event.args,
+            sample_anchor_seq: anchor,
+            received_at: Instant::now(),
+        });
+    }
+
+    fn motion_event_markers(&self, x_range: ChartXRange, cx: &Context<Self>) -> Vec<EventMarker> {
+        let mut markers = Vec::new();
+        for event in self.motion_events.iter().rev() {
+            if markers.len() >= MAX_CHART_EVENT_MARKERS {
+                break;
+            }
+            let Some(x) = self.motion_event_x(event) else {
+                continue;
+            };
+            if x < x_range.x_min || x > x_range.x_max {
+                continue;
+            }
+            markers.push(EventMarker {
+                x,
+                color: self.special_event_color(event.kind, cx),
+            });
+        }
+        markers.reverse();
+        markers
+    }
+
+    fn motion_event_x(&self, event: &MotionEventRecord) -> Option<f32> {
+        if let Some(timestamp_us) = event
+            .meta
+            .and_then(|meta| meta.timestamp_valid().then_some(meta.timestamp_us))
+        {
+            return nearest_sample_index_by_timestamp(&self.samples, timestamp_us)
+                .map(|index| index as f32);
+        }
+
+        let rel = event.sample_anchor_seq.checked_sub(self.sample_seq_base)?;
+        (rel < self.samples.len() as u64).then_some(rel as f32)
+    }
+
+    fn latest_motion_event(&self) -> Option<&MotionEventRecord> {
+        self.motion_events.back()
+    }
+
+    fn special_event_color(&self, kind: SpecialEventKind, cx: &Context<Self>) -> Hsla {
+        match kind {
+            SpecialEventKind::Amd => cx.theme().yellow,
+            SpecialEventKind::Smd => cx.theme().red,
+            SpecialEventKind::Drdy => cx.theme().cyan,
+        }
     }
 
     fn push_history_sample(&mut self, acc: Vec3, gyro: Vec3, timestamp_us: Option<u64>) {
@@ -3893,6 +3999,7 @@ impl RseqGpui {
         let range = self.chart_display_range(series, &data, min_span);
         let x_range = self.chart_display_x_range(series, data.len());
         let zoom = self.chart_display_zoom(series, &data, min_span);
+        let event_markers = self.motion_event_markers(x_range, cx);
         let view = cx.entity();
         v_flex()
             .flex_1()
@@ -3991,7 +4098,7 @@ impl RseqGpui {
                             this.zoom_chart_from_wheel(series, min_span, event, window, cx);
                         },
                     ))
-                    .child(TripleLineChart::new_with_ranges_and_axes(
+                    .child(TripleLineChart::new_with_ranges_axes_and_markers(
                         data,
                         colors,
                         visible_axes,
@@ -3999,6 +4106,7 @@ impl RseqGpui {
                         x_range.x_max,
                         range.y_min,
                         range.y_max,
+                        event_markers,
                     )),
             )
     }
@@ -4346,6 +4454,7 @@ impl RseqGpui {
             .p_3()
             .gap_3()
             .child(self.render_motion_toolbar(cx))
+            .child(self.render_motion_events(cx))
             .when(!self.metadata.tuning_catalog.is_empty(), |this| {
                 this.child(self.render_motion_controls(cx))
             })
@@ -4390,6 +4499,61 @@ impl RseqGpui {
             )
             .child(self.render_history_panel(cx))
             .into_any_element()
+    }
+
+    fn render_motion_events(&self, cx: &Context<Self>) -> impl IntoElement {
+        let latest = self.latest_motion_event();
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .flex_wrap()
+            .px_3()
+            .py_2()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().font_semibold().child("Events"))
+                    .children(SpecialEventKind::ALL.into_iter().map(|kind| {
+                        let color = self.special_event_color(kind, cx);
+                        let count = self.motion_event_counts[kind.index()];
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .border_1()
+                            .border_color(color.opacity(0.42))
+                            .rounded(cx.theme().radius)
+                            .bg(color.opacity(0.08))
+                            .child(div().size_2().rounded_full().bg(color))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .child(format!("{} {count}", kind.as_str())),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(match latest {
+                        Some(event) => format!(
+                            "latest {} {} args={} age={}ms",
+                            event.kind.as_str(),
+                            format_motion_event_meta(event.meta),
+                            event.args.len(),
+                            event.received_at.elapsed().as_millis()
+                        ),
+                        None => "no special events".to_string(),
+                    }),
+            )
     }
 
     fn render_axis_checkbox(&self, axis: usize, cx: &Context<Self>) -> impl IntoElement {
@@ -6840,6 +7004,48 @@ fn motion_gyro_vec3(sample: &MotionSample) -> Vec3 {
     ]
 }
 
+fn nearest_sample_index_by_timestamp(
+    samples: &VecDeque<MotionSample>,
+    timestamp_us: u64,
+) -> Option<usize> {
+    let mut first_ts = None;
+    let mut last_ts = None;
+    let mut nearest = None;
+
+    for (index, sample) in samples.iter().enumerate() {
+        let Some(sample_ts) = sample.timestamp_us else {
+            continue;
+        };
+        first_ts.get_or_insert(sample_ts);
+        last_ts = Some(sample_ts);
+        let delta = sample_ts.abs_diff(timestamp_us);
+        if nearest.is_none_or(|(_, best_delta)| delta < best_delta) {
+            nearest = Some((index, delta));
+        }
+    }
+
+    let (Some(first_ts), Some(last_ts)) = (first_ts, last_ts) else {
+        return None;
+    };
+    let min_ts = first_ts.min(last_ts);
+    let max_ts = first_ts.max(last_ts);
+    if timestamp_us < min_ts || timestamp_us > max_ts {
+        return None;
+    }
+
+    nearest.map(|(index, _)| index)
+}
+
+fn format_motion_event_meta(meta: Option<rseq::trace::ReportMeta>) -> String {
+    match meta {
+        Some(meta) if meta.timestamp_valid() => {
+            format!("frame={} ts_us={}", meta.frame_id, meta.timestamp_us)
+        }
+        Some(meta) => format!("frame={}", meta.frame_id),
+        None => "no-meta".to_string(),
+    }
+}
+
 fn attitude_dt_secs(last_timestamp_us: Option<u64>, timestamp_us: Option<u64>) -> Option<f32> {
     let (Some(last), Some(timestamp)) = (last_timestamp_us, timestamp_us) else {
         return None;
@@ -8863,6 +9069,24 @@ irq!(int1) {
         assert!((std[0] - 1.6329932).abs() < 0.00001);
         assert_eq!(std[1], 0.0);
         assert!((std[2] - 1.8856181).abs() < 0.00001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn nearest_sample_index_by_timestamp_uses_closest_motion_sample() {
+        let mut samples = VecDeque::new();
+        for timestamp_us in [100, 220, 360] {
+            samples.push_back(MotionSample {
+                timestamp_us: Some(timestamp_us),
+                acc: [0.0; 3],
+                gyro: [0.0; 3],
+                temp_c: None,
+            });
+        }
+
+        assert_eq!(nearest_sample_index_by_timestamp(&samples, 280), Some(1));
+        assert_eq!(nearest_sample_index_by_timestamp(&samples, 340), Some(2));
+        assert_eq!(nearest_sample_index_by_timestamp(&samples, 50), None);
+        assert_eq!(nearest_sample_index_by_timestamp(&samples, 400), None);
     }
 
     #[::core::prelude::v1::test]

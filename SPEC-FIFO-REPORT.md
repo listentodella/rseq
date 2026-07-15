@@ -15,11 +15,40 @@
 | 名称 | 数值 | 当前用途 |
 | --- | ---: | --- |
 | `FIFO_RAW` | `0x01` | FIFO 原始字节流 |
-| `AMD` | `0x02` | 占位: any motion detected |
+| `AMD` | `0x02` | any motion detected / Motion B 事件 |
 | `SMD` | `0x03` | 占位: significant motion detected |
 | `DRDY` | `0x04` | 占位: data ready |
 
 单条 `report!` 最多携带 8 个参数, 其中最多 1 个 raw bytes 参数。raw bytes 最大长度为 4096 字节。
+
+## 特殊运动事件
+
+特殊事件复用同一个 `report!` Trace v2 帧格式, 不新增 wire protocol。事件的唯一序号和时间由 report v2 自动附带的 `frame_id` 与 `timestamp_us` 提供。
+
+QMI8660 的 Motion B 中断状态约定映射为 `AMD`：
+
+```rseq
+irq!(int1) {
+    on(motion_b) {
+        report!(AMD);
+    }
+
+    on(fifo_watermark) {
+        let fifo_l = read!(UI.FIFO_STATUSL, 1);
+        let fifo_h = read!(UI.FIFO_STATUSH, 1);
+        let fifo_len = fifo_l | ((fifo_h & 0x0f) << 8);
+        let data = read!(UI.FIFO_DATA, fifo_len);
+        report!(FIFO_RAW, fifo_len, data);
+    }
+}
+```
+
+约定：
+
+- `AMD` 第一版使用零参数事件, 即 `report!(AMD);`。
+- 如果同一次中断状态快照同时命中 `motion_b` 和 `fifo_watermark`, 两个 `on(...)` 分支都会按声明顺序执行。
+- UI 层把 `AMD`/`SMD`/`DRDY` 作为特殊事件预览, 其他数字 kind 仍按普通 report 展示。
+- 保存为 `.bin` 的 capture 不需要升级格式, replay 时会按 kind 重新派生特殊事件。
 
 ## FIFO_RAW 上报写法
 

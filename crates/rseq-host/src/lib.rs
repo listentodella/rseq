@@ -1614,6 +1614,57 @@ pub struct ReportSummary {
     pub health: ReportHealth,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialEventKind {
+    Amd,
+    Smd,
+    Drdy,
+}
+
+impl SpecialEventKind {
+    pub const ALL: [Self; 3] = [Self::Amd, Self::Smd, Self::Drdy];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Amd => "AMD",
+            Self::Smd => "SMD",
+            Self::Drdy => "DRDY",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Amd => 0,
+            Self::Smd => 1,
+            Self::Drdy => 2,
+        }
+    }
+
+    pub const fn report_kind(self) -> u32 {
+        match self {
+            Self::Amd => rseq::REPORT_KIND_AMD,
+            Self::Smd => rseq::REPORT_KIND_SMD,
+            Self::Drdy => rseq::REPORT_KIND_DRDY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialEvent {
+    pub kind: SpecialEventKind,
+    pub meta: Option<ReportMeta>,
+    pub args: Vec<ReportArg>,
+}
+
+pub const fn special_event_kind(report_kind: u32) -> Option<SpecialEventKind> {
+    match report_kind {
+        rseq::REPORT_KIND_AMD => Some(SpecialEventKind::Amd),
+        rseq::REPORT_KIND_SMD => Some(SpecialEventKind::Smd),
+        rseq::REPORT_KIND_DRDY => Some(SpecialEventKind::Drdy),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReportProcessor {
     decoders: ReportDecoderRegistry,
@@ -1762,6 +1813,13 @@ impl ReportProcessor {
 
         summary.line = line;
         events.push(SessionEvent::Report(summary.clone()));
+        if let Some(kind) = special_event_kind(kind) {
+            events.push(SessionEvent::SpecialEvent(SpecialEvent {
+                kind,
+                meta,
+                args: args.to_vec(),
+            }));
+        }
         events.push(SessionEvent::Health(health));
         events
     }
@@ -2114,6 +2172,7 @@ pub enum SessionEvent {
         data: Vec<u8>,
     },
     Sample(MotionSample),
+    SpecialEvent(SpecialEvent),
     Report(ReportSummary),
     Health(ReportHealth),
 }
@@ -3469,6 +3528,55 @@ let whoami = read!(UI.WHOAMI, 1);
             event,
             SessionEvent::Health(health)
                 if health.total_reports == 1 && health.last_frame_id == Some(77)
+        )));
+    }
+
+    #[test]
+    fn special_event_kind_classifies_only_builtin_events() {
+        assert_eq!(
+            special_event_kind(rseq::REPORT_KIND_AMD),
+            Some(SpecialEventKind::Amd)
+        );
+        assert_eq!(
+            special_event_kind(rseq::REPORT_KIND_SMD),
+            Some(SpecialEventKind::Smd)
+        );
+        assert_eq!(
+            special_event_kind(rseq::REPORT_KIND_DRDY),
+            Some(SpecialEventKind::Drdy)
+        );
+        assert_eq!(special_event_kind(rseq::REPORT_KIND_FIFO_RAW), None);
+        assert_eq!(special_event_kind(0x99), None);
+    }
+
+    #[test]
+    fn report_processor_emits_special_event_for_amd_report() {
+        let mut processor = ReportProcessor::new(ReportDecoderRegistry::default());
+        let meta = ReportMeta {
+            flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
+            frame_id: 12,
+            timestamp_us: 44_000,
+        };
+
+        let events = processor.handle_report(Some(meta), rseq::REPORT_KIND_AMD, &[]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Report(summary)
+                if summary.kind == rseq::REPORT_KIND_AMD
+                    && summary.line == "AMD frame_id=12 ts_us=44000"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SpecialEvent(event)
+                if event.kind == SpecialEventKind::Amd
+                    && event.meta == Some(meta)
+                    && event.args.is_empty()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Health(health)
+                if health.total_reports == 1 && health.last_frame_id == Some(12)
         )));
     }
 

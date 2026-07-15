@@ -30,6 +30,7 @@ const I16_FULL_SCALE_COUNTS: f64 = 32768.0;
 const DEFAULT_TEMP_LSB_PER_C: f64 = 1.0;
 const DEFAULT_TEMP_OFFSET_C: f64 = 0.0;
 const MAX_TEXT_LINES: usize = 256;
+const MAX_MOTION_EVENTS: usize = 1024;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -225,6 +226,14 @@ struct ImuSample {
 }
 
 #[derive(Debug, Clone)]
+struct TuiMotionEvent {
+    kind: rseq_host::SpecialEventKind,
+    meta: Option<ReportMeta>,
+    sample_index: u64,
+    args_len: usize,
+}
+
+#[derive(Debug, Clone)]
 struct RegisterValue {
     access: AccessKind,
     data: Vec<u8>,
@@ -345,6 +354,7 @@ enum AppEvent {
         data: Vec<u8>,
     },
     Report(String),
+    SpecialEvent(rseq_host::SpecialEvent),
     ControlApplied {
         name: String,
         label: String,
@@ -417,6 +427,8 @@ struct App {
     tuning_dialog: Option<TuningDialog>,
     control_busy: Option<String>,
     reports: VecDeque<String>,
+    motion_events: VecDeque<TuiMotionEvent>,
+    motion_event_counts: [u64; 3],
     logs: VecDeque<String>,
     sample_counter: u64,
     report_counter: u64,
@@ -449,6 +461,8 @@ impl App {
             tuning_dialog: None,
             control_busy: None,
             reports: VecDeque::with_capacity(MAX_TEXT_LINES),
+            motion_events: VecDeque::with_capacity(MAX_MOTION_EVENTS),
+            motion_event_counts: [0; 3],
             logs: VecDeque::with_capacity(MAX_TEXT_LINES),
             sample_counter: 0,
             report_counter: 0,
@@ -1075,12 +1089,27 @@ impl App {
                 self.report_counter += 1;
                 push_bounded(&mut self.reports, line, MAX_TEXT_LINES);
             }
+            AppEvent::SpecialEvent(event) => {
+                if self.motion_events.len() == MAX_MOTION_EVENTS {
+                    self.motion_events.pop_front();
+                }
+                self.motion_event_counts[event.kind.index()] =
+                    self.motion_event_counts[event.kind.index()].saturating_add(1);
+                self.motion_events.push_back(TuiMotionEvent {
+                    kind: event.kind,
+                    meta: event.meta,
+                    sample_index: self.sample_counter,
+                    args_len: event.args.len(),
+                });
+            }
             AppEvent::ControlApplied {
                 name,
                 label,
                 report_scale,
             } => {
                 self.samples.clear();
+                self.motion_events.clear();
+                self.motion_event_counts = [0; 3];
                 let scale = report_scale
                     .map(|update| format!(", {}={}", update.kind.as_str(), update.value))
                     .unwrap_or_default();
@@ -1230,13 +1259,18 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_motion(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let chunks = Layout::default()
+    let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(area);
+    render_motion_events(frame, root[0], app);
     render_motion_chart(
         frame,
-        chunks[0],
+        root[1],
         app,
         MotionKind::Accel,
         "acc m/s^2",
@@ -1245,13 +1279,40 @@ fn render_motion(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     render_motion_chart(
         frame,
-        chunks[1],
+        root[2],
         app,
         MotionKind::Gyro,
         "gyro rad/s",
         ["gx", "gy", "gz"],
         [Color::Magenta, Color::LightBlue, Color::LightRed],
     );
+}
+
+fn render_motion_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        " events ",
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for kind in rseq_host::SpecialEventKind::ALL {
+        spans.push(Span::styled(
+            format!(
+                " {}={} ",
+                kind.as_str(),
+                app.motion_event_counts[kind.index()]
+            ),
+            Style::default().fg(special_event_color(kind)),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        latest_motion_event_label(app),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let paragraph = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).title("events"));
+    frame.render_widget(paragraph, area);
 }
 
 #[derive(Clone, Copy)]
@@ -1270,11 +1331,26 @@ fn render_motion_chart(
     colors: [Color; 3],
 ) {
     let (series, x_bounds, y_bounds) = chart_series(app, kind);
-    let datasets = vec![
+    let mut datasets = vec![
         dataset(names[0], colors[0], &series[0]),
         dataset(names[1], colors[1], &series[1]),
         dataset(names[2], colors[2], &series[2]),
     ];
+    let marker_series = motion_event_marker_series(app, x_bounds, y_bounds);
+    for event_kind in rseq_host::SpecialEventKind::ALL {
+        let data = &marker_series[event_kind.index()];
+        if data.is_empty() {
+            continue;
+        }
+        datasets.push(
+            Dataset::default()
+                .name(event_kind.as_str())
+                .marker(symbols::Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(special_event_color(event_kind)))
+                .data(data),
+        );
+    }
     let chart = Chart::new(datasets)
         .block(Block::default().borders(Borders::ALL).title(title))
         .x_axis(
@@ -1341,6 +1417,96 @@ fn chart_series(app: &App, kind: MotionKind) -> ([Vec<(f64, f64)>; 3], [f64; 2],
     };
 
     (series, x_bounds, y_bounds)
+}
+
+fn motion_event_marker_series(
+    app: &App,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+) -> [Vec<(f64, f64)>; 3] {
+    let mut markers: [Vec<(f64, f64)>; 3] = std::array::from_fn(|_| Vec::new());
+    let span = (y_bounds[1] - y_bounds[0]).abs().max(1.0);
+    for event in &app.motion_events {
+        let x = if let Some(meta) = event.meta.filter(|meta| meta.timestamp_valid()) {
+            let Some(index) =
+                nearest_imu_sample_index_by_timestamp(&app.samples, meta.timestamp_us)
+            else {
+                continue;
+            };
+            index
+        } else {
+            event.sample_index
+        } as f64;
+        if x < x_bounds[0] || x > x_bounds[1] {
+            continue;
+        }
+        let lane = event.kind.index() as f64;
+        let y = y_bounds[1] - span * (0.10 + lane * 0.07);
+        markers[event.kind.index()].push((x, y));
+    }
+    markers
+}
+
+fn nearest_imu_sample_index_by_timestamp(
+    samples: &VecDeque<ImuSample>,
+    timestamp_us: u64,
+) -> Option<u64> {
+    let mut first_ts = None;
+    let mut last_ts = None;
+    let mut nearest = None;
+
+    for sample in samples {
+        let Some(sample_ts) = sample.timestamp_us else {
+            continue;
+        };
+        first_ts.get_or_insert(sample_ts);
+        last_ts = Some(sample_ts);
+        let delta = sample_ts.abs_diff(timestamp_us);
+        if nearest.is_none_or(|(_, best_delta)| delta < best_delta) {
+            nearest = Some((sample.index, delta));
+        }
+    }
+
+    let (Some(first_ts), Some(last_ts)) = (first_ts, last_ts) else {
+        return None;
+    };
+    let min_ts = first_ts.min(last_ts);
+    let max_ts = first_ts.max(last_ts);
+    if timestamp_us < min_ts || timestamp_us > max_ts {
+        return None;
+    }
+
+    nearest.map(|(index, _)| index)
+}
+
+fn latest_motion_event_label(app: &App) -> String {
+    match app.motion_events.back() {
+        Some(event) => format!(
+            "latest {} {} args={}",
+            event.kind.as_str(),
+            format_motion_event_meta(event.meta),
+            event.args_len
+        ),
+        None => "no special events".to_string(),
+    }
+}
+
+fn format_motion_event_meta(meta: Option<ReportMeta>) -> String {
+    match meta {
+        Some(meta) if meta.timestamp_valid() => {
+            format!("frame={} ts_us={}", meta.frame_id, meta.timestamp_us)
+        }
+        Some(meta) => format!("frame={}", meta.frame_id),
+        None => "no-meta".to_string(),
+    }
+}
+
+fn special_event_color(kind: rseq_host::SpecialEventKind) -> Color {
+    match kind {
+        rseq_host::SpecialEventKind::Amd => Color::Yellow,
+        rseq_host::SpecialEventKind::Smd => Color::Red,
+        rseq_host::SpecialEventKind::Drdy => Color::Cyan,
+    }
 }
 
 fn render_reports(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1927,6 +2093,22 @@ fn spawn_demo_source(
                     "FIFO_RAW frame_id={frame} ts_us={} fifo_len={fifo_len} samples={}",
                     start.elapsed().as_micros(),
                     fifo_len / 12
+                )));
+            }
+            if frame % 96 == 0 {
+                let meta = ReportMeta {
+                    flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
+                    frame_id: frame as u32,
+                    timestamp_us: start.elapsed().as_micros() as u64,
+                };
+                let _ = tx.send(AppEvent::SpecialEvent(rseq_host::SpecialEvent {
+                    kind: rseq_host::SpecialEventKind::Amd,
+                    meta: Some(meta),
+                    args: Vec::new(),
+                }));
+                let _ = tx.send(AppEvent::Report(format!(
+                    "AMD frame_id={} ts_us={}",
+                    meta.frame_id, meta.timestamp_us
                 )));
             }
             if frame % 16 == 0 {
@@ -2564,6 +2746,13 @@ fn handle_report(
         if !args.is_empty() {
             let _ = write!(line, " args=[{args}]");
         }
+    }
+    if let Some(event_kind) = rseq_host::special_event_kind(kind) {
+        let _ = tx.send(AppEvent::SpecialEvent(rseq_host::SpecialEvent {
+            kind: event_kind,
+            meta,
+            args: args.to_vec(),
+        }));
     }
     let _ = tx.send(AppEvent::Report(line));
 }
@@ -3424,6 +3613,81 @@ mod tests {
         assert!(app.registers.contains_key(&0x57));
         assert!(!app.registers.contains_key(&0x58));
         assert!(!app.registers.contains_key(&0x59));
+    }
+
+    #[test]
+    fn motion_event_marker_prefers_nearest_timestamped_sample() {
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            RegisterDumpMap::default(),
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
+        app.samples.push_back(ImuSample {
+            index: 10,
+            timestamp_us: Some(100),
+            acc: [0.0; 3],
+            gyro: [0.0; 3],
+        });
+        app.samples.push_back(ImuSample {
+            index: 11,
+            timestamp_us: Some(220),
+            acc: [0.0; 3],
+            gyro: [0.0; 3],
+        });
+        app.motion_events.push_back(TuiMotionEvent {
+            kind: rseq_host::SpecialEventKind::Amd,
+            meta: Some(ReportMeta {
+                flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 1,
+                timestamp_us: 200,
+            }),
+            sample_index: 99,
+            args_len: 0,
+        });
+
+        let markers = motion_event_marker_series(&app, [10.0, 11.0], [-1.0, 1.0]);
+
+        assert_eq!(markers[rseq_host::SpecialEventKind::Amd.index()].len(), 1);
+        assert_eq!(markers[rseq_host::SpecialEventKind::Amd.index()][0].0, 11.0);
+    }
+
+    #[test]
+    fn motion_event_marker_skips_timestamp_outside_sample_window() {
+        let mut app = App::new(
+            "test".to_string(),
+            16,
+            RegisterDumpMap::default(),
+            rseq_host::TuningControlCatalog::default(),
+            None,
+        );
+        app.samples.push_back(ImuSample {
+            index: 20,
+            timestamp_us: Some(500),
+            acc: [0.0; 3],
+            gyro: [0.0; 3],
+        });
+        app.samples.push_back(ImuSample {
+            index: 21,
+            timestamp_us: Some(600),
+            acc: [0.0; 3],
+            gyro: [0.0; 3],
+        });
+        app.motion_events.push_back(TuiMotionEvent {
+            kind: rseq_host::SpecialEventKind::Amd,
+            meta: Some(ReportMeta {
+                flags: rseq_link::REPORT_FLAG_TIMESTAMP_VALID,
+                frame_id: 1,
+                timestamp_us: 200,
+            }),
+            sample_index: 20,
+            args_len: 0,
+        });
+
+        let markers = motion_event_marker_series(&app, [20.0, 21.0], [-1.0, 1.0]);
+
+        assert!(markers[rseq_host::SpecialEventKind::Amd.index()].is_empty());
     }
 
     #[test]
